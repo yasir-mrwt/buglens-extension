@@ -1,0 +1,368 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>BugLens QA Inspector</title>
+    <link rel="stylesheet" href="panel.css" />
+  </head>
+  <body data-active-view="dashboard">
+    <div class="app-layout">
+      <aside class="sidebar">
+        <div class="sidebar-brand">
+          <img src="../assets/icons/icon48.png" alt="" />
+          <div>
+            <div class="brand-name">
+              <strong>BugLens</strong>
+              <span>v0.4.0</span>
+            </div>
+            <p>QA Inspector</p>
+          </div>
+        </div>
+
+        <nav class="view-tabs" role="tablist" aria-label="BugLens sections">
+          <button class="tab-button active" role="tab" aria-selected="true" tabindex="0" data-tab="dashboard">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
+            <span>Dashboard</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="api">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9 4 12l4 3M16 9l4 3-4 3M14 5l-4 14"/></svg>
+            <span>API Testing</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="console">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 7 5 5-5 5M12 17h7"/></svg>
+            <span>Console</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="ui">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 9v11"/></svg>
+            <span>UI Scan</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="reports">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7"/></svg>
+            <span>Reports</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="settings">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.5-1.2.9-1.9-2.1-2.1-1.9.9-1.2-.5-.7-2h-3l-.7 2-1.2.5-1.9-.9-2.1 2.1.9 1.9-.5 1.2-2 .7v3l2 .7.5 1.2-.9 1.9 2.1 2.1 1.9-.9 1.2.5.7 2h3l.7-2 1.2-.5 1.9.9 2.1-2.1-.9-1.9.5-1.2z"/></svg>
+            <span>Settings</span>
+          </button>
+        </nav>
+
+        <div class="sidebar-footer">
+          <span class="privacy-dot" aria-hidden="true"></span>
+          <div>
+            <strong>Local processing</strong>
+            <p>No captured data is uploaded.</p>
+          </div>
+        </div>
+      </aside>
+
+      <section class="workspace">
+        <header id="sessionBanner" class="topbar banner idle">
+          <div class="session-context">
+            <div class="session-title-row">
+              <span id="sessionDot" class="status-dot" aria-hidden="true"></span>
+              <strong id="sessionStatus">Not Started</strong>
+              <span class="separator" aria-hidden="true"></span>
+              <span id="sessionDuration">00:00</span>
+            </div>
+            <div class="current-url">
+              <span>Current page</span>
+              <strong id="currentUrl">Checking...</strong>
+            </div>
+            <p id="sessionHint">Start a session, then reload the page for complete network coverage.</p>
+          </div>
+          <div class="actions" aria-label="Session actions">
+            <button id="startBtn" class="primary">Start Session</button>
+            <button id="stopBtn" disabled>Stop</button>
+            <button id="clearBtn" class="danger-quiet">Clear</button>
+            <button id="quickExportBtn">Export Report</button>
+          </div>
+        </header>
+
+        <div id="toastRegion" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
+
+        <main class="content">
+          <header class="page-heading dashboard-only">
+            <div>
+              <p class="eyebrow">Session overview</p>
+              <h1>QA Dashboard</h1>
+              <p>Understand page health, confirmed findings, and capture coverage at a glance.</p>
+            </div>
+          </header>
+
+          <section class="dashboard-layout dashboard-only">
+            <article class="health-card">
+              <div id="healthMeter" class="health-meter" style="--score: 100">
+                <div><strong id="healthScore">100</strong><span>/100</span></div>
+              </div>
+              <div>
+                <span class="eyebrow">QA health</span>
+                <h2 id="healthLabel">Excellent</h2>
+                <p>Framework observations do not reduce this score.</p>
+              </div>
+            </article>
+
+            <article class="guidance-card">
+              <div>
+                <span class="eyebrow">Recommended next step</span>
+                <h2 id="dashboardGuidanceTitle">Start a focused QA session</h2>
+                <p id="dashboardGuidance">Capture one page or user flow at a time for a cleaner report.</p>
+              </div>
+              <div class="guidance-actions">
+                <button id="viewPriorityBtn" class="primary">Review Findings</button>
+                <button id="viewReportsBtn">Open Reports</button>
+                <button id="quickCopyBtn">Copy Summary</button>
+              </div>
+            </article>
+          </section>
+
+          <section class="summary-grid dashboard-only">
+            <article class="summary-card actionable"><span>Actionable Issues</span><strong id="actionableCount">0</strong><small>Confirmed user impact</small></article>
+            <article class="summary-card review"><span>Needs Review</span><strong id="reviewCount">0</strong><small>Manual confirmation</small></article>
+            <article class="summary-card framework"><span>Framework Noise</span><strong id="frameworkCount">0</strong><small>Not counted as issues</small></article>
+            <article class="summary-card console"><span>Console Errors</span><strong id="consoleErrorCount">0</strong><small>Runtime capture</small></article>
+            <article class="summary-card scan"><span>UI Scan</span><strong id="uiScanSummary">Ready</strong><small>Manual visual checks</small></article>
+          </section>
+
+          <section class="capture-grid dashboard-only" aria-label="Capture status">
+            <article><span class="capture-icon">N</span><div><span>Network capture</span><strong id="networkStatus">Not started</strong></div></article>
+            <article><span class="capture-icon">C</span><div><span>Console capture</span><strong id="consoleStatus">Checking</strong></div></article>
+            <article><span class="capture-icon">U</span><div><span>UI scanner</span><strong id="uiStatus">Ready</strong></div></article>
+            <article><span class="capture-icon">T</span><div><span>Last update</span><strong id="lastUpdated">Never</strong></div></article>
+          </section>
+
+          <header class="page-heading api-only">
+            <div>
+              <p class="eyebrow">Network quality</p>
+              <h1>API Testing</h1>
+              <p>Business API findings are separated from framework traffic, assets, and navigation requests.</p>
+            </div>
+          </header>
+
+          <section class="api-breakdown api-only">
+            <article><span>Business APIs</span><strong id="businessApiCount">0</strong><small>Application endpoints</small></article>
+            <article><span>Framework/Internal</span><strong id="frameworkRequestCount">0</strong><small>RSC and prefetch</small></article>
+            <article><span>Static Assets</span><strong id="staticRequestCount">0</strong><small>Scripts and media</small></article>
+            <article><span>Documents</span><strong id="documentRequestCount">0</strong><small>Pages and navigation</small></article>
+            <article><span>Passed Requests</span><strong id="passedRequestCount">0</strong><small>Successful responses</small></article>
+          </section>
+
+          <aside class="info-callout api-only">
+            <div>
+              <strong>Framework traffic is hidden by default</strong>
+              <p>Next.js route-data observations remain available through the Category filter and do not affect QA health.</p>
+            </div>
+          </aside>
+
+          <header class="page-heading console-only">
+            <div>
+              <p class="eyebrow">Runtime quality</p>
+              <h1>Console</h1>
+              <p>Review page errors, warnings, rejected promises, and repeated runtime messages.</p>
+            </div>
+          </header>
+
+          <section class="console-overview console-only">
+            <article><span>Errors</span><strong id="consoleErrorMetric">0</strong><small>console.error and runtime failures</small></article>
+            <article><span>Warnings</span><strong id="consoleWarningMetric">0</strong><small>console.warn messages</small></article>
+            <article><span>Repeated</span><strong id="consoleRepeatedMetric">0</strong><small>Grouped duplicate messages</small></article>
+          </section>
+
+          <header class="page-heading ui-only">
+            <div>
+              <p class="eyebrow">Visual quality</p>
+              <h1>UI Scan</h1>
+              <p>Run focused checks on the visible screen and manually confirm uncertain visual observations.</p>
+            </div>
+            <button id="uiScanBtn" class="primary">Run UI Scan</button>
+          </header>
+
+          <section class="ui-scan-overview ui-only">
+            <article><span>Last scan</span><strong id="uiLastScan">Not run</strong><small id="uiScanMetrics">No scan completed</small></article>
+            <article><span>Elements scanned</span><strong id="uiScannedCount">0</strong><small>Visible DOM nodes</small></article>
+            <article><span>Skipped</span><strong id="uiSkippedCount">0</strong><small>Outside scan scope</small></article>
+            <article><span>Viewport</span><strong id="uiViewportMetric">Unknown</strong><small>Current inspected page</small></article>
+            <article><span>Ignored decoration</span><strong id="uiIgnoredCount">0</strong><small>Background and decorative layers</small></article>
+          </section>
+
+          <aside class="info-callout ui-only">
+            <div>
+              <strong>Visual checks require tester judgment</strong>
+              <p>Open a finding to see why it was flagged, possible false-positive context, and what to verify manually.</p>
+            </div>
+          </aside>
+
+          <section class="toolbar findings-only">
+            <label>
+              Category
+              <select id="categoryFilter">
+                <option value="counted">Actionable + Needs Review</option>
+                <option value="actionable">Actionable Only</option>
+                <option value="needs-review">Needs Review</option>
+                <option value="framework-noise">Framework Noise</option>
+                <option value="informational">Informational</option>
+                <option value="passed">Passed</option>
+                <option value="all">All Findings</option>
+              </select>
+            </label>
+            <label>
+              Severity
+              <select id="severityFilter">
+                <option value="all">All severities</option>
+                <option value="critical">Critical</option>
+                <option value="high">High</option>
+                <option value="medium">Medium</option>
+                <option value="low">Low</option>
+                <option value="info">Info</option>
+              </select>
+            </label>
+            <label class="search-label">
+              Search findings
+              <input id="searchInput" type="search" placeholder="Search URL, title, message, or selector" />
+            </label>
+            <button id="resetFiltersBtn" class="toolbar-button">Reset</button>
+          </section>
+
+          <section id="findingsPanel" class="issues-panel findings-only">
+            <div class="panel-head">
+              <div>
+                <h2 id="findingsHeading">Priority Findings</h2>
+                <p>Open a row for technical evidence and filing guidance.</p>
+              </div>
+              <span id="issueCountText">0 findings</span>
+            </div>
+            <div id="emptyState" class="empty-state">
+              <span id="emptyIcon" class="empty-icon neutral" aria-hidden="true">i</span>
+              <strong>No findings yet</strong>
+              <p>Start a session, reload the page, perform your QA flow, then run a UI scan.</p>
+            </div>
+            <div id="issuesList" class="issues-list"></div>
+          </section>
+
+          <header class="page-heading reports-only">
+            <div>
+              <p class="eyebrow">Shareable evidence</p>
+              <h1>Reports</h1>
+              <p>Choose the format that best fits review, tracking, or developer debugging.</p>
+            </div>
+            <span class="privacy-pill">Redacted locally</span>
+          </header>
+
+          <section class="report-summary-grid reports-only">
+            <article><span>QA health</span><strong id="reportHealth">100/100</strong></article>
+            <article><span>Actionable</span><strong id="reportActionable">0</strong></article>
+            <article><span>Needs review</span><strong id="reportReview">0</strong></article>
+            <article><span>Captured routes</span><strong id="reportRoutes">0</strong></article>
+          </section>
+
+          <section class="report-panel reports-only">
+            <div id="reportPreview" class="report-preview"></div>
+            <div class="export-grid">
+              <article class="export-card">
+                <span class="file-type">HTML</span>
+                <div><h2>HTML Report</h2><p>Best for sharing a readable QA review with teams and managers.</p></div>
+                <button id="exportHtmlBtn" class="primary">Download HTML</button>
+              </article>
+              <article class="export-card">
+                <span class="file-type">CSV</span>
+                <div><h2>CSV for Google Sheets</h2><p>Best for QA tracking with concise evidence and recommendation columns.</p></div>
+                <button id="exportCsvBtn">Download CSV</button>
+              </article>
+              <article class="export-card">
+                <span class="file-type">JSON</span>
+                <div><h2>JSON Report</h2><p>Best for developers, automation, and complete machine-readable evidence.</p></div>
+                <button id="exportJsonBtn">Download JSON</button>
+              </article>
+              <article class="export-card">
+                <span class="file-type">TEXT</span>
+                <div><h2>Copy QA Summary</h2><p>Best for a quick update in Slack, Jira, Linear, or a pull request.</p></div>
+                <button id="copyReportBtn">Copy Summary</button>
+              </article>
+            </div>
+            <p class="privacy-note">Exports are generated on this device. Sensitive values are redacted before report creation.</p>
+          </section>
+
+          <header class="page-heading settings-only">
+            <div>
+              <p class="eyebrow">Configuration</p>
+              <h1>Settings</h1>
+              <p>Adjust capture, filtering, UI scan, and report behavior without changing the privacy model.</p>
+            </div>
+            <button id="resetSettingsBtn">Reset Defaults</button>
+          </header>
+
+          <section class="settings-panel settings-only">
+            <fieldset>
+              <legend>Capture</legend>
+              <p class="group-description">Control optional evidence capture. Redaction and temporary storage remain enabled.</p>
+              <div class="settings-grid">
+                <label class="setting-row">
+                  <span><strong>Response body capture</strong><small>Store short redacted response snippets when Chrome makes them available.</small></span>
+                  <input id="captureResponseBody" type="checkbox" />
+                </label>
+                <div class="setting-row readonly-setting">
+                  <span><strong>Sensitive-data redaction</strong><small>Authorization, cookies, tokens, and secrets are removed.</small></span>
+                  <span class="status-pill success">Enabled</span>
+                </div>
+                <div class="setting-row readonly-setting">
+                  <span><strong>Session-only evidence</strong><small>Captured results are not stored as long-term browser history.</small></span>
+                  <span class="status-pill success">Enabled</span>
+                </div>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>API thresholds</legend>
+              <p class="group-description">Tune performance and duplicate-call rules for your application.</p>
+              <div class="settings-grid numeric-grid">
+                <label>Slow API threshold<input id="slowApiMs" type="number" min="100" step="100" value="1000" /><span>ms</span></label>
+                <label>Very slow threshold<input id="verySlowApiMs" type="number" min="500" step="100" value="3000" /><span>ms</span></label>
+                <label>Duplicate window<input id="duplicateWindowMs" type="number" min="100" step="100" value="2000" /><span>ms</span></label>
+                <label>Response preview limit<input id="maxBodyPreviewBytes" type="number" min="1000" max="20000" step="1000" value="10000" /><span>bytes</span></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Filtering</legend>
+              <p class="group-description">Keep speculative framework behavior separate from confirmed application defects.</p>
+              <div class="settings-grid">
+                <label class="setting-row"><span><strong>Hide framework noise by default</strong><small>Keep Next.js route-data observations out of the main finding list.</small></span><input id="hideFrameworkNoise" type="checkbox" checked /></label>
+                <label class="setting-row"><span><strong>Show Next.js prefetch findings</strong><small>Make framework route-data observations visible in normal filtering.</small></span><input id="showNextPrefetchFindings" type="checkbox" /></label>
+                <label class="setting-row"><span><strong>Treat matching prefetch failures as review items</strong><small>Promote framework traffic only when related failure evidence exists.</small></span><input id="treatFrameworkPrefetchAsIssue" type="checkbox" /></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>UI Scan</legend>
+              <p class="group-description">Keep scans bounded and focused on visible, user-relevant interface elements.</p>
+              <div class="settings-grid">
+                <label class="setting-row"><span><strong>Visible viewport only</strong><small>Ignore content that is currently outside the tester's screen.</small></span><input id="uiVisibleViewportOnly" type="checkbox" checked /></label>
+                <label class="setting-row"><span><strong>Include decorative elements</strong><small>Also inspect backgrounds, canvases, and non-interactive decoration.</small></span><input id="uiIncludeDecorativeElements" type="checkbox" /></label>
+              </div>
+              <div class="settings-grid numeric-grid settings-subgrid">
+                <label>Maximum UI nodes<input id="maxUiNodes" type="number" min="500" max="10000" step="500" value="4000" /></label>
+                <label>Findings per rule<input id="maxIssuesPerRule" type="number" min="1" max="100" value="25" /></label>
+                <label class="wide-field">Allowed color tokens<textarea id="allowedColors" placeholder="#000000&#10;#ffffff&#10;#2563eb"></textarea><small>Optional. Enter one CSS color per line.</small></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>Reports</legend>
+              <p class="group-description">Choose which observations and export formats are available.</p>
+              <div class="settings-grid">
+                <label class="setting-row"><span><strong>Include framework noise</strong><small>Keep framework observations in exported evidence without counting them as issues.</small></span><input id="exportFrameworkNoise" type="checkbox" checked /></label>
+                <label class="setting-row"><span><strong>Enable CSV export</strong><small>Allow spreadsheet-friendly report downloads for Google Sheets.</small></span><input id="csvExportEnabled" type="checkbox" checked /></label>
+              </div>
+            </fieldset>
+
+            <div class="settings-footer">
+              <p>Changes are stored locally as extension preferences.</p>
+              <button id="saveSettingsBtn" class="primary">Save Settings</button>
+            </div>
+          </section>
+        </main>
+      </section>
+    </div>
+    <script type="module" src="panel.js"></script>
+  </body>
+</html>
