@@ -1,0 +1,14 @@
+{
+  "name": "buglens-ai-backend",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local BugLens AI backend for Ollama-powered QA analysis.",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

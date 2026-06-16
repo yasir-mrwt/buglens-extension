@@ -25,17 +25,17 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
             <span>Dashboard</span>
           </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="api">
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="findings">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9 4 12l4 3M16 9l4 3-4 3M14 5l-4 14"/></svg>
-            <span>API Testing</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="console">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m5 7 5 5-5 5M12 17h7"/></svg>
-            <span>Console</span>
+            <span>Findings</span>
           </button>
           <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="ui">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3" y="4" width="18" height="16" rx="2"/><path d="M3 9h18M8 9v11"/></svg>
-            <span>UI Scan</span>
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4zM8 19h8M12 15v4M8 9h8M8 12h5"/></svg>
+            <span>UI Bugs</span>
+          </button>
+          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="ai">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M4.6 6.6l2.1 2.1M17.3 17.3l2.1 2.1M3 12h3M18 12h3M4.6 17.4l2.1-2.1M17.3 6.7l2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>
+            <span>AI Assistant</span>
           </button>
           <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="reports">
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7"/></svg>
@@ -58,18 +58,27 @@
 
       <section class="workspace">
         <header id="sessionBanner" class="topbar banner idle">
-          <div class="session-context">
-            <div class="session-title-row">
-              <span id="sessionDot" class="status-dot" aria-hidden="true"></span>
-              <strong id="sessionStatus">Not Started</strong>
-              <span class="separator" aria-hidden="true"></span>
-              <span id="sessionDuration">00:00</span>
+          <div class="topbar-main">
+            <div class="session-context">
+              <div class="session-title-row">
+                <span id="sessionDot" class="status-dot" aria-hidden="true"></span>
+                <strong id="sessionStatus">Not Started</strong>
+                <span class="separator" aria-hidden="true"></span>
+                <span id="sessionDuration">00:00</span>
+              </div>
+              <div class="current-url">
+                <span>Current page</span>
+                <strong id="currentUrl">Checking...</strong>
+              </div>
+              <p id="sessionHint">Start a session, then reload the page for complete network coverage.</p>
             </div>
-            <div class="current-url">
-              <span>Current page</span>
-              <strong id="currentUrl">Checking...</strong>
-            </div>
-            <p id="sessionHint">Start a session, then reload the page for complete network coverage.</p>
+            <nav class="top-workflow-tabs" aria-label="Quick sections">
+              <button type="button" data-shortcut-tab="dashboard">Dashboard</button>
+              <button type="button" data-shortcut-tab="findings">Findings</button>
+              <button type="button" data-shortcut-tab="ui">UI Bugs</button>
+              <button type="button" data-shortcut-tab="ai">AI Analysis</button>
+              <button type="button" data-shortcut-tab="reports">Reports</button>
+            </nav>
           </div>
           <div class="actions" aria-label="Session actions">
             <button id="startBtn" class="primary">Start Session</button>
@@ -92,24 +101,35 @@
 
           <section class="dashboard-layout dashboard-only">
             <article class="health-card">
-              <div id="healthMeter" class="health-meter" style="--score: 100">
-                <div><strong id="healthScore">100</strong><span>/100</span></div>
+              <div class="health-card-header">
+                <div>
+                  <span class="eyebrow">QA health</span>
+                  <h2 id="healthLabel">Excellent</h2>
+                </div>
+                <span class="health-score-badge"><strong id="healthScore">100</strong>/100</span>
               </div>
-              <div>
-                <span class="eyebrow">QA health</span>
-                <h2 id="healthLabel">Excellent</h2>
-                <p>Framework observations do not reduce this score.</p>
+              <div id="healthMeter" class="health-meter" style="--score: 100" aria-hidden="true">
+                <span></span>
+              </div>
+              <p id="healthSummary">Framework observations do not reduce this score.</p>
+              <div class="health-breakdown">
+                <span><strong id="healthActionableMetric">0</strong> Actionable</span>
+                <span><strong id="healthReviewMetric">0</strong> Review</span>
+                <span><strong id="healthNoiseMetric">0</strong> Noise</span>
               </div>
             </article>
 
             <article class="guidance-card">
-              <div>
+              <div class="guidance-copy">
                 <span class="eyebrow">Recommended next step</span>
                 <h2 id="dashboardGuidanceTitle">Start a focused QA session</h2>
                 <p id="dashboardGuidance">Capture one page or user flow at a time for a cleaner report.</p>
               </div>
+              <span class="next-step-chip">Next best action</span>
               <div class="guidance-actions">
                 <button id="viewPriorityBtn" class="primary">Review Findings</button>
+                <button id="uiScanBtn">Run UI Scan</button>
+                <button id="viewAiBtn">Analyze with AI</button>
                 <button id="viewReportsBtn">Open Reports</button>
                 <button id="quickCopyBtn">Copy Summary</button>
               </div>
@@ -119,9 +139,10 @@
           <section class="summary-grid dashboard-only">
             <article class="summary-card actionable"><span>Actionable Issues</span><strong id="actionableCount">0</strong><small>Confirmed user impact</small></article>
             <article class="summary-card review"><span>Needs Review</span><strong id="reviewCount">0</strong><small>Manual confirmation</small></article>
-            <article class="summary-card framework"><span>Framework Noise</span><strong id="frameworkCount">0</strong><small>Not counted as issues</small></article>
-            <article class="summary-card console"><span>Console Errors</span><strong id="consoleErrorCount">0</strong><small>Runtime capture</small></article>
+            <article class="summary-card framework"><span>Noise / Ignored</span><strong id="frameworkCount">0</strong><small>Not counted as issues</small></article>
+            <article class="summary-card console"><span>Console Status</span><strong id="consoleErrorCount">0</strong><small>Errors observed</small></article>
             <article class="summary-card scan"><span>UI Scan</span><strong id="uiScanSummary">Ready</strong><small>Manual visual checks</small></article>
+            <article class="summary-card ai"><span>AI Assistant</span><strong id="aiStatusSummary">Off</strong><small>Optional local analysis</small></article>
           </section>
 
           <section class="capture-grid dashboard-only" aria-label="Capture status">
@@ -131,15 +152,15 @@
             <article><span class="capture-icon">T</span><div><span>Last update</span><strong id="lastUpdated">Never</strong></div></article>
           </section>
 
-          <header class="page-heading api-only">
+          <header class="page-heading findings-only">
             <div>
-              <p class="eyebrow">Network quality</p>
-              <h1>API Testing</h1>
-              <p>Business API findings are separated from framework traffic, assets, and navigation requests.</p>
+              <p class="eyebrow">Unified review</p>
+              <h1>Findings</h1>
+              <p>Review actionable items, manual-review observations, and noise in one filtered list.</p>
             </div>
           </header>
 
-          <section class="api-breakdown api-only">
+          <section class="api-breakdown findings-only">
             <article><span>Business APIs</span><strong id="businessApiCount">0</strong><small>Application endpoints</small></article>
             <article><span>Framework/Internal</span><strong id="frameworkRequestCount">0</strong><small>RSC and prefetch</small></article>
             <article><span>Static Assets</span><strong id="staticRequestCount">0</strong><small>Scripts and media</small></article>
@@ -147,7 +168,7 @@
             <article><span>Passed Requests</span><strong id="passedRequestCount">0</strong><small>Successful responses</small></article>
           </section>
 
-          <aside class="info-callout api-only">
+          <aside class="info-callout findings-only">
             <div>
               <strong>Framework traffic is hidden by default</strong>
               <p>Next.js route-data observations remain available through the Category filter and do not affect QA health.</p>
@@ -174,7 +195,6 @@
               <h1>UI Scan</h1>
               <p>Run focused checks on the visible screen and manually confirm uncertain visual observations.</p>
             </div>
-            <button id="uiScanBtn" class="primary">Run UI Scan</button>
           </header>
 
           <section class="ui-scan-overview ui-only">
@@ -193,6 +213,16 @@
           </aside>
 
           <section class="toolbar findings-only">
+            <label>
+              Type
+              <select id="typeFilter">
+                <option value="all">All types</option>
+                <option value="api">API</option>
+                <option value="console">Console</option>
+                <option value="ui">UI</option>
+                <option value="noise">Noise</option>
+              </select>
+            </label>
             <label>
               Category
               <select id="categoryFilter">
@@ -239,6 +269,69 @@
             <div id="issuesList" class="issues-list"></div>
           </section>
 
+          <header class="page-heading ai-only">
+            <div>
+              <p class="eyebrow">Optional local analysis</p>
+              <h1>AI Assistant</h1>
+              <p>AI reviews the current BugLens session and helps separate real issues from noise.</p>
+            </div>
+            <span id="aiStatusPill" class="status-pill">Not configured</span>
+          </header>
+
+          <section class="ai-panel ai-only">
+            <article class="ai-status-card">
+              <div>
+                <span class="eyebrow">Local backend</span>
+                <h2 id="aiStatusTitle">AI not configured</h2>
+                <p id="aiStatusText">Start the local BugLens AI backend, then check the connection.</p>
+              </div>
+              <button id="checkAiBtn">Check AI</button>
+            </article>
+
+            <label class="ai-url-field">
+              Backend URL
+              <input id="aiBackendUrl" type="url" value="http://localhost:8787" />
+              <small>Development backend that forwards sanitized summaries to local Ollama.</small>
+            </label>
+
+            <section class="ai-console" aria-live="polite">
+              <div>
+                <span class="eyebrow">Backend console</span>
+                <strong>Connection log</strong>
+              </div>
+              <pre id="aiConnectionLog">Backend not checked yet. Start ai-backend with npm start, then click Check AI.</pre>
+            </section>
+
+            <div class="ai-actions">
+              <button id="analyzeAiBtn" class="primary">Analyze Session</button>
+              <button id="generateTestsBtn">Generate Test Cases</button>
+              <button id="generateBugsBtn">Generate Bug Reports</button>
+              <button id="copyAiSummaryBtn">Copy AI Summary</button>
+            </div>
+
+            <div class="ai-result-toolbar">
+              <div class="ai-result-tabs" role="tablist" aria-label="AI result type">
+                <button type="button" class="active" data-ai-mode="analysis">Analysis</button>
+                <button type="button" data-ai-mode="test-cases">Test Cases</button>
+                <button type="button" data-ai-mode="bug-reports">Bug Reports</button>
+              </div>
+              <div class="ai-download-actions">
+                <button id="downloadAiMarkdownBtn">Download Markdown</button>
+                <button id="downloadAiJsonBtn">Download JSON</button>
+              </div>
+            </div>
+
+            <label class="setting-row ai-report-toggle">
+              <span><strong>Add AI summary to reports</strong><small>Include validated AI executive summary, next tests, and bug drafts in exported HTML/JSON.</small></span>
+              <input id="includeAiSummaryInReport" type="checkbox" />
+            </label>
+
+            <div id="aiOutput" class="ai-output empty">
+              <strong>No AI analysis yet</strong>
+              <p>AI runs only when you click a button. BugLens still works without AI.</p>
+            </div>
+          </section>
+
           <header class="page-heading reports-only">
             <div>
               <p class="eyebrow">Shareable evidence</p>
@@ -277,6 +370,14 @@
                 <span class="file-type">TEXT</span>
                 <div><h2>Copy QA Summary</h2><p>Best for a quick update in Slack, Jira, Linear, or a pull request.</p></div>
                 <button id="copyReportBtn">Copy Summary</button>
+              </article>
+              <article class="export-card ai-export-card">
+                <span class="file-type">AI</span>
+                <div><h2>AI Artifacts</h2><p>Download generated test cases, bug drafts, or analysis for QA handoff.</p></div>
+                <div class="export-card-actions">
+                  <button id="downloadAiMarkdownReportBtn">Markdown</button>
+                  <button id="downloadAiJsonReportBtn">JSON</button>
+                </div>
               </article>
             </div>
             <p class="privacy-note">Exports are generated on this device. Sensitive values are redacted before report creation.</p>
@@ -319,6 +420,21 @@
                 <label>Very slow threshold<input id="verySlowApiMs" type="number" min="500" step="100" value="3000" /><span>ms</span></label>
                 <label>Duplicate window<input id="duplicateWindowMs" type="number" min="100" step="100" value="2000" /><span>ms</span></label>
                 <label>Response preview limit<input id="maxBodyPreviewBytes" type="number" min="1000" max="20000" step="1000" value="10000" /><span>bytes</span></label>
+              </div>
+            </fieldset>
+
+            <fieldset>
+              <legend>AI</legend>
+              <p class="group-description">AI is optional, local-first, and only runs when you click an AI action.</p>
+              <div class="settings-grid">
+                <div class="setting-row readonly-setting">
+                  <span><strong>Provider</strong><small>Development mode uses the local BugLens backend and Ollama llama3.2:3b.</small></span>
+                  <span class="status-pill">Local</span>
+                </div>
+                <div class="setting-row readonly-setting">
+                  <span><strong>Payload safety</strong><small>Only sanitized summaries are sent. Raw headers, bodies, cookies, and tokens are excluded.</small></span>
+                  <span class="status-pill success">Enabled</span>
+                </div>
               </div>
             </fieldset>
 

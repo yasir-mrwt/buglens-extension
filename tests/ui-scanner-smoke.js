@@ -18,6 +18,7 @@ class FakeElement {
     this.scrollHeight = options.scrollHeight || this.clientHeight;
     this._rect = options.rect;
     this._style = options.style;
+    this._attrs = options.attrs || {};
   }
 
   getBoundingClientRect() {
@@ -35,8 +36,8 @@ class FakeElement {
     return null;
   }
 
-  getAttribute() {
-    return null;
+  getAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name] : null;
   }
 }
 
@@ -112,7 +113,11 @@ const document = {
   images: [],
   querySelectorAll(selector) {
     if (selector === 'body *') return bodyElements;
+    if (selector === 'a') return bodyElements.filter((element) => element.tagName === 'A');
     return [];
+  },
+  getElementById(id) {
+    return bodyElements.find((element) => element.id === id) || null;
   }
 };
 
@@ -210,6 +215,42 @@ function scan() {
   }
   if (overflowFinding.evidence.selector !== 'article.content-panel') {
     throw new Error(`Expected a concise stable selector, received ${overflowFinding.evidence.selector}.`);
+  }
+
+  const missingHref = new FakeElement('a', {
+    text: 'Broken CTA',
+    attrs: {},
+    rect: { left: 30, top: 140, width: 120, height: 36 },
+    childNodes: [{ nodeType: 3, textContent: 'Broken CTA' }],
+    style: {
+      display: 'inline-block',
+      visibility: 'visible',
+      opacity: '1',
+      position: 'relative',
+      pointerEvents: 'auto',
+      zIndex: 'auto',
+      transform: 'none',
+      overflow: 'visible',
+      overflowX: 'visible',
+      overflowY: 'visible',
+      textOverflow: 'clip',
+      whiteSpace: 'normal'
+    }
+  });
+  const missingTarget = new FakeElement('a', {
+    text: 'Jump to pricing',
+    attrs: { href: '#pricing' },
+    rect: { left: 30, top: 190, width: 140, height: 36 },
+    childNodes: [{ nodeType: 3, textContent: 'Jump to pricing' }],
+    style: missingHref._style
+  });
+  bodyElements = [missingHref, missingTarget];
+  const linkScan = await scan();
+  if (!linkScan.issues.some((issue) => issue.evidence.ruleId === 'missing-link-href')) {
+    throw new Error('Visible anchor without href was not detected.');
+  }
+  if (!linkScan.issues.some((issue) => issue.evidence.ruleId === 'missing-anchor-target')) {
+    throw new Error('Visible hash link with missing target was not detected.');
   }
 
   console.log('UI scanner regression test passed.');

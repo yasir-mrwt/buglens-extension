@@ -1,6 +1,6 @@
 # BugLens
 
-BugLens is a lightweight, local-first Chrome DevTools QA assistant. It separates actionable defects from findings that need review, framework noise, informational observations, and passed checks, then exports professional HTML, JSON, or CSV evidence.
+BugLens is a lightweight, local-first Chrome DevTools QA assistant. It separates actionable defects from findings that need review, framework noise, informational observations, and passed checks, then exports professional HTML, JSON, or CSV evidence. Optional local AI analysis can review a sanitized session summary through a local Ollama backend.
 
 BugLens is intentionally designed for **one active inspected page and one QA session at a time**. It is not a crawler, cloud dashboard, cross-tab monitor, or background testing service.
 
@@ -18,6 +18,7 @@ BugLens is intentionally designed for **one active inspected page and one QA ses
 - Sensitive-data redaction before display, storage, and export
 - Local HTML, normalized JSON, and Google Sheets-friendly CSV reports
 - Compact finding cards with copy-ready bug descriptions and expandable evidence
+- Optional AI Assistant powered by a local backend and Ollama `llama3.2:3b`
 - Clear confirmation, filter reset, settings reset, and action feedback
 - Unsupported-page and unavailable-content-script states
 - Reload and SPA route timeline tracking
@@ -26,11 +27,12 @@ BugLens is intentionally designed for **one active inspected page and one QA ses
 
 BugLens uses a responsive, neutral DevTools workspace:
 
-- A persistent sidebar separates Dashboard, API Testing, Console, UI Scan, Reports, and Settings.
+- A persistent sidebar separates Dashboard, Findings, AI Assistant, Reports, and Settings.
 - The sticky session bar keeps the inspected page, capture status, elapsed time, session controls, and report export visible.
 - Dashboard cards use restrained status colors and exclude framework noise from QA health.
 - API findings show compact method, status, duration, severity, category, and confidence badges before expandable evidence.
-- Console and UI Scan have dedicated summaries and purpose-specific empty states.
+- Findings are unified and filterable by type, category, severity, and search text.
+- AI Assistant can analyze the session, suggest tests, draft bugs, and optionally add its summary to reports.
 - Reports use format cards that explain when to choose HTML, CSV, JSON, or a copied QA summary.
 - Settings use grouped controls, helper text, and accessible switches.
 - At narrow DevTools widths, the sidebar becomes a compact horizontal navigation bar and cards wrap into fewer columns.
@@ -40,11 +42,13 @@ BugLens uses a responsive, neutral DevTools workspace:
 BugLens performs analysis inside the browser extension.
 
 - Captured QA data is not sent to any server or external API.
+- AI is optional and sends only a small sanitized session summary to `http://localhost:8787` when the tester clicks an AI action.
 - Session results use `chrome.storage.session`, not long-term browser history.
 - Harmless rule preferences use `chrome.storage.local`.
 - Reports are created only when the tester explicitly exports them.
 - Response snippets are disabled by default.
 - Tokens, cookies, authorization values, passwords, secrets, and sensitive query parameters are redacted with `[REDACTED]`.
+- AI payloads exclude cookies, authorization headers, tokens, passwords, raw request/response headers, request/response bodies, personal data, and screenshots.
 
 Stopping a session pauses capture but keeps results available for review and export. **Clear** removes the temporary session. Chrome also removes session storage when the browser session ends.
 
@@ -80,8 +84,9 @@ After editing extension files, click the extension's **Reload** button on `chrom
 6. Perform the manual QA flow.
 7. Click **Scan UI** on the screen you want to inspect.
 8. Review actionable findings first, then inspect needs-review or framework observations where useful.
-9. Click **Stop** when the flow is complete.
-10. Export HTML, JSON, or CSV, or copy the QA summary.
+9. Optionally open **AI Assistant** and click **Analyze Session**.
+10. Click **Stop** when the flow is complete.
+11. Export HTML, JSON, or CSV, or copy the QA summary.
 
 To test another unrelated page, stop or clear the current session and start a new one. SPA route changes can remain in one flow, but BugLens warns when a session contains several routes.
 
@@ -93,6 +98,7 @@ Reload page
 Perform one focused test flow
 Review Actionable and Needs Review findings
 Scan the final visible UI state
+Optionally ask AI to analyze the session
 Stop Session
 Export HTML for review, JSON for tooling, or CSV for Google Sheets
 Clear before testing another page or flow
@@ -145,6 +151,8 @@ The page-context listener captures:
 - Message, source file, line, column, stack, URL, and timestamp when available
 
 Matching console issues are fingerprinted and shown once with a duplicate count. The default unique console issue limit is 300.
+
+Console errors and warnings default to **Needs Review** unless there is confirmed user-facing impact. This keeps runtime noise from destroying QA health on SPA homepages that still work correctly.
 
 ## UI Scanner
 
@@ -216,6 +224,44 @@ The DevTools **Settings** section groups network, UI scanner, noise, and reporti
 - Optional allowed color tokens
 
 Settings persist locally and can be restored to professional defaults in one click. Captured session evidence does not become long-term history.
+
+## Local AI Backend
+
+BugLens AI is optional. The extension works normally when the backend is not running.
+
+Development architecture:
+
+```text
+BugLens Extension
+Local BugLens AI Backend: http://localhost:8787
+Ollama: http://localhost:11434
+Model: llama3.2:3b
+```
+
+Start Ollama and the backend:
+
+```bash
+ollama pull llama3.2:3b
+cd ai-backend
+npm start
+```
+
+Health check:
+
+```bash
+curl http://localhost:8787/api/health
+```
+
+AI endpoints:
+
+```text
+GET  /api/health
+POST /api/ai/analyze-session
+POST /api/ai/generate-bug-report
+POST /api/ai/generate-test-cases
+```
+
+The backend uses Ollama through `http://localhost:11434/v1/chat/completions`. It includes an `OpenAIProvider` placeholder for a future paid-provider switch, but no OpenAI API key is used or stored by the extension.
 
 ## Known Limitations
 

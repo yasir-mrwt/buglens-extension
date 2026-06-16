@@ -171,6 +171,58 @@
       }
     }
 
+    for (const anchor of Array.from(document.querySelectorAll('a')).slice(0, maxUiNodes)) {
+      if (!isVisibleElement(anchor, visibleViewportOnly)) continue;
+      const selector = getSelector(anchor);
+      const href = anchor.getAttribute('href');
+      const linkText = getShortText(anchor);
+      const rect = getRect(anchor);
+      if (href === null || String(href).trim() === '') {
+        addIssue(
+          'missing-link-href',
+          'medium',
+          'Visible link is missing href',
+          'A visible anchor is styled or exposed as a link but does not provide a destination.',
+          {
+            selector,
+            text: linkText,
+            href,
+            rect
+          },
+          {
+            category: 'needs-review',
+            confidence: 'high',
+            userImpact: 'Keyboard, screen-reader, or mouse users may not be able to navigate from this link.',
+            recommendation: 'Add a valid href or replace the element with a button if it performs an in-page action.'
+          }
+        );
+        continue;
+      }
+
+      const linkProblem = getHrefProblem(href);
+      if (linkProblem) {
+        addIssue(
+          linkProblem.ruleId,
+          linkProblem.severity,
+          linkProblem.title,
+          linkProblem.description,
+          {
+            selector,
+            text: linkText,
+            href,
+            rect,
+            reason: linkProblem.reason
+          },
+          {
+            category: linkProblem.category,
+            confidence: linkProblem.confidence,
+            userImpact: linkProblem.userImpact,
+            recommendation: linkProblem.recommendation
+          }
+        );
+      }
+    }
+
     const clickables = document.querySelectorAll('button, a[href], input, select, textarea, [role="button"], [onclick]');
     for (const el of Array.from(clickables).slice(0, maxUiNodes)) {
       if (!isVisibleElement(el, visibleViewportOnly)) continue;
@@ -492,6 +544,102 @@
       || style.overflowX === 'hidden'
       || style.overflowY === 'hidden'
       || style.whiteSpace === 'nowrap';
+  }
+
+  function getHrefProblem(href) {
+    const value = String(href || '').trim();
+    const lower = value.toLowerCase();
+    if (value === '#') {
+      return {
+        ruleId: 'placeholder-link-href',
+        severity: 'low',
+        category: 'needs-review',
+        confidence: 'medium',
+        title: 'Visible link uses placeholder href',
+        description: 'A visible link points to # and may not navigate anywhere meaningful.',
+        reason: 'href is #',
+        userImpact: 'Users may click a link that does not navigate to the expected destination.',
+        recommendation: 'Replace the placeholder with a real destination or convert the control to a button.'
+      };
+    }
+    if (value.startsWith('#') && value.length > 1) {
+      const targetId = value.slice(1);
+      let decodedTarget = targetId;
+      try {
+        decodedTarget = decodeURIComponent(targetId);
+      } catch {
+        decodedTarget = targetId;
+      }
+      if (!document.getElementById(decodedTarget)) {
+        return {
+          ruleId: 'missing-anchor-target',
+          severity: 'medium',
+          category: 'needs-review',
+          confidence: 'high',
+          title: 'Anchor link target is missing',
+          description: 'A visible same-page link points to an element id that does not exist on the page.',
+          reason: `No element found with id "${decodedTarget}"`,
+          userImpact: 'Users may click the link and remain on the same screen without reaching the expected section.',
+          recommendation: 'Add the matching target id or update the href to the correct section.'
+        };
+      }
+    }
+    if (lower.startsWith('javascript:')) {
+      return {
+        ruleId: 'javascript-link-href',
+        severity: 'medium',
+        category: 'needs-review',
+        confidence: 'high',
+        title: 'Visible link uses javascript href',
+        description: 'A visible link uses a javascript: URL instead of a normal destination.',
+        reason: 'href starts with javascript:',
+        userImpact: 'The link may be inaccessible, blocked by policy, or confusing for assistive technology.',
+        recommendation: 'Use a button for script actions or provide a real link destination.'
+      };
+    }
+    if (/^(?:http|https):$/i.test(value) || /^(?:http|https):\/?$/i.test(value)) {
+      return {
+        ruleId: 'invalid-link-href',
+        severity: 'medium',
+        category: 'needs-review',
+        confidence: 'high',
+        title: 'Visible link has invalid href',
+        description: 'A visible link has an incomplete URL and may fail navigation.',
+        reason: 'href is an incomplete URL',
+        userImpact: 'Users may be sent to a broken or unintended destination.',
+        recommendation: 'Replace the href with a complete, valid URL or route.'
+      };
+    }
+    if (/^(?:mailto|tel):$/i.test(value)) {
+      return {
+        ruleId: 'invalid-link-href',
+        severity: 'medium',
+        category: 'needs-review',
+        confidence: 'high',
+        title: 'Visible link has invalid href',
+        description: 'A visible mail or telephone link is missing its destination.',
+        reason: 'href has a protocol but no value',
+        userImpact: 'Users may be unable to contact or navigate from this link.',
+        recommendation: 'Add the missing email address, phone number, or valid destination.'
+      };
+    }
+    try {
+      // Relative paths, hash links with targets, mailto, tel, and absolute URLs are valid here.
+      new URL(value, location.href);
+    } catch {
+      return {
+        ruleId: 'invalid-link-href',
+        severity: 'medium',
+        category: 'needs-review',
+        confidence: 'medium',
+        title: 'Visible link has invalid href',
+        description: 'A visible link contains a href value that cannot be parsed as a URL.',
+        reason: 'URL parsing failed',
+        userImpact: 'Users may be unable to navigate from this link.',
+        recommendation: 'Fix the malformed href value and retest navigation.'
+      };
+    }
+    return null;
   }
 
   function hasDirectText(el) {

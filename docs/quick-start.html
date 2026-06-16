@@ -21,10 +21,12 @@
       <li>Perform the manual QA flow.</li>
       <li>Click <strong>Scan UI</strong> on important screens.</li>
       <li>Review Actionable findings before Needs Review and Framework Noise.</li>
+      <li>Optionally open <strong>AI Assistant</strong> and analyze the sanitized session with the local backend.</li>
       <li>Stop the session, open Reports, then export HTML, JSON, or CSV.</li>
     </ol>
     <p>Session data is temporary and stored locally in the browser. BugLens does not send captured evidence to a server. UI scanning is manual to keep CPU use low.</p>
     <p>Response body snippets are disabled by default, large or binary bodies are skipped, and sensitive headers and fields are redacted in reports.</p>
     <p>Framework noise does not increase the main issue count by default. CSV exports are formatted for Google Sheets without requiring Google OAuth.</p>
+    <p>AI is optional. When used, BugLens sends only a small sanitized session summary to the local backend at <code>http://localhost:8787</code>; raw headers, bodies, cookies, tokens, and screenshots are excluded.</p>
   </body>
 </html>

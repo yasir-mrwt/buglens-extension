@@ -157,6 +157,26 @@ processNetworkEntry(makeEntry(
   'document'
 ));
 globalThis.__promotedReport = buildReport();
+globalThis.__needsReviewHealth = calculateHealthScore(Array.from({ length: 20 }, (_, index) => ({
+  type: 'ui',
+  category: 'needs-review',
+  severity: 'medium',
+  evidence: { selector: '#item-' + index }
+})));
+globalThis.__noiseHealth = calculateHealthScore(Array.from({ length: 20 }, () => ({
+  type: 'api',
+  category: 'framework-noise',
+  severity: 'info',
+  evidence: { category: 'framework-prefetch' }
+})));
+globalThis.__consoleReview = analyzeConsolePayload({
+  level: 'error',
+  message: 'Uncaught test error',
+  channel: 'console',
+  timestamp: Date.now()
+});
+globalThis.__aiSummary = buildAiSessionSummary('analyze-session');
+globalThis.__aiFallback = buildLocalAiFallback('generate-test-cases', new Error('test timeout'));
 globalThis.__migrated = consolidateStoredFindings([
   {
     type: 'api',
@@ -269,6 +289,28 @@ setTimeout(() => {
   }
   if (context.__promotedReport.summary.needsReview !== 1 || context.__promotedReport.summary.totalIssues !== 1) {
     throw new Error('A matching failed document navigation did not promote the framework finding.');
+  }
+  if (context.__needsReviewHealth.score < 75) {
+    throw new Error(`Needs-review findings reduced health too aggressively: ${context.__needsReviewHealth.score}.`);
+  }
+  if (context.__noiseHealth.score < 90) {
+    throw new Error(`Framework noise reduced health too aggressively: ${context.__noiseHealth.score}.`);
+  }
+  if (context.__consoleReview.category !== 'needs-review') {
+    throw new Error('Console payloads should default to needs-review unless user-facing impact is confirmed.');
+  }
+  const aiSummaryText = JSON.stringify(context.__aiSummary);
+  if (aiSummaryText.includes('"requestHeaders"')
+    || aiSummaryText.includes('"responseHeaders"')
+    || aiSummaryText.includes('"requestBody"')
+    || aiSummaryText.includes('"responseBody"')) {
+    throw new Error('AI session summary leaked raw headers or sensitive fields.');
+  }
+  if (!context.__aiFallback.testCases || context.__aiFallback.testCases.length === 0) {
+    throw new Error('AI fallback did not generate structured test cases.');
+  }
+  if (!context.__aiFallback.bugReportDrafts || context.__aiFallback.bugReportDrafts.length === 0) {
+    throw new Error('AI fallback did not generate bug report drafts from available findings.');
   }
   if (context.__migrated.length !== 1
     || context.__migrated[0].category !== 'framework-noise'

@@ -3,7 +3,7 @@
   "name": "BugLens QA Inspector",
   "short_name": "BugLens",
   "version": "0.4.0",
-  "description": "A local-first Chrome DevTools QA assistant for API, console, and UI validation.",
+  "description": "A local-first Chrome DevTools QA assistant with optional local AI analysis.",
   "minimum_chrome_version": "116",
   "permissions": [
     "activeTab",

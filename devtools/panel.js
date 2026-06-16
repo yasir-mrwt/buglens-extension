@@ -21,6 +21,8 @@ const DEFAULT_SETTINGS = {
   uiIncludeDecorativeElements: false,
   exportFrameworkNoise: true,
   csvExportEnabled: true,
+  aiBackendUrl: 'http://localhost:8787',
+  includeAiSummaryInReport: false,
   allowedColors: []
 };
 
@@ -31,6 +33,12 @@ const REPORT_LIMITATIONS = [
   'Response bodies may be unavailable, encoded, cached, binary, or skipped by size limits.',
   'UI findings are rule-based QA hints, not pixel-perfect visual assertions.'
 ];
+
+const MAX_PERSISTED_URLS = 80;
+const MAX_PERSISTED_TIMELINE_EVENTS = 120;
+const MAX_PERSISTED_ISSUES = 300;
+const MAX_PERSISTED_AI_LOGS = 20;
+const MAX_STORAGE_STRING_LENGTH = 2000;
 
 const SENSITIVE_KEYS = [
   'authorization',
@@ -100,6 +108,15 @@ const state = {
     slow: 0
   },
   duplicateCache: new Map(),
+  ai: {
+    status: 'not-configured',
+    lastCheckedAt: null,
+    analysis: null,
+    lastTask: '',
+    activeMode: 'analysis',
+    error: '',
+    log: ['Backend not checked yet. Start ai-backend with npm start, then click Check AI.']
+  },
   settings: { ...DEFAULT_SETTINGS }
 };
 
@@ -124,9 +141,14 @@ const els = {
   healthScore: document.getElementById('healthScore'),
   healthMeter: document.getElementById('healthMeter'),
   healthLabel: document.getElementById('healthLabel'),
+  healthSummary: document.getElementById('healthSummary'),
+  healthActionableMetric: document.getElementById('healthActionableMetric'),
+  healthReviewMetric: document.getElementById('healthReviewMetric'),
+  healthNoiseMetric: document.getElementById('healthNoiseMetric'),
   dashboardGuidanceTitle: document.getElementById('dashboardGuidanceTitle'),
   dashboardGuidance: document.getElementById('dashboardGuidance'),
   viewPriorityBtn: document.getElementById('viewPriorityBtn'),
+  viewAiBtn: document.getElementById('viewAiBtn'),
   viewReportsBtn: document.getElementById('viewReportsBtn'),
   quickExportBtn: document.getElementById('quickExportBtn'),
   quickCopyBtn: document.getElementById('quickCopyBtn'),
@@ -134,6 +156,7 @@ const els = {
   reviewCount: document.getElementById('reviewCount'),
   frameworkCount: document.getElementById('frameworkCount'),
   consoleErrorCount: document.getElementById('consoleErrorCount'),
+  aiStatusSummary: document.getElementById('aiStatusSummary'),
   consoleErrorMetric: document.getElementById('consoleErrorMetric'),
   consoleWarningMetric: document.getElementById('consoleWarningMetric'),
   consoleRepeatedMetric: document.getElementById('consoleRepeatedMetric'),
@@ -153,6 +176,7 @@ const els = {
   consoleStatus: document.getElementById('consoleStatus'),
   uiStatus: document.getElementById('uiStatus'),
   lastUpdated: document.getElementById('lastUpdated'),
+  typeFilter: document.getElementById('typeFilter'),
   categoryFilter: document.getElementById('categoryFilter'),
   severityFilter: document.getElementById('severityFilter'),
   searchInput: document.getElementById('searchInput'),
@@ -166,6 +190,22 @@ const els = {
   reportActionable: document.getElementById('reportActionable'),
   reportReview: document.getElementById('reportReview'),
   reportRoutes: document.getElementById('reportRoutes'),
+  aiStatusPill: document.getElementById('aiStatusPill'),
+  aiStatusTitle: document.getElementById('aiStatusTitle'),
+  aiStatusText: document.getElementById('aiStatusText'),
+  aiBackendUrl: document.getElementById('aiBackendUrl'),
+  aiConnectionLog: document.getElementById('aiConnectionLog'),
+  checkAiBtn: document.getElementById('checkAiBtn'),
+  analyzeAiBtn: document.getElementById('analyzeAiBtn'),
+  generateTestsBtn: document.getElementById('generateTestsBtn'),
+  generateBugsBtn: document.getElementById('generateBugsBtn'),
+  copyAiSummaryBtn: document.getElementById('copyAiSummaryBtn'),
+  downloadAiMarkdownBtn: document.getElementById('downloadAiMarkdownBtn'),
+  downloadAiJsonBtn: document.getElementById('downloadAiJsonBtn'),
+  downloadAiMarkdownReportBtn: document.getElementById('downloadAiMarkdownReportBtn'),
+  downloadAiJsonReportBtn: document.getElementById('downloadAiJsonReportBtn'),
+  includeAiSummaryInReport: document.getElementById('includeAiSummaryInReport'),
+  aiOutput: document.getElementById('aiOutput'),
   findingsHeading: document.getElementById('findingsHeading'),
   slowApiMs: document.getElementById('slowApiMs'),
   verySlowApiMs: document.getElementById('verySlowApiMs'),
@@ -194,6 +234,12 @@ const els = {
 
 const tabButtons = typeof document.querySelectorAll === 'function'
   ? Array.from(document.querySelectorAll('[data-tab]'))
+  : [];
+const shortcutTabButtons = typeof document.querySelectorAll === 'function'
+  ? Array.from(document.querySelectorAll('[data-shortcut-tab]'))
+  : [];
+const aiModeButtons = typeof document.querySelectorAll === 'function'
+  ? Array.from(document.querySelectorAll('[data-ai-mode]'))
   : [];
 
 init().catch((error) => {
@@ -233,6 +279,17 @@ function bindEvents() {
     button.addEventListener('click', () => setActiveView(button.dataset.tab));
     button.addEventListener('keydown', handleTabKeydown);
   }
+  for (const button of shortcutTabButtons) {
+    button.addEventListener('click', () => setActiveView(button.dataset.shortcutTab));
+  }
+  for (const button of aiModeButtons) {
+    button.addEventListener('click', () => {
+      state.ai.activeMode = button.dataset.aiMode || 'analysis';
+      renderAiState();
+      schedulePersist();
+    });
+  }
+  els.typeFilter.addEventListener('change', renderIssues);
   els.categoryFilter.addEventListener('change', renderIssues);
   els.severityFilter.addEventListener('change', renderIssues);
   els.searchInput.addEventListener('input', renderIssues);
@@ -244,9 +301,19 @@ function bindEvents() {
   els.saveSettingsBtn.addEventListener('click', saveSettingsFromForm);
   els.resetSettingsBtn.addEventListener('click', resetSettingsToDefaults);
   els.viewPriorityBtn.addEventListener('click', focusPriorityFindings);
+  els.viewAiBtn.addEventListener('click', () => setActiveView('ai'));
   els.viewReportsBtn.addEventListener('click', () => setActiveView('reports'));
   els.quickExportBtn.addEventListener('click', exportHtml);
   els.quickCopyBtn.addEventListener('click', copyBugReport);
+  els.checkAiBtn.addEventListener('click', checkAiHealth);
+  els.analyzeAiBtn.addEventListener('click', () => runAiTask('analyze-session'));
+  els.generateTestsBtn.addEventListener('click', () => runAiTask('generate-test-cases'));
+  els.generateBugsBtn.addEventListener('click', () => runAiTask('generate-bug-report'));
+  els.copyAiSummaryBtn.addEventListener('click', copyAiSummary);
+  els.downloadAiMarkdownBtn.addEventListener('click', downloadAiMarkdown);
+  els.downloadAiJsonBtn.addEventListener('click', downloadAiJson);
+  els.downloadAiMarkdownReportBtn.addEventListener('click', downloadAiMarkdown);
+  els.downloadAiJsonReportBtn.addEventListener('click', downloadAiJson);
 }
 
 function handleTabKeydown(event) {
@@ -292,6 +359,8 @@ function writeSettingsToForm() {
   els.uiIncludeDecorativeElements.checked = Boolean(state.settings.uiIncludeDecorativeElements);
   els.exportFrameworkNoise.checked = Boolean(state.settings.exportFrameworkNoise);
   els.csvExportEnabled.checked = Boolean(state.settings.csvExportEnabled);
+  els.aiBackendUrl.value = String(state.settings.aiBackendUrl || DEFAULT_SETTINGS.aiBackendUrl);
+  els.includeAiSummaryInReport.checked = Boolean(state.settings.includeAiSummaryInReport);
   els.allowedColors.value = (state.settings.allowedColors || []).join('\n');
 }
 
@@ -330,6 +399,8 @@ function readSettingsFromForm() {
     uiIncludeDecorativeElements: Boolean(els.uiIncludeDecorativeElements.checked),
     exportFrameworkNoise: Boolean(els.exportFrameworkNoise.checked),
     csvExportEnabled: Boolean(els.csvExportEnabled.checked),
+    aiBackendUrl: normalizeBackendUrl(els.aiBackendUrl.value || DEFAULT_SETTINGS.aiBackendUrl),
+    includeAiSummaryInReport: Boolean(els.includeAiSummaryInReport.checked),
     allowedColors: els.allowedColors.value
       .split(/\n|,/) 
       .map((item) => item.trim())
@@ -338,7 +409,7 @@ function readSettingsFromForm() {
 }
 
 function setActiveView(view) {
-  const allowed = ['dashboard', 'api', 'console', 'ui', 'reports', 'settings'];
+  const allowed = ['dashboard', 'findings', 'ui', 'ai', 'reports', 'settings'];
   state.activeView = allowed.includes(view) ? view : 'dashboard';
   if (document.body && document.body.dataset) document.body.dataset.activeView = state.activeView;
   for (const button of tabButtons) {
@@ -349,16 +420,25 @@ function setActiveView(view) {
       button.setAttribute('tabindex', isActive ? '0' : '-1');
     }
   }
+  for (const button of shortcutTabButtons) {
+    button.classList.toggle('active', button.dataset.shortcutTab === state.activeView);
+  }
 
-  if (state.activeView === 'api' && state.settings.hideFrameworkNoise) {
+  if (state.activeView === 'findings' && state.settings.hideFrameworkNoise) {
     els.categoryFilter.value = 'counted';
+    els.typeFilter.value = 'all';
+  } else if (state.activeView === 'ui') {
+    els.categoryFilter.value = 'all';
+    els.typeFilter.value = 'ui';
   } else if (state.activeView === 'dashboard') {
     els.categoryFilter.value = 'counted';
+    els.typeFilter.value = 'all';
   }
   render();
 }
 
 function resetFilters() {
+  els.typeFilter.value = 'all';
   els.categoryFilter.value = 'counted';
   els.severityFilter.value = 'all';
   els.searchInput.value = '';
@@ -367,7 +447,7 @@ function resetFilters() {
 }
 
 function focusPriorityFindings() {
-  setActiveView('dashboard');
+  setActiveView('findings');
   resetFilters();
   if (els.findingsPanel && typeof els.findingsPanel.scrollIntoView === 'function') {
     els.findingsPanel.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -383,6 +463,11 @@ function clampNumber(value, min, max, fallback) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   return Math.min(max, Math.max(min, Math.round(parsed)));
+}
+
+function normalizeBackendUrl(value) {
+  const text = String(value || '').trim().replace(/\/+$/, '');
+  return text || DEFAULT_SETTINGS.aiBackendUrl;
 }
 
 function createEmptyNetworkStats() {
@@ -437,6 +522,10 @@ async function restoreSession() {
       : {};
     state.networkStats = { ...createEmptyNetworkStats(), ...savedNetworkStats };
     state.droppedIssues = { api: 0, console: 0, ui: 0, ...(saved.droppedIssues || {}) };
+    state.ai = { ...state.ai, ...(saved.ai || {}) };
+    if (!Array.isArray(state.ai.log) || state.ai.log.length === 0) {
+      state.ai.log = ['Backend not checked yet. Start ai-backend with npm start, then click Check AI.'];
+    }
     state.issues = consolidateStoredFindings(Array.isArray(saved.issues) ? saved.issues.map(migrateStoredIssue) : []);
     if (!Object.prototype.hasOwnProperty.call(savedNetworkStats, 'framework')) {
       const migratedFrameworkRequests = state.issues
@@ -544,6 +633,15 @@ async function startSession() {
   state.issues = [];
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = new Map();
+  state.ai = {
+    status: 'not-configured',
+    lastCheckedAt: null,
+    analysis: null,
+    lastTask: '',
+    activeMode: 'analysis',
+    error: '',
+    log: ['New QA session started. AI is optional; click Check AI before analysis.']
+  };
   state.settings = readSettingsFromForm();
   await chrome.storage.local.set({ buglensSettings: state.settings });
   await setContentSession(state.sessionId);
@@ -659,14 +757,23 @@ async function persistSession() {
   persistTimer = null;
   if (!state.sessionId) return;
 
-  const serializable = {
+  try {
+    const serializable = buildSessionSnapshot();
+    await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: serializable });
+  } catch (error) {
+    console.warn('[BugLens] Session persistence failed:', error && error.message ? error.message : error);
+  }
+}
+
+function buildSessionSnapshot() {
+  return sanitizeForStorage({
     sessionId: state.sessionId,
     active: state.active,
     startedAt: state.startedAt,
     endedAt: state.endedAt,
     pageUrl: state.pageUrl,
-    capturedUrls: state.capturedUrls,
-    timeline: state.timeline,
+    capturedUrls: boundedArray(state.capturedUrls, MAX_PERSISTED_URLS),
+    timeline: boundedArray(state.timeline, MAX_PERSISTED_TIMELINE_EVENTS),
     reloadObserved: state.reloadObserved,
     lastUpdatedAt: state.lastUpdatedAt,
     unsupportedReason: state.unsupportedReason,
@@ -674,15 +781,81 @@ async function persistSession() {
     environment: state.environment,
     uiStats: state.uiStats,
     droppedIssues: state.droppedIssues,
-    issues: state.issues,
-    networkStats: state.networkStats
-  };
+    issues: boundedArray(state.issues, MAX_PERSISTED_ISSUES).map(compactIssueForStorage),
+    networkStats: state.networkStats,
+    ai: compactAiStateForStorage(state.ai)
+  });
+}
 
-  try {
-    await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: serializable });
-  } catch (error) {
-    console.warn('[BugLens] Session persistence failed', error);
+function compactIssueForStorage(issue) {
+  if (!issue || typeof issue !== 'object') return null;
+  return {
+    type: issue.type,
+    category: issue.category,
+    severity: issue.severity,
+    confidence: issue.confidence,
+    title: issue.title,
+    description: issue.description,
+    userImpact: issue.userImpact,
+    recommendation: issue.recommendation,
+    includeInIssueCount: issue.includeInIssueCount,
+    includeInReport: issue.includeInReport,
+    evidence: compactStorageValue(issue.evidence, 0),
+    url: issue.url,
+    timestamp: issue.timestamp,
+    duplicateKey: issue.duplicateKey,
+    count: issue.count,
+    firstSeenAt: issue.firstSeenAt,
+    lastSeenAt: issue.lastSeenAt
+  };
+}
+
+function compactAiStateForStorage(ai) {
+  const safeAi = ai && typeof ai === 'object' ? ai : {};
+  return {
+    status: safeAi.status || 'not-configured',
+    lastCheckedAt: safeAi.lastCheckedAt || null,
+    analysis: compactStorageValue(safeAi.analysis, 0),
+    lastTask: safeAi.lastTask || '',
+    activeMode: normalizeAiMode(safeAi.activeMode),
+    error: safeAi.error || '',
+    log: boundedArray(safeAi.log, MAX_PERSISTED_AI_LOGS)
+  };
+}
+
+function boundedArray(value, limit) {
+  if (!Array.isArray(value)) return [];
+  return value.slice(Math.max(0, value.length - limit));
+}
+
+function sanitizeForStorage(value) {
+  return JSON.parse(JSON.stringify(compactStorageValue(value, 0)));
+}
+
+function compactStorageValue(value, depth, seen = new WeakSet()) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return redactText(value, MAX_STORAGE_STRING_LENGTH);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (typeof value === 'bigint') return String(value);
+  if (typeof value === 'symbol' || typeof value === 'function') return String(value);
+  if (depth > 5) return '[Object]';
+  if (typeof value !== 'object') return String(value);
+  if (seen.has(value)) return '[Circular]';
+  seen.add(value);
+
+  if (Array.isArray(value)) {
+    return value.slice(0, 40).map((item) => compactStorageValue(item, depth + 1, seen));
   }
+
+  const output = {};
+  for (const [key, item] of Object.entries(value).slice(0, 40)) {
+    if (isSensitiveKey(key)) {
+      output[key] = '[REDACTED]';
+    } else {
+      output[key] = compactStorageValue(item, depth + 1, seen);
+    }
+  }
+  return output;
 }
 
 function registerNetworkListener() {
@@ -1140,7 +1313,9 @@ function analyzeConsolePayload(payload) {
 
   return {
     type: 'console',
+    category: 'needs-review',
     severity,
+    confidence: isRuntime ? 'medium' : 'low',
     title: `${level.toUpperCase()}: ${message.slice(0, 90)}`,
     description: isRuntime
       ? 'Runtime JavaScript error detected in the page context.'
@@ -1540,10 +1715,15 @@ function render() {
   if (els.healthMeter && els.healthMeter.style && typeof els.healthMeter.style.setProperty === 'function') {
     els.healthMeter.style.setProperty('--score', String(health.score));
   }
+  els.healthSummary.textContent = getHealthSummaryText(counts, health);
+  els.healthActionableMetric.textContent = counts.actionable;
+  els.healthReviewMetric.textContent = counts.needsReview;
+  els.healthNoiseMetric.textContent = counts.frameworkNoise + counts.informational;
   els.actionableCount.textContent = counts.actionable;
   els.reviewCount.textContent = counts.needsReview;
   els.frameworkCount.textContent = counts.frameworkNoise;
   els.consoleErrorCount.textContent = counts.consoleErrors;
+  els.aiStatusSummary.textContent = getAiStatusLabel();
   const consoleFindings = state.issues.filter((issue) => issue.type === 'console');
   els.consoleErrorMetric.textContent = consoleFindings.filter((issue) => issue.evidence && issue.evidence.level === 'error').length;
   els.consoleWarningMetric.textContent = consoleFindings.filter((issue) => (
@@ -1591,14 +1771,47 @@ function render() {
   els.copyReportBtn.disabled = !hasSession;
   els.quickExportBtn.disabled = !hasSession;
   els.quickCopyBtn.disabled = !hasSession;
+  const aiBusy = state.ai.status === 'checking' || state.ai.status === 'analyzing';
+  els.checkAiBtn.disabled = aiBusy;
+  els.analyzeAiBtn.disabled = aiBusy || !hasSession;
+  els.generateTestsBtn.disabled = aiBusy || !hasSession;
+  els.generateBugsBtn.disabled = aiBusy || !hasSession;
+  els.copyAiSummaryBtn.disabled = !state.ai.analysis;
+  els.downloadAiMarkdownBtn.disabled = !state.ai.analysis;
+  els.downloadAiJsonBtn.disabled = !state.ai.analysis;
+  els.downloadAiMarkdownReportBtn.disabled = !state.ai.analysis;
+  els.downloadAiJsonReportBtn.disabled = !state.ai.analysis;
+  els.viewAiBtn.disabled = !hasSession;
   els.reportHealth.textContent = `${health.score}/100`;
   els.reportActionable.textContent = counts.actionable;
   els.reportReview.textContent = counts.needsReview;
   els.reportRoutes.textContent = new Set(state.capturedUrls.filter(Boolean)).size;
   els.reportPreview.textContent = buildExecutiveSummary(counts, health);
   renderDashboardGuidance(counts);
+  renderAiState();
 
   renderIssues();
+}
+
+function getAiStatusLabel() {
+  if (state.ai.status === 'ready') return 'Ready';
+  if (state.ai.status === 'analyzing') return 'Running';
+  if (state.ai.status === 'complete') return 'Done';
+  if (state.ai.status === 'failed') return 'Failed';
+  return 'Off';
+}
+
+function getHealthSummaryText(counts, health) {
+  if (counts.actionable > 0) {
+    return `${counts.actionable} confirmed issue${counts.actionable === 1 ? '' : 's'} need attention. Score is based on user-impacting findings only.`;
+  }
+  if (counts.needsReview > 0) {
+    return `${counts.needsReview} observation${counts.needsReview === 1 ? '' : 's'} need manual review before filing. No confirmed defect is counted yet.`;
+  }
+  if (counts.frameworkNoise + counts.informational > 0) {
+    return `${counts.frameworkNoise + counts.informational} noisy or informational observation${counts.frameworkNoise + counts.informational === 1 ? '' : 's'} ignored. QA health remains ${health.label.toLowerCase()}.`;
+  }
+  return 'No confirmed defects detected. Run the UI scan and AI review when the target screen is ready.';
 }
 
 function renderDashboardGuidance(counts) {
@@ -1632,6 +1845,744 @@ function renderDashboardGuidance(counts) {
   els.dashboardGuidance.textContent = copy;
   els.viewPriorityBtn.disabled = counts.actionable + counts.needsReview === 0;
   els.viewReportsBtn.disabled = !state.startedAt;
+}
+
+function renderAiState() {
+  const statusLabel = getAiStatusLabel();
+  els.aiStatusPill.textContent = statusLabel;
+  const activeMode = normalizeAiMode(state.ai.activeMode);
+  state.ai.activeMode = activeMode;
+  for (const button of aiModeButtons) {
+    const isActive = button.dataset.aiMode === activeMode;
+    button.classList.toggle('active', isActive);
+    if (typeof button.setAttribute === 'function') {
+      button.setAttribute('aria-selected', String(isActive));
+    }
+  }
+  els.analyzeAiBtn.classList.toggle('active-task', activeMode === 'analysis');
+  els.generateTestsBtn.classList.toggle('active-task', activeMode === 'test-cases');
+  els.generateBugsBtn.classList.toggle('active-task', activeMode === 'bug-reports');
+  els.aiStatusTitle.textContent = {
+    'not-configured': 'AI not configured',
+    checking: 'Checking AI backend',
+    ready: 'AI ready',
+    analyzing: 'Analyzing session',
+    complete: 'Analysis complete',
+    failed: 'AI failed'
+  }[state.ai.status] || 'AI not configured';
+
+  els.aiStatusText.textContent = {
+    'not-configured': 'Start the local BugLens AI backend, then check the connection.',
+    checking: 'Contacting the local backend.',
+    ready: 'Local backend is reachable. AI will run only when you click an action.',
+    analyzing: 'Sending a sanitized session summary to the local backend.',
+    complete: 'AI analysis is ready and can be copied or included in reports.',
+    failed: state.ai.error || 'AI analysis failed. BugLens deterministic checks are still available.'
+  }[state.ai.status] || 'Start the local BugLens AI backend, then check the connection.';
+
+  if (els.aiConnectionLog) {
+    els.aiConnectionLog.textContent = Array.isArray(state.ai.log) && state.ai.log.length
+      ? state.ai.log.slice(-8).join('\n')
+      : 'Backend not checked yet. Start ai-backend with npm start, then click Check AI.';
+  }
+
+  if (!state.ai.analysis) {
+    els.aiOutput.classList.toggle('empty', true);
+    els.aiOutput.innerHTML = '<strong>No AI analysis yet</strong><p>AI runs only when you click a button. BugLens still works without AI.</p>';
+    return;
+  }
+
+  els.aiOutput.classList.toggle('empty', false);
+  renderAiAnalysis(state.ai.analysis, activeMode);
+}
+
+function addAiLog(message) {
+  const timestamp = new Date().toLocaleTimeString();
+  const line = `[${timestamp}] ${message}`;
+  state.ai.log = Array.isArray(state.ai.log) ? state.ai.log : [];
+  state.ai.log.push(line);
+  state.ai.log = state.ai.log.slice(-20);
+}
+
+function normalizeAiMode(mode) {
+  return ['analysis', 'test-cases', 'bug-reports'].includes(mode) ? mode : 'analysis';
+}
+
+function aiModeForTask(task) {
+  if (task === 'generate-test-cases') return 'test-cases';
+  if (task === 'generate-bug-report') return 'bug-reports';
+  return 'analysis';
+}
+
+function renderAiAnalysis(analysis, mode = 'analysis') {
+  els.aiOutput.innerHTML = '';
+  if (mode === 'test-cases') {
+    els.aiOutput.append(
+      makeAiHero('Generated test cases', 'Downloadable QA scenarios based on the current BugLens evidence.'),
+      makeTestCaseSection(analysis.testCases),
+      makeAiSection('Extra recommended checks', analysis.recommendedNextTests)
+    );
+    return;
+  }
+  if (mode === 'bug-reports') {
+    els.aiOutput.append(
+      makeAiHero('Bug report drafts', 'Ready-to-review drafts for confirmed or high-confidence findings.'),
+      makeBugDraftSection(analysis.bugReportDrafts),
+      makeAiSection('Needs review before filing', analysis.needsReview.map((item) => `${item.title}: ${item.whatToVerify}`))
+    );
+    return;
+  }
+  els.aiOutput.append(
+    makeAiHero('Session analysis', analysis.executiveSummary),
+    makeAiSection('Actionable issues', analysis.actionableIssues.map((item) => `${item.title}: ${item.reason} Recommendation: ${item.recommendation}`)),
+    makeAiSection('Likely false positives', analysis.likelyFalsePositives.map((item) => `${item.title}: ${item.reason}`)),
+    makeAiSection('Needs review', analysis.needsReview.map((item) => `${item.title}: ${item.whatToVerify}`)),
+    makeAiSection('Recommended next tests', analysis.recommendedNextTests),
+    makeAiSection('Manager summary', [analysis.managerSummary]),
+    makeAiSection('Developer summary', [analysis.developerSummary])
+  );
+}
+
+function makeAiHero(title, copy) {
+  const section = document.createElement('section');
+  section.className = 'ai-result-hero';
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  const p = document.createElement('p');
+  p.textContent = copy || 'AI generated this from the sanitized BugLens session.';
+  section.append(heading, p);
+  return section;
+}
+
+function makeAiSection(title, items) {
+  const section = document.createElement('section');
+  section.className = 'ai-result-section';
+  const heading = document.createElement('h3');
+  heading.textContent = title;
+  section.appendChild(heading);
+  const filtered = (items || []).filter(Boolean);
+  if (filtered.length <= 1) {
+    const p = document.createElement('p');
+    p.textContent = filtered[0] || 'No items.';
+    section.appendChild(p);
+    return section;
+  }
+  const list = document.createElement('ul');
+  for (const item of filtered) {
+    const li = document.createElement('li');
+    li.textContent = item;
+    list.appendChild(li);
+  }
+  section.appendChild(list);
+  return section;
+}
+
+function makeTestCaseSection(testCases) {
+  const section = document.createElement('section');
+  section.className = 'ai-result-section ai-card-list';
+  const heading = document.createElement('h3');
+  heading.textContent = 'Test cases';
+  section.appendChild(heading);
+  const items = Array.isArray(testCases) ? testCases : [];
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.textContent = 'No structured test cases were generated. Try Analyze Session first, then Generate Test Cases.';
+    section.appendChild(p);
+    return section;
+  }
+  for (const testCase of items) {
+    const article = document.createElement('article');
+    article.className = 'ai-item-card';
+    const title = document.createElement('h4');
+    title.textContent = testCase.title || 'Untitled test case';
+    const meta = document.createElement('p');
+    meta.className = 'ai-item-meta';
+    meta.textContent = [testCase.priority, testCase.type, testCase.sourceFinding].filter(Boolean).join(' · ');
+    const objective = document.createElement('p');
+    objective.textContent = testCase.objective || 'Verify the behavior described by BugLens evidence.';
+    const list = document.createElement('ol');
+    for (const step of testCase.steps || []) {
+      const li = document.createElement('li');
+      li.textContent = step;
+      list.appendChild(li);
+    }
+    const expected = document.createElement('p');
+    expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(testCase.expectedResult || 'The flow works without a confirmed BugLens issue.')}`;
+    article.append(title, meta, objective, list, expected);
+    section.appendChild(article);
+  }
+  return section;
+}
+
+function makeBugDraftSection(drafts) {
+  const section = document.createElement('section');
+  section.className = 'ai-result-section ai-card-list';
+  const heading = document.createElement('h3');
+  heading.textContent = 'Drafts';
+  section.appendChild(heading);
+  const items = Array.isArray(drafts) ? drafts : [];
+  if (!items.length) {
+    const p = document.createElement('p');
+    p.textContent = 'No bug drafts were generated because AI did not find confirmed enough evidence.';
+    section.appendChild(p);
+    return section;
+  }
+  for (const draft of items) {
+    const article = document.createElement('article');
+    article.className = 'ai-item-card';
+    const title = document.createElement('h4');
+    title.textContent = draft.title || 'Untitled bug draft';
+    const severity = document.createElement('p');
+    severity.className = 'ai-item-meta';
+    severity.textContent = `Severity: ${draft.severity || 'needs review'}`;
+    const steps = document.createElement('ol');
+    for (const step of draft.stepsToReproduce || []) {
+      const li = document.createElement('li');
+      li.textContent = step;
+      steps.appendChild(li);
+    }
+    const expected = document.createElement('p');
+    expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(draft.expectedResult || 'Expected behavior was not provided.')}`;
+    const actual = document.createElement('p');
+    actual.innerHTML = `<strong>Actual:</strong> ${escapeHtml(draft.actualResult || 'Actual behavior was not provided.')}`;
+    const evidence = document.createElement('p');
+    evidence.innerHTML = `<strong>Evidence:</strong> ${escapeHtml(draft.evidenceSummary || 'No evidence summary provided.')}`;
+    article.append(title, severity, steps, expected, actual, evidence);
+    section.appendChild(article);
+  }
+  return section;
+}
+
+async function checkAiHealth() {
+  state.settings = readSettingsFromForm();
+  await chrome.storage.local.set({ buglensSettings: state.settings });
+  state.ai.status = 'checking';
+  state.ai.error = '';
+  addAiLog(`Checking backend ${state.settings.aiBackendUrl}/api/health`);
+  render();
+  try {
+    const response = await fetchWithTimeout(`${state.settings.aiBackendUrl}/api/health`, { method: 'GET' }, 8000);
+    if (!response.ok) throw new Error(`Backend returned ${response.status}`);
+    const payload = await response.json().catch(() => ({}));
+    state.ai.lastCheckedAt = Date.now();
+    addAiLog(`Backend running: ${payload.provider || 'provider unknown'} ${payload.model || ''}`.trim());
+    if (payload.ai && payload.ai.ok === false) {
+      state.ai.status = 'failed';
+      state.ai.error = `Backend is running, but ${payload.ai.error || payload.ai.note || 'the AI provider is not ready.'}`;
+      addAiLog(`Provider warning: ${state.ai.error}`);
+      showToast('Backend is running, but Ollama is not ready.', 'error');
+    } else {
+      state.ai.status = 'ready';
+      state.ai.error = '';
+      showToast('AI backend is ready.', 'success');
+    }
+  } catch (error) {
+    state.ai.status = 'failed';
+    state.ai.error = formatAiError(error);
+    addAiLog(`Connection failed: ${state.ai.error}`);
+    showToast('AI backend is not reachable.', 'error');
+  }
+  schedulePersist();
+  render();
+}
+
+async function runAiTask(task) {
+  if (!state.startedAt) {
+    showToast('Start a session before using AI analysis.', 'error');
+    return;
+  }
+  state.settings = readSettingsFromForm();
+  await chrome.storage.local.set({ buglensSettings: state.settings });
+  state.ai.status = 'analyzing';
+  state.ai.lastTask = task;
+  state.ai.activeMode = aiModeForTask(task);
+  state.ai.error = '';
+  addAiLog(`Running ${task} against ${state.settings.aiBackendUrl}`);
+  render();
+
+  const endpoint = {
+    'analyze-session': '/api/ai/analyze-session',
+    'generate-test-cases': '/api/ai/generate-test-cases',
+    'generate-bug-report': '/api/ai/generate-bug-report'
+  }[task];
+
+  try {
+    const response = await fetchWithTimeout(`${state.settings.aiBackendUrl}${endpoint}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: buildAiSessionSummary(task) })
+    }, 90000);
+    if (!response.ok) throw new Error(`AI backend returned ${response.status}`);
+    const payload = await response.json();
+    state.ai.analysis = validateAiAnalysis(payload.analysis || payload);
+    state.ai.status = 'complete';
+    state.ai.lastCheckedAt = Date.now();
+    if (payload.fallback) {
+      addAiLog(`${task} used deterministic fallback: ${payload.fallbackReason || 'Ollama was slow or returned incomplete JSON.'}`);
+    }
+    addAiLog(`${task} complete.`);
+    showToast('AI analysis complete.', 'success');
+  } catch (error) {
+    state.ai.analysis = buildLocalAiFallback(task, error);
+    state.ai.status = 'complete';
+    state.ai.error = '';
+    addAiLog(`${task} used local fallback: ${formatAiError(error)}`);
+    showToast('AI fallback generated from local findings.', 'success');
+  }
+  schedulePersist();
+  render();
+}
+
+function formatAiError(error) {
+  if (error && error.name === 'AbortError') {
+    return 'Request timed out. BugLens generated a local fallback; restart ai-backend to use the newest backend fallback.';
+  }
+  const message = error && error.message ? error.message : 'AI request failed.';
+  if (/Failed to fetch/i.test(message)) {
+    return 'Could not reach the backend. Start ai-backend with npm start and confirm the URL/port.';
+  }
+  return message;
+}
+
+function buildLocalAiFallback(task, error) {
+  const session = buildAiSessionSummary(task);
+  const actionable = session.actionableFindings || [];
+  const needsReview = session.needsReviewFindings || [];
+  const findings = [...actionable, ...needsReview].slice(0, 10);
+  const recommendedNextTests = buildLocalRecommendedTests(session, findings);
+  const testCases = buildLocalTestCases(session, findings, recommendedNextTests);
+  const bugReportDrafts = buildLocalBugDrafts(session, actionable, needsReview);
+  const hasActionable = actionable.length > 0;
+  const hasReview = needsReview.length > 0;
+  return validateAiAnalysis({
+    qaHealth: hasActionable ? 'risky' : (hasReview ? 'needs_review' : 'good'),
+    executiveSummary: `BugLens generated this locally because AI did not finish: ${formatAiError(error)}`,
+    actionableIssues: actionable.slice(0, 8).map((issue) => ({
+      title: issue.title,
+      severity: issue.severity,
+      reason: issue.evidenceSummary || issue.description,
+      recommendation: issue.recommendation
+    })),
+    likelyFalsePositives: session.frameworkNoiseSummary && session.frameworkNoiseSummary.count ? [{
+      title: 'Framework/internal route prefetch traffic',
+      reason: 'Speculative framework traffic was observed without confirmed user-facing failure.'
+    }] : [],
+    needsReview: needsReview.slice(0, 8).map((issue) => ({
+      title: issue.title,
+      whatToVerify: issue.recommendation || issue.evidenceSummary || 'Confirm user impact before filing.'
+    })),
+    recommendedNextTests,
+    testCases,
+    bugReportDrafts,
+    managerSummary: hasActionable
+      ? 'Local fallback found actionable BugLens evidence that should be reviewed before release.'
+      : 'Local fallback did not find confirmed actionable defects. Run the generated checks for confidence.',
+    developerSummary: `Local fallback generated ${testCases.length} test case(s) and ${bugReportDrafts.length} bug draft(s).`
+  });
+}
+
+function buildLocalRecommendedTests(session, findings) {
+  const tests = [];
+  if (session.networkSummary && Number(session.networkSummary.businessApis || 0) > 0) {
+    tests.push('Repeat the main user flow and verify business API calls return expected successful responses.');
+  }
+  if (session.consoleSummary && (Number(session.consoleSummary.errors || 0) > 0 || Number(session.consoleSummary.warnings || 0) > 0)) {
+    tests.push('Repeat the flow and verify no meaningful console errors or warnings appear.');
+  }
+  tests.push(session.uiScanSummary && Number(session.uiScanSummary.scans || 0) > 0
+    ? 'Re-run the visible viewport UI scan after fixes and confirm review items are gone.'
+    : 'Run a visible viewport UI scan on the target screen after it reaches the intended state.');
+  for (const finding of findings.slice(0, 4)) {
+    tests.push(`Manually verify "${finding.title || 'captured finding'}" and confirm whether it is reproducible.`);
+  }
+  return Array.from(new Set(tests)).slice(0, 8);
+}
+
+function buildLocalTestCases(session, findings, recommendedNextTests) {
+  const pageUrl = session.pageUrl || 'the tested page';
+  const sources = findings.length ? findings : recommendedNextTests.map((item, index) => ({
+    title: `Follow-up QA check ${index + 1}`,
+    type: index === 0 ? 'api' : 'ui',
+    severity: 'medium',
+    category: 'needs-review',
+    evidenceSummary: item,
+    recommendation: item
+  }));
+  return sources.slice(0, 8).map((finding, index) => ({
+    title: `${priorityFromFinding(finding)} ${testTypeFromFinding(finding)} check: ${finding.title || `QA follow-up ${index + 1}`}`,
+    objective: finding.description || finding.evidenceSummary || finding.recommendation || 'Verify the captured BugLens observation.',
+    priority: priorityFromFinding(finding),
+    type: testTypeFromFinding(finding),
+    sourceFinding: finding.title || 'BugLens session',
+    dataNeeded: 'Use a normal QA account and existing test data for this page.',
+    steps: [
+      `Open ${pageUrl}.`,
+      'Start BugLens, reload the page, and perform the user flow under test.',
+      finding.recommendation || finding.evidenceSummary || 'Observe the behavior related to the captured finding.',
+      'Confirm whether network, console, and visible UI evidence matches the expected result.'
+    ],
+    expectedResult: expectedResultFromFinding(finding)
+  }));
+}
+
+function buildLocalBugDrafts(session, actionable, needsReview) {
+  const pageUrl = session.pageUrl || 'the tested page';
+  const candidates = actionable.length ? actionable : needsReview.slice(0, 3);
+  return candidates.slice(0, 8).map((finding) => ({
+    title: finding.title || 'BugLens captured issue',
+    severity: finding.severity || (finding.category === 'needs-review' ? 'needs review' : 'medium'),
+    stepsToReproduce: [
+      `Open ${pageUrl}.`,
+      'Start BugLens and reload the page.',
+      'Repeat the tested flow that produced this evidence.',
+      'Review the matching BugLens finding and confirm the behavior.'
+    ],
+    expectedResult: expectedResultFromFinding(finding),
+    actualResult: finding.description || finding.evidenceSummary || 'BugLens captured evidence that requires review.',
+    evidenceSummary: finding.evidenceSummary || finding.recommendation || 'Sanitized BugLens finding evidence.'
+  }));
+}
+
+function priorityFromFinding(finding) {
+  if (finding.severity === 'critical') return 'P0';
+  if (finding.severity === 'high') return 'P1';
+  if (finding.severity === 'medium' || finding.category === 'actionable') return 'P2';
+  return 'P3';
+}
+
+function testTypeFromFinding(finding) {
+  const source = `${finding.type || ''} ${finding.title || ''}`.toLowerCase();
+  if (source.includes('ui') || source.includes('visual') || source.includes('layout')) return 'visual';
+  if (source.includes('console')) return 'regression';
+  if (source.includes('api') || source.includes('network')) return 'functional';
+  if (source.includes('slow') || source.includes('performance')) return 'performance';
+  return 'regression';
+}
+
+function expectedResultFromFinding(finding) {
+  if (finding.type === 'api') return 'The relevant API calls complete with expected status, timing, and no duplicate side effects.';
+  if (finding.type === 'console') return 'The flow completes without meaningful console errors, runtime errors, or unhandled promise rejections.';
+  if (finding.type === 'ui') return 'The visible UI remains readable, aligned, accessible, and usable in the tested viewport.';
+  return finding.recommendation || 'The tested flow behaves correctly without confirmed user-facing defects.';
+}
+
+async function fetchWithTimeout(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...options, signal: controller.signal });
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
+function buildAiSessionSummary(task) {
+  const counts = countIssues(state.issues);
+  const health = calculateHealthScore(state.issues);
+  const endedAt = state.endedAt || (state.active ? Date.now() : null);
+  const sessionDurationMs = state.startedAt && endedAt ? Math.max(0, endedAt - state.startedAt) : null;
+  const actionable = state.issues.filter((issue) => issue.category === 'actionable').slice(0, 12).map(summarizeIssueForAi);
+  const needsReview = state.issues.filter((issue) => issue.category === 'needs-review').slice(0, 16).map(summarizeIssueForAi);
+  const frameworkNoise = state.issues.filter((issue) => issue.category === 'framework-noise');
+
+  return {
+    task,
+    pageUrl: redactUrl(state.pageUrl),
+    sessionDurationMs,
+    health,
+    counts: {
+      actionable: counts.actionable,
+      needsReview: counts.needsReview,
+      frameworkNoise: counts.frameworkNoise,
+      informational: counts.informational,
+      consoleErrors: counts.consoleErrors
+    },
+    actionableFindings: actionable,
+    needsReviewFindings: needsReview,
+    frameworkNoiseSummary: {
+      count: counts.frameworkNoise,
+      examples: frameworkNoise.slice(0, 8).map((issue) => ({
+        title: issue.title,
+        routeCount: issue.evidence && issue.evidence.routeCount,
+        evidenceSummary: summarizeIssueEvidenceForAi(issue)
+      }))
+    },
+    consoleSummary: {
+      errors: state.issues.filter((issue) => issue.type === 'console' && issue.evidence && issue.evidence.level === 'error').length,
+      warnings: state.issues.filter((issue) => issue.type === 'console' && issue.evidence && ['warn', 'warning'].includes(issue.evidence.level)).length,
+      repeatedMessages: state.issues.filter((issue) => issue.type === 'console' && Number(issue.count || 1) > 1).length
+    },
+    uiScanSummary: {
+      scans: state.uiStats.scans,
+      lastScannedElements: state.uiStats.lastScannedElements,
+      lastSkippedElements: state.uiStats.lastSkippedElements,
+      ignoredDecorativeElements: state.uiStats.ignoredDecorativeElements,
+      hitNodeLimit: state.uiStats.hitNodeLimit
+    },
+    networkSummary: {
+      businessApis: state.networkStats.api,
+      frameworkInternal: state.networkStats.framework,
+      staticAssets: state.networkStats.static,
+      documents: state.networkStats.documents,
+      passed: state.networkStats.passed,
+      failed: state.networkStats.failed,
+      slow: state.networkStats.slow
+    },
+    environment: {
+      viewport: state.environment.viewport,
+      userAgentSummary: summarizeUserAgent(state.environment.userAgent)
+    },
+    privacy: {
+      sanitized: true,
+      excluded: ['cookies', 'authorization headers', 'tokens', 'passwords', 'raw headers', 'request bodies', 'response bodies', 'screenshots']
+    }
+  };
+}
+
+function summarizeIssueForAi(issue) {
+  return {
+    type: issue.type,
+    category: issue.category,
+    severity: issue.severity,
+    confidence: issue.confidence,
+    title: issue.title,
+    description: issue.description,
+    userImpact: issue.userImpact,
+    recommendation: issue.recommendation,
+    pageUrl: issue.url || redactUrl(state.pageUrl),
+    duplicateCount: issue.count,
+    evidenceSummary: summarizeIssueEvidenceForAi(issue)
+  };
+}
+
+function summarizeIssueEvidenceForAi(issue) {
+  const evidence = issue.evidence || {};
+  if (issue.type === 'api') {
+    return [
+      evidence.method,
+      evidence.status ? `status ${evidence.status}` : '',
+      evidence.durationMs ? `${evidence.durationMs}ms` : '',
+      evidence.logicalRoute || evidence.url
+    ].filter(Boolean).join(' ');
+  }
+  if (issue.type === 'console') {
+    return String(evidence.message || issue.description || '').slice(0, 240);
+  }
+  return [
+    evidence.ruleId,
+    evidence.selector,
+    evidence.text,
+    evidence.whyFlagged,
+    evidence.falsePositiveNote
+  ].filter(Boolean).join(' | ').slice(0, 260);
+}
+
+function summarizeUserAgent(value) {
+  const text = String(value || '');
+  if (!text) return '';
+  const browser = text.match(/(Chrome|Firefox|Safari|Edg)\/[\d.]+/);
+  const platform = text.match(/\(([^)]+)\)/);
+  return [browser && browser[0], platform && platform[1]].filter(Boolean).join(' on ').slice(0, 160);
+}
+
+function validateAiAnalysis(value) {
+  if (!value || typeof value !== 'object') throw new Error('AI returned an invalid response.');
+  const safeArray = (items, mapItem) => Array.isArray(items) ? items.slice(0, 12).map(mapItem).filter(Boolean) : [];
+  const text = (item, fallback = '') => {
+    const value = String(item ?? '').trim();
+    return (value || String(fallback || '')).slice(0, 1200);
+  };
+  const qaHealth = ['excellent', 'good', 'needs_review', 'risky', 'broken'].includes(value.qaHealth)
+    ? value.qaHealth
+    : 'needs_review';
+  const recommendedNextTests = safeArray(value.recommendedNextTests, (item) => text(item));
+  const testCases = safeArray(value.testCases, (item) => ({
+    title: text(item && item.title, 'Untitled test case'),
+    objective: text(item && item.objective, 'Verify the behavior described by BugLens evidence.'),
+    priority: text(item && item.priority, 'P2'),
+    type: text(item && item.type, 'functional'),
+    sourceFinding: text(item && item.sourceFinding, 'BugLens session'),
+    dataNeeded: text(item && item.dataNeeded, 'Standard QA account or existing test data.'),
+    steps: Array.isArray(item && item.steps) ? item.steps.slice(0, 10).map((step) => text(step)).filter(Boolean) : [],
+    expectedResult: text(item && item.expectedResult, 'The flow completes without confirmed API, console, or UI defects.')
+  }));
+  const fallbackTestCases = recommendedNextTests.map((item, index) => ({
+    title: `Follow-up QA check ${index + 1}`,
+    objective: item,
+    priority: 'P2',
+    type: 'regression',
+    sourceFinding: 'AI recommended next test',
+    dataNeeded: 'Standard QA test data.',
+    steps: [
+      'Open the page or flow captured in the BugLens session.',
+      item,
+      'Observe network, console, and visible UI behavior while completing the flow.'
+    ],
+    expectedResult: 'The flow completes without confirmed BugLens defects or user-facing regressions.'
+  }));
+  const actionableIssues = safeArray(value.actionableIssues, (item) => ({
+    title: text(item && item.title),
+    severity: text(item && item.severity),
+    reason: text(item && item.reason),
+    recommendation: text(item && item.recommendation)
+  }));
+  const bugReportDrafts = safeArray(value.bugReportDrafts, (item) => ({
+    title: text(item && item.title),
+    severity: text(item && item.severity),
+    stepsToReproduce: Array.isArray(item && item.stepsToReproduce) ? item.stepsToReproduce.slice(0, 8).map((step) => text(step)).filter(Boolean) : [],
+    expectedResult: text(item && item.expectedResult),
+    actualResult: text(item && item.actualResult),
+    evidenceSummary: text(item && item.evidenceSummary)
+  })).filter((item) => item.title || item.evidenceSummary);
+  const fallbackBugDrafts = actionableIssues.map((item) => ({
+    title: item.title || 'BugLens actionable issue',
+    severity: item.severity || 'needs review',
+    stepsToReproduce: [
+      'Open the page captured in the BugLens session.',
+      'Start BugLens, reload the page, and repeat the tested user flow.',
+      'Observe the evidence described in the BugLens finding.'
+    ],
+    expectedResult: item.recommendation || 'The tested flow completes without user-facing defects.',
+    actualResult: item.reason || 'BugLens captured evidence that requires developer review.',
+    evidenceSummary: item.reason || 'Actionable BugLens finding.'
+  }));
+
+  return {
+    qaHealth,
+    executiveSummary: text(value.executiveSummary, 'AI completed the review but did not provide an executive summary.'),
+    actionableIssues,
+    likelyFalsePositives: safeArray(value.likelyFalsePositives, (item) => ({
+      title: text(item && item.title),
+      reason: text(item && item.reason)
+    })),
+    needsReview: safeArray(value.needsReview, (item) => ({
+      title: text(item && item.title),
+      whatToVerify: text(item && item.whatToVerify)
+    })),
+    recommendedNextTests,
+    testCases: testCases.length ? testCases : fallbackTestCases,
+    bugReportDrafts: bugReportDrafts.length ? bugReportDrafts : fallbackBugDrafts,
+    managerSummary: text(value.managerSummary, 'No manager summary was provided by AI.'),
+    developerSummary: text(value.developerSummary, 'No developer summary was provided by AI.')
+  };
+}
+
+function copyAiSummary() {
+  if (!state.ai.analysis) {
+    showToast('No AI summary to copy yet.', 'error');
+    return;
+  }
+  const analysis = state.ai.analysis;
+  const lines = [
+    `AI QA Health: ${analysis.qaHealth}`,
+    '',
+    analysis.executiveSummary,
+    '',
+    'Recommended next tests:',
+    ...analysis.recommendedNextTests.map((item) => `- ${item}`),
+    '',
+    'Manager summary:',
+    analysis.managerSummary,
+    '',
+    'Developer summary:',
+    analysis.developerSummary
+  ];
+  copyText(lines.join('\n').trim(), els.copyAiSummaryBtn);
+}
+
+function downloadAiMarkdown() {
+  if (!state.ai.analysis) {
+    showToast('No AI output to download yet.', 'error');
+    return;
+  }
+  const mode = normalizeAiMode(state.ai.activeMode);
+  const markdown = buildAiMarkdown(state.ai.analysis, mode);
+  downloadBlob(markdown, `buglens-ai-${mode}-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
+  showToast('AI Markdown downloaded.', 'success');
+}
+
+function downloadAiJson() {
+  if (!state.ai.analysis) {
+    showToast('No AI output to download yet.', 'error');
+    return;
+  }
+  const mode = normalizeAiMode(state.ai.activeMode);
+  const payload = {
+    tool: 'BugLens',
+    version: VERSION,
+    generatedAt: new Date().toISOString(),
+    mode,
+    pageUrl: state.pageUrl,
+    aiAnalysis: state.ai.analysis
+  };
+  downloadBlob(JSON.stringify(payload, null, 2), `buglens-ai-${mode}-${dateFilePart()}.json`, 'application/json');
+  showToast('AI JSON downloaded.', 'success');
+}
+
+function buildAiMarkdown(analysis, mode) {
+  const lines = [
+    `# BugLens AI ${modeLabel(mode)}`,
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Page: ${state.pageUrl || 'N/A'}`,
+    `AI QA Health: ${analysis.qaHealth}`,
+    ''
+  ];
+
+  if (mode === 'test-cases') {
+    lines.push('## Test Cases', '');
+    for (const testCase of analysis.testCases || []) {
+      lines.push(`### ${testCase.title}`);
+      lines.push(`- Priority: ${testCase.priority || 'P2'}`);
+      lines.push(`- Type: ${testCase.type || 'functional'}`);
+      lines.push(`- Source: ${testCase.sourceFinding || 'BugLens session'}`);
+      lines.push(`- Data Needed: ${testCase.dataNeeded || 'Standard QA test data.'}`);
+      lines.push('', testCase.objective || 'Verify the behavior described by BugLens evidence.', '');
+      lines.push('Steps:');
+      (testCase.steps || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+      lines.push('', `Expected Result: ${testCase.expectedResult || 'The flow completes without confirmed defects.'}`, '');
+    }
+    return lines.join('\n').trim();
+  }
+
+  if (mode === 'bug-reports') {
+    lines.push('## Bug Report Drafts', '');
+    for (const draft of analysis.bugReportDrafts || []) {
+      lines.push(`### ${draft.title}`);
+      lines.push(`Severity: ${draft.severity || 'needs review'}`, '');
+      lines.push('Steps to Reproduce:');
+      (draft.stepsToReproduce || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+      lines.push('', `Expected Result: ${draft.expectedResult || 'N/A'}`);
+      lines.push(`Actual Result: ${draft.actualResult || 'N/A'}`);
+      lines.push(`Evidence: ${draft.evidenceSummary || 'N/A'}`, '');
+    }
+    return lines.join('\n').trim();
+  }
+
+  lines.push('## Executive Summary', '', analysis.executiveSummary || 'N/A', '');
+  lines.push('## Actionable Issues', '');
+  for (const item of analysis.actionableIssues || []) {
+    lines.push(`- ${item.title}: ${item.reason} Recommendation: ${item.recommendation}`);
+  }
+  lines.push('', '## Needs Review', '');
+  for (const item of analysis.needsReview || []) {
+    lines.push(`- ${item.title}: ${item.whatToVerify}`);
+  }
+  lines.push('', '## Recommended Next Tests', '');
+  for (const item of analysis.recommendedNextTests || []) {
+    lines.push(`- ${item}`);
+  }
+  lines.push('', '## Manager Summary', '', analysis.managerSummary || 'N/A');
+  lines.push('', '## Developer Summary', '', analysis.developerSummary || 'N/A');
+  return lines.join('\n').trim();
+}
+
+function modeLabel(mode) {
+  return {
+    analysis: 'Analysis',
+    'test-cases': 'Test Cases',
+    'bug-reports': 'Bug Reports'
+  }[mode] || 'Analysis';
 }
 
 function getSessionStatus() {
@@ -1697,18 +2648,18 @@ function renderIssues() {
       els.emptyIcon.classList.toggle('neutral', true);
       emptyTitle.textContent = 'Start a QA session';
       emptyCopy.textContent = 'Start the session and reload the page for complete API and console coverage.';
-    } else if (state.activeView === 'console' && !state.issues.some((issue) => issue.type === 'console')) {
+    } else if (els.typeFilter.value === 'console' && !state.issues.some((issue) => issue.type === 'console')) {
       emptyTitle.textContent = 'No console errors detected';
       emptyCopy.textContent = 'BugLens captured console errors, warnings, runtime failures, and unhandled promise rejections during this session.';
-    } else if (state.activeView === 'ui' && state.uiStats.scans === 0) {
+    } else if (els.typeFilter.value === 'ui' && state.uiStats.scans === 0) {
       els.emptyIcon.textContent = 'i';
       els.emptyIcon.classList.toggle('neutral', true);
       emptyTitle.textContent = 'UI scan not run yet';
-      emptyCopy.textContent = 'Open the screen you want to review, then run a focused UI scan.';
-    } else if (state.activeView === 'ui' && !state.issues.some((issue) => issue.type === 'ui')) {
+      emptyCopy.textContent = 'Open the screen you want to review, then run a focused UI scan from the dashboard.';
+    } else if (els.typeFilter.value === 'ui' && !state.issues.some((issue) => issue.type === 'ui')) {
       emptyTitle.textContent = 'No UI findings on this screen';
       emptyCopy.textContent = 'The latest scan did not detect a confirmed layout, readability, image, or interaction concern.';
-    } else if (state.activeView === 'api' && counts.frameworkNoise > 0 && filtered.length === 0) {
+    } else if (counts.frameworkNoise > 0 && filtered.length === 0) {
       emptyTitle.textContent = 'No actionable API issues found';
       emptyCopy.textContent = `${counts.frameworkNoise} framework observation${counts.frameworkNoise === 1 ? ' is' : 's are'} hidden and not counted as application issues.`;
     } else if (state.issues.length > 0) {
@@ -1729,14 +2680,14 @@ function renderIssues() {
 }
 
 function getFilteredIssues() {
-  const type = ['api', 'console', 'ui'].includes(state.activeView) ? state.activeView : 'all';
+  const selectedType = state.activeView === 'ui' ? 'ui' : els.typeFilter.value;
   const category = els.categoryFilter.value;
   const severity = els.severityFilter.value;
   const search = els.searchInput.value.trim().toLowerCase();
 
   return state.issues.filter((issue) => {
-    if (type !== 'all' && issue.type !== type) return false;
-    if (state.activeView === 'dashboard' && !issue.includeInIssueCount) return false;
+    if (selectedType === 'noise' && issue.category !== 'framework-noise' && issue.category !== 'informational') return false;
+    if (selectedType !== 'all' && selectedType !== 'noise' && issue.type !== selectedType) return false;
     if (category === 'counted' && !issue.includeInIssueCount) return false;
     if (category !== 'all' && category !== 'counted' && issue.category !== category) return false;
     if (issue.category === 'framework-noise'
@@ -1756,10 +2707,8 @@ function getFilteredIssues() {
 }
 
 function getFindingsHeading() {
-  if (state.activeView === 'api') return 'API Findings';
-  if (state.activeView === 'console') return 'Console Findings';
-  if (state.activeView === 'ui') return 'UI Findings';
-  return 'Priority Findings';
+  if (state.activeView === 'ui') return 'UI Bug Findings';
+  return 'Session Findings';
 }
 
 function renderIssueCard(issue) {
@@ -1910,17 +2859,22 @@ function countIssues(issues) {
 
 function calculateHealthScore(issues) {
   let score = 100;
+  let actionableCount = 0;
+  let needsReviewCount = 0;
   for (const issue of issues) {
     if (issue.category === 'framework-noise' || issue.category === 'informational' || issue.category === 'passed') continue;
     if (issue.category === 'needs-review') {
-      score -= 3;
+      needsReviewCount += 1;
       continue;
     }
-    score -= { critical: 30, high: 18, medium: 9, low: 3, info: 0 }[issue.severity] || 0;
-    if (issue.type === 'console' && issue.evidence && issue.evidence.level === 'error') score -= 5;
+    actionableCount += 1;
+    score -= { critical: 28, high: 16, medium: 8, low: 2, info: 0 }[issue.severity] || 0;
   }
+  score -= Math.min(25, needsReviewCount * 2);
+  if (actionableCount === 0 && needsReviewCount > 0) score = Math.max(score, 75);
+  if (actionableCount === 0 && needsReviewCount === 0) score = Math.max(score, 90);
   score = Math.max(0, Math.round(score));
-  const label = score >= 90 ? 'Excellent' : score >= 75 ? 'Good' : score >= 55 ? 'Needs Attention' : 'At Risk';
+  const label = score >= 90 ? 'Excellent' : score >= 75 ? 'Good' : score >= 55 ? 'Needs Review' : score >= 30 ? 'Risky' : 'Broken';
   return { score, label };
 }
 
@@ -2178,7 +3132,7 @@ function buildReport() {
     const channel = issue.evidence && issue.evidence.channel;
     const level = issue.evidence && issue.evidence.level;
     if (channel === 'promise') summary.unhandledRejections += 1;
-    if (level === 'warn') summary.warnings += 1;
+    if (['warn', 'warning'].includes(level)) summary.warnings += 1;
     if (level === 'error') summary.errors += 1;
     return summary;
   }, { errors: 0, warnings: 0, unhandledRejections: 0 });
@@ -2244,6 +3198,7 @@ function buildReport() {
     passedChecks,
     ignoredFindings,
     findings: reportable.map(serializeFinding),
+    aiAnalysis: state.settings.includeAiSummaryInReport && state.ai.analysis ? state.ai.analysis : null,
     redactionNotice: 'Common credentials, tokens, cookies, secrets, and sensitive query values are replaced with [REDACTED].',
     limitations: REPORT_LIMITATIONS,
     settings: state.settings
@@ -2320,6 +3275,7 @@ function buildIgnoredFindings() {
 
 function exportJson() {
   try {
+    state.settings = readSettingsFromForm();
     const report = buildReport();
     downloadBlob(JSON.stringify(report, null, 2), `buglens-report-${dateFilePart()}.json`, 'application/json');
     showToast('JSON report exported.', 'success');
@@ -2332,6 +3288,7 @@ function exportJson() {
 
 function exportHtml() {
   try {
+    state.settings = readSettingsFromForm();
     const report = buildReport();
     const html = renderHtmlReport(report);
     downloadBlob(html, `buglens-report-${dateFilePart()}.html`, 'text/html');
@@ -2361,6 +3318,46 @@ function renderHtmlReport(report) {
       ${findings.length ? findings.map((finding) => findingCard(finding)).join('') : `<p class="muted">${escapeHtml(emptyText)}</p>`}
     </section>
   `;
+  const aiSection = report.aiAnalysis ? `
+    <section>
+      <h2>AI Assistant Summary</h2>
+      <p><strong>AI QA health:</strong> ${escapeHtml(report.aiAnalysis.qaHealth)}</p>
+      <p>${escapeHtml(report.aiAnalysis.executiveSummary)}</p>
+      <h3>Recommended next tests</h3>
+      ${report.aiAnalysis.recommendedNextTests.length
+        ? `<ul>${report.aiAnalysis.recommendedNextTests.map((item) => `<li>${escapeHtml(item)}</li>`).join('')}</ul>`
+        : '<p class="muted">No AI test suggestions were included.</p>'}
+      <h3>Generated test cases</h3>
+      ${report.aiAnalysis.testCases && report.aiAnalysis.testCases.length
+        ? report.aiAnalysis.testCases.map((testCase) => `
+          <article class="finding info">
+            <h3>${escapeHtml(testCase.title)}</h3>
+            <p><strong>Priority:</strong> ${escapeHtml(testCase.priority)} &nbsp; <strong>Type:</strong> ${escapeHtml(testCase.type)}</p>
+            <p><strong>Objective:</strong> ${escapeHtml(testCase.objective)}</p>
+            <p><strong>Data needed:</strong> ${escapeHtml(testCase.dataNeeded)}</p>
+            <ol>${(testCase.steps || []).map((step) => `<li>${escapeHtml(step)}</li>`).join('')}</ol>
+            <p><strong>Expected:</strong> ${escapeHtml(testCase.expectedResult)}</p>
+          </article>
+        `).join('')
+        : '<p class="muted">No AI test cases were included.</p>'}
+      <h3>Bug report drafts</h3>
+      ${report.aiAnalysis.bugReportDrafts.length
+        ? report.aiAnalysis.bugReportDrafts.map((draft) => `
+          <article class="finding ${escapeHtml(draft.severity || 'info')}">
+            <h3>${escapeHtml(draft.title)}</h3>
+            <p><strong>Severity:</strong> ${escapeHtml(draft.severity)}</p>
+            <p><strong>Expected:</strong> ${escapeHtml(draft.expectedResult)}</p>
+            <p><strong>Actual:</strong> ${escapeHtml(draft.actualResult)}</p>
+            <p><strong>Evidence:</strong> ${escapeHtml(draft.evidenceSummary)}</p>
+          </article>
+        `).join('')
+        : '<p class="muted">No AI bug drafts were included.</p>'}
+      <h3>Manager summary</h3>
+      <p>${escapeHtml(report.aiAnalysis.managerSummary || 'N/A')}</p>
+      <h3>Developer summary</h3>
+      <p>${escapeHtml(report.aiAnalysis.developerSummary || 'N/A')}</p>
+    </section>
+  ` : '';
   const apiFindings = report.findings.filter((finding) => (
     finding.type === 'api'
     && finding.category !== 'framework-noise'
@@ -2444,6 +3441,7 @@ function renderHtmlReport(report) {
   ${section('API Findings', apiFindings, 'No reportable business API findings.')}
   ${section('Console Findings', consoleFindings, 'No reportable console findings.')}
   ${section('UI Findings', uiFindings, 'No reportable UI findings.')}
+  ${aiSection}
   <section>
     <h2>Framework Noise / Ignored Findings</h2>
     ${[...report.frameworkNoise, ...report.observations.filter((finding) => finding.category === 'informational')].length
@@ -2477,6 +3475,7 @@ function renderHtmlReport(report) {
 }
 
 function exportCsv() {
+  state.settings = readSettingsFromForm();
   if (!state.settings.csvExportEnabled) {
     setTemporaryText(els.exportCsvBtn, 'Disabled');
     showToast('CSV export is disabled in Settings.', 'error');
