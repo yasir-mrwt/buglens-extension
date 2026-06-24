@@ -41,6 +41,10 @@ class AIProvider {
   async completeChat() {
     throw new Error('AIProvider.completeChat is not implemented.');
   }
+
+  async streamChat() {
+    throw new Error('AIProvider.streamChat is not implemented.');
+  }
 }
 
 class OllamaProvider extends AIProvider {
@@ -101,6 +105,60 @@ class OllamaProvider extends AIProvider {
     const content = payload?.choices?.[0]?.message?.content;
     if (!content) throw new Error('Ollama returned an empty chat response.');
     return parseOptionalJsonFromModel(content);
+  }
+
+  async streamChat({ system, user, onToken, signal }) {
+    const response = await fetch(`${this.baseUrl}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      signal,
+      body: JSON.stringify({
+        model: this.model,
+        stream: true,
+        options: { temperature: 0.3 },
+        messages: [
+          { role: 'system', content: system },
+          { role: 'user', content: user }
+        ]
+      })
+    });
+    if (!response.ok) {
+      const body = await response.text().catch(() => '');
+      throw new Error(`Ollama stream returned ${response.status}: ${body.slice(0, 240)}`);
+    }
+    if (!response.body || typeof response.body.getReader !== 'function') {
+      const result = await this.completeChat({ system, user });
+      const answer = typeof result === 'string' ? result : (result.answer || result.message || '');
+      if (answer) onToken(answer);
+      return answer;
+    }
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let answer = '';
+    const consumeLine = (line) => {
+      const trimmed = line.trim();
+      if (!trimmed) return;
+      const payload = JSON.parse(trimmed);
+      const token = payload?.message?.content || payload?.response || '';
+      if (token) {
+        answer += token;
+        onToken(token);
+      }
+      if (payload.done && payload.error) throw new Error(payload.error);
+    };
+
+    while (true) {
+      const { value, done } = await reader.read();
+      buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+      const lines = buffer.split(/\r?\n/);
+      buffer = lines.pop() || '';
+      for (const line of lines) consumeLine(line);
+      if (done) break;
+    }
+    if (buffer.trim()) consumeLine(buffer);
+    return answer;
   }
 }
 
@@ -169,6 +227,11 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    if (req.method === 'POST' && isChatStreamRoute(req.url)) {
+      await handleChatStream(req, res);
+      return;
+    }
+
     sendJson(res, 404, { ok: false, error: 'Not found' });
   } catch (error) {
     sendJson(res, 500, { ok: false, error: error.message || 'Internal server error' });
@@ -188,6 +251,11 @@ server.listen(CONFIG.port, () => {
 function isChatRoute(url) {
   const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
   return pathname === '/api/ai/chat' || pathname === '/api/chat';
+}
+
+function isChatStreamRoute(url) {
+  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
+  return pathname === '/api/ai/chat-stream' || pathname === '/api/chat-stream';
 }
 
 async function handleAi(req, res, task) {
@@ -279,6 +347,100 @@ async function handleChat(req, res) {
     usedContext,
     suggestedActions: suggestChatActions(question, context)
   });
+}
+
+async function handleChatStream(req, res) {
+  console.log(`[${new Date().toISOString()}] chat stream request received`);
+  const body = await readJson(req);
+  const question = String(body.message || body.question || '').slice(0, 1000);
+  const context = sanitizeIncomingSession(body.context || {});
+  const history = sanitizeChatHistory(body.history || []);
+  const scope = classifyChatScope(question);
+  const usedContext = buildUsedContextList(context);
+  const fallbackAnswer = scope === 'irrelevant'
+    ? 'I can only help with this TestPilot QA session, testing, debugging, reports, and software engineering topics. Ask me about the current findings, APIs, UI scan, console logs, or what to test next.'
+    : buildFallbackChatAnswer(question, context, '');
+
+  sendSseHeaders(res);
+  if (scope === 'irrelevant') {
+    sendSse(res, 'token', { token: fallbackAnswer });
+    sendSse(res, 'done', {
+      ok: true,
+      fallback: false,
+      fallbackReason: '',
+      answer: fallbackAnswer,
+      scope,
+      usedContext,
+      suggestedActions: ['Ask about current findings', 'Review API failures', 'Explain health score']
+    });
+    res.end();
+    return;
+  }
+
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), CONFIG.chatTimeoutMs);
+  let rawAnswer = '';
+  let usedFallback = false;
+  let fallbackReason = '';
+
+  try {
+    rawAnswer = await provider.streamChat({
+      system: buildChatSystemPrompt(),
+      user: JSON.stringify({ message: question, context, history }, null, 2),
+      signal: controller.signal,
+      onToken(token) {
+        sendSse(res, 'token', { token });
+      }
+    });
+    const answer = cleanChatAnswerText(rawAnswer);
+    if (!answer || !isChatAnswerAligned(question, answer)) {
+      usedFallback = true;
+      fallbackReason = answer ? 'AI answer did not match the requested task.' : 'AI returned no usable chat answer.';
+      const replacement = buildFallbackChatAnswer(question, context, fallbackReason);
+      sendSse(res, 'replace', { answer: replacement });
+      rawAnswer = replacement;
+    } else {
+      rawAnswer = answer;
+    }
+  } catch (error) {
+    usedFallback = true;
+    fallbackReason = formatProviderError(error);
+    rawAnswer = isProviderCapacityError(fallbackReason)
+      ? buildProviderUnavailableChatAnswer(fallbackReason)
+      : buildFallbackChatAnswer(question, context, fallbackReason);
+    sendSse(res, 'replace', { answer: rawAnswer });
+    console.warn(`[${new Date().toISOString()}] chat stream using fallback: ${fallbackReason}`);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  console.log(`[${new Date().toISOString()}] chat stream completed${usedFallback ? ' with fallback' : ''}`);
+  sendSse(res, 'done', {
+    ok: true,
+    fallback: usedFallback,
+    fallbackReason,
+    answer: rawAnswer,
+    scope,
+    usedContext,
+    suggestedActions: suggestChatActions(question, context)
+  });
+  res.end();
+}
+
+function sendSseHeaders(res) {
+  res.writeHead(200, {
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
+    'Content-Type': 'text/event-stream; charset=utf-8',
+    'Cache-Control': 'no-cache, no-transform',
+    Connection: 'keep-alive'
+  });
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\n`);
+  res.write(`data: ${JSON.stringify(data)}\n\n`);
 }
 
 function buildChatSystemPrompt() {

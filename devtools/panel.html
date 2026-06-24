@@ -420,6 +420,30 @@
 
           <section class="report-panel reports-only">
             <div id="reportPreview" class="report-preview"></div>
+            <article class="report-builder">
+              <div class="report-builder-head">
+                <div>
+                  <span class="eyebrow">Report builder</span>
+                  <h2>Ready-to-file bug draft</h2>
+                  <p>Edit the draft before copying it into Jira, Linear, Slack, or a QA handoff.</p>
+                </div>
+                <div class="report-builder-actions">
+                  <button id="refreshReportBuilderBtn" type="button">Refresh Draft</button>
+                  <button id="copyReportBuilderBtn" type="button">Copy Draft</button>
+                  <button id="downloadReportBuilderBtn" type="button">Export Markdown</button>
+                </div>
+              </div>
+              <div class="report-builder-grid">
+                <label>Title<input id="reportBuilderTitle" type="text" placeholder="No confirmed defect selected yet" /></label>
+                <label>Severity<select id="reportBuilderSeverity"><option>needs review</option><option>critical</option><option>high</option><option>medium</option><option>low</option></select></label>
+                <label>Status<select id="reportBuilderStatus"><option>needs review</option><option>confirmed</option><option>ignored</option></select></label>
+                <label class="wide-field">Summary<textarea id="reportBuilderSummary" rows="3" placeholder="Short defect summary"></textarea></label>
+                <label class="wide-field">Steps to reproduce<textarea id="reportBuilderSteps" rows="5" placeholder="1. Open the tested page..."></textarea></label>
+                <label class="wide-field">Expected result<textarea id="reportBuilderExpected" rows="2" placeholder="What should happen"></textarea></label>
+                <label class="wide-field">Actual result<textarea id="reportBuilderActual" rows="2" placeholder="What happened instead"></textarea></label>
+                <label class="wide-field">Evidence<textarea id="reportBuilderEvidence" rows="4" placeholder="Sanitized TestPilot evidence"></textarea></label>
+              </div>
+            </article>
             <div class="export-grid">
               <article class="export-card">
                 <span class="file-type">HTML</span>

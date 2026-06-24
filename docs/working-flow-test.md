@@ -204,6 +204,7 @@ Expected:
 
 - TestPilot answers as a QA assistant.
 - It does not execute page actions.
+- With `Local Backend`, response text streams into the assistant message as the local model writes tokens.
 - If backend is down, it shows a clear local fallback response.
 
 Pass:
@@ -212,7 +213,7 @@ Pass:
 
 Fail:
 
-- Chat runs agent actions, returns the same irrelevant answer every time, or crashes on backend timeout.
+- Chat runs agent actions, returns the same irrelevant answer every time, waits silently for the full local LLM response, or crashes on backend timeout.
 
 ## 8. Agent Mode: Highlight Elements
 
@@ -331,6 +332,8 @@ Expected:
 
 - Evidence is linked under the relevant action step.
 - Example: `PASS click #4: Clicked safe target` followed by linked API/console evidence.
+- Agent response includes `Outcome`, `Evidence confidence`, `Evidence summary`, a safe plan, observed action results, passed checks, failed checks, and recommended next steps.
+- The response says when evidence is weak instead of presenting a needs-review result as a confirmed bug.
 - Bug report/test generation can use latest agent evidence.
 
 Pass:
@@ -340,8 +343,38 @@ Pass:
 Fail:
 
 - The report shows all raw logs with no action relationship, or no linked evidence appears after a known failing action.
+- Agent claims a pass/fail without action evidence, linked evidence, or tester review guidance.
 
-## 13. Test Case Generation Tab
+## 13. False-Positive Controls
+
+Steps:
+
+1. Capture at least one finding.
+2. Open `Network / Findings` or `UI Bugs`.
+3. On a finding, click `Real Bug`.
+4. Confirm the category/count updates as actionable.
+5. Click `Needs Review`.
+6. Confirm it remains counted but is marked for tester confirmation.
+7. Click `Ignore`.
+8. Open `Reports` and export JSON/HTML.
+
+Expected:
+
+- `Real Bug`, `Needs Review`, and `Ignore` buttons appear on each finding.
+- The active tester decision is visually highlighted.
+- Ignored findings move out of the health score and appear as informational/ignored report context.
+- Confirmed findings remain reportable and influence generated bug drafts.
+- Exported reports include `reviewStatus` and `reviewedAt`.
+
+Pass:
+
+- Tester decisions persist after reload and affect dashboard counts, report builder drafts, and exports.
+
+Fail:
+
+- Buttons only change styling, ignored items still lower the score, or exports lose the tester decision.
+
+## 14. Test Case Generation Tab
 
 Steps:
 
@@ -375,7 +408,7 @@ Fail:
 
 - Output says no test cases after a real session with evidence, generated tests invent unrelated product features, or the chat thread fills with the full test-case output.
 
-## 14. Bug Report Generation
+## 15. Bug Report Generation
 
 Steps:
 
@@ -405,7 +438,36 @@ Fail:
 
 - Bug report gives health-score advice instead of a bug draft, invents steps/evidence, or appears below the main chat.
 
-## 15. Accessibility / UI Scan
+## 16. Report Builder
+
+Steps:
+
+1. Capture a finding or generate a bug report draft.
+2. Open `Reports`.
+3. Review the `Ready-to-file bug draft` panel.
+4. Edit the title, severity, status, summary, steps, expected result, actual result, or evidence.
+5. Click `Copy Draft`.
+6. Click `Export Markdown`.
+7. Click `Refresh Draft`.
+8. Export HTML and JSON.
+
+Expected:
+
+- The builder auto-fills from the strongest current evidence: generated bug draft, confirmed finding, needs-review finding, or latest Agent result.
+- Manual edits are not overwritten during normal rendering.
+- `Refresh Draft` intentionally rebuilds from current evidence.
+- Copy/export produces a clean Markdown bug draft.
+- JSON/HTML reports include the report-builder draft.
+
+Pass:
+
+- The draft is useful for Jira/Linear after tester review and does not expose secrets.
+
+Fail:
+
+- Builder is empty despite reportable evidence, edits disappear unexpectedly, or exported reports omit the draft.
+
+## 17. Accessibility / UI Scan
 
 Steps:
 
@@ -429,7 +491,7 @@ Fail:
 
 - Scan returns nothing on a page with obvious unlabeled inputs/images, or floods the report with decorative false positives.
 
-## 16. Export And Copy
+## 18. Export And Copy
 
 Steps:
 
@@ -441,6 +503,7 @@ Steps:
 Expected:
 
 - Export includes session details, findings, redaction notice, limitations, and latest agent result.
+- Export includes the report-builder draft when present.
 - Sensitive query values, tokens, cookies, auth headers, and passwords are redacted.
 
 Pass:
@@ -451,7 +514,7 @@ Fail:
 
 - Export exposes secrets or loses the latest agent result.
 
-## 17. Automated Checks
+## 19. Automated Checks
 
 Run these after code changes:
 
@@ -460,6 +523,8 @@ node --check devtools/panel.js
 node --check content/content-script.js
 node --check background/service-worker.js
 node --check ai-backend/server.js
+node tests/ai-provider-settings-smoke.js
+node tests/responsive-ui-smoke.js
 node tests/network-analyzer-smoke.js
 node tests/ui-scanner-smoke.js
 git diff --check
@@ -495,10 +560,13 @@ Run these exact prompts in `Agent` mode after starting a session and reloading t
 
 Each Agent response should include:
 
-- `Status`
+- `Outcome`
+- `Evidence confidence`
+- `Evidence summary`
 - `Task`
 - `Data Strategy`
-- `Summary`
+- `Safe plan`
+- `Observed action results`
 - `Evidence`
 - `Passed Checks`
 - `Failed Checks`

@@ -242,6 +242,7 @@ let aiHealthTimer = null;
 let autoUiScanTimer = null;
 let lastAutoUiScanAt = 0;
 let aiApiKeyTouched = false;
+let reportBuilderDirty = false;
 
 const els = {
   startBtn: document.getElementById('startBtn'),
@@ -306,6 +307,17 @@ const els = {
   reportActionable: document.getElementById('reportActionable'),
   reportReview: document.getElementById('reportReview'),
   reportRoutes: document.getElementById('reportRoutes'),
+  reportBuilderTitle: document.getElementById('reportBuilderTitle'),
+  reportBuilderSeverity: document.getElementById('reportBuilderSeverity'),
+  reportBuilderStatus: document.getElementById('reportBuilderStatus'),
+  reportBuilderSummary: document.getElementById('reportBuilderSummary'),
+  reportBuilderSteps: document.getElementById('reportBuilderSteps'),
+  reportBuilderExpected: document.getElementById('reportBuilderExpected'),
+  reportBuilderActual: document.getElementById('reportBuilderActual'),
+  reportBuilderEvidence: document.getElementById('reportBuilderEvidence'),
+  refreshReportBuilderBtn: document.getElementById('refreshReportBuilderBtn'),
+  copyReportBuilderBtn: document.getElementById('copyReportBuilderBtn'),
+  downloadReportBuilderBtn: document.getElementById('downloadReportBuilderBtn'),
   aiStatusPill: document.getElementById('aiStatusPill'),
   testPilotCurrentView: document.getElementById('testPilotCurrentView'),
   aiStatusTitle: document.getElementById('aiStatusTitle'),
@@ -510,6 +522,26 @@ function bindEvents() {
   els.exportHtmlBtn.addEventListener('click', exportHtml);
   els.exportCsvBtn.addEventListener('click', exportCsv);
   els.copyReportBtn.addEventListener('click', copyBugReport);
+  els.refreshReportBuilderBtn?.addEventListener('click', () => populateReportBuilderDraft({ force: true, notify: true }));
+  els.copyReportBuilderBtn?.addEventListener('click', copyReportBuilderDraft);
+  els.downloadReportBuilderBtn?.addEventListener('click', downloadReportBuilderDraft);
+  for (const field of [
+    els.reportBuilderTitle,
+    els.reportBuilderSeverity,
+    els.reportBuilderStatus,
+    els.reportBuilderSummary,
+    els.reportBuilderSteps,
+    els.reportBuilderExpected,
+    els.reportBuilderActual,
+    els.reportBuilderEvidence
+  ]) {
+    field?.addEventListener('input', () => {
+      reportBuilderDirty = true;
+    });
+    field?.addEventListener('change', () => {
+      reportBuilderDirty = true;
+    });
+  }
   els.saveSettingsBtn.addEventListener('click', saveSettingsFromForm);
   els.resetSettingsBtn.addEventListener('click', resetSettingsToDefaults);
   els.viewPriorityBtn.addEventListener('click', focusPriorityFindings);
@@ -709,7 +741,7 @@ function maskApiKey(value) {
   const text = String(value || '');
   if (!text) return '';
   const tail = text.slice(-4);
-  const prefix = text.includes('_') ? text.split('_')[0] : text.slice(0, 3);
+  const prefix = (text.split(/[-_]/)[0] || text.slice(0, 3)).slice(0, 8);
   return `${prefix || 'key'}-${'•'.repeat(8)}${tail}`;
 }
 
@@ -1317,6 +1349,8 @@ function compactIssueForStorage(issue) {
     recommendation: issue.recommendation,
     includeInIssueCount: issue.includeInIssueCount,
     includeInReport: issue.includeInReport,
+    reviewStatus: issue.reviewStatus || 'auto',
+    reviewedAt: issue.reviewedAt || null,
     evidence: compactStorageValue(issue.evidence, 0),
     url: issue.url,
     timestamp: issue.timestamp,
@@ -1336,9 +1370,11 @@ function compactAiStateForStorage(ai) {
     lastTask: safeAi.lastTask || '',
     activeMode: normalizeAiMode(safeAi.activeMode),
     chatMessages: boundedArray(safeAi.chatMessages, 20).map((message) => ({
-      role: message && message.role === 'user' ? 'user' : 'assistant',
+      role: ['user', 'assistant', 'system'].includes(message && message.role) ? message.role : 'assistant',
+      type: message && message.type === 'separator' ? 'separator' : undefined,
       text: String(message && message.text ? message.text : '').slice(0, MAX_STORAGE_STRING_LENGTH),
-      timestamp: message && message.timestamp ? message.timestamp : Date.now()
+      timestamp: message && message.timestamp ? message.timestamp : Date.now(),
+      streaming: false
     })),
     lastAgentResult: compactStorageValue(safeAi.lastAgentResult, 0),
     error: safeAi.error || '',
@@ -2111,6 +2147,10 @@ function normalizeIssue(issue) {
       ? issue.includeInIssueCount
       : category === 'actionable' || category === 'needs-review',
     includeInReport: typeof issue.includeInReport === 'boolean' ? issue.includeInReport : true,
+    reviewStatus: ['confirmed', 'needs-review', 'ignored', 'auto'].includes(issue.reviewStatus)
+      ? issue.reviewStatus
+      : 'auto',
+    reviewedAt: issue.reviewedAt || null,
     evidence,
     url,
     timestamp,
@@ -2383,6 +2423,7 @@ function render() {
   els.reportReview.textContent = counts.needsReview;
   els.reportRoutes.textContent = new Set(state.capturedUrls.filter(Boolean)).size;
   els.reportPreview.textContent = buildExecutiveSummary(counts, health);
+  renderReportBuilderState();
   renderDashboardGuidance(counts);
   renderAiState();
 
@@ -2593,7 +2634,8 @@ function renderAiChatMessages() {
     els.aiChatMessages.appendChild(article);
   }
 
-  if (aiChatBusy) {
+  const hasStreamingAssistant = messages.some((message) => message && message.role === 'assistant' && message.streaming);
+  if (aiChatBusy && !hasStreamingAssistant) {
     const thinking = document.createElement('article');
     thinking.className = 'ai-chat-message assistant thinking';
     const label = document.createElement('span');
@@ -2662,12 +2704,25 @@ async function submitAiChat(value) {
       });
       return;
     }
-    const providerResponse = await completeChatWithSelectedProvider(question);
-    const answer = String(providerResponse.text || '').trim() || buildLocalChatFallback(question);
-    state.ai.chatMessages.push({ role: 'assistant', text: answer, timestamp: Date.now() });
+    const streamingMessage = createStreamingAssistantMessage();
+    const providerResponse = await completeChatWithSelectedProvider(question, {
+      onToken(token) {
+        streamingMessage.text += token;
+        renderAiChatMessages();
+      },
+      onReplace(text) {
+        streamingMessage.text = text;
+        renderAiChatMessages();
+      }
+    });
+    streamingMessage.streaming = false;
+    streamingMessage.text = String(providerResponse.text || streamingMessage.text || '').trim() || buildLocalChatFallback(question);
     if (providerResponse.usage) recordAiUsage(providerResponse.usage);
     if (providerResponse.fallbackReason) addAiLog(`chat used fallback: ${providerResponse.fallbackReason}`);
   } catch (error) {
+    for (const message of state.ai.chatMessages || []) {
+      if (message && message.streaming) message.streaming = false;
+    }
     state.ai.chatMessages.push({
       role: 'assistant',
       text: `Local AI backend is not available. Start the backend and try again.\n\nReason: ${formatAiError(error)}`,
@@ -2682,9 +2737,21 @@ async function submitAiChat(value) {
   }
 }
 
-async function completeChatWithSelectedProvider(question) {
+function createStreamingAssistantMessage() {
+  state.ai.chatMessages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  const message = { role: 'assistant', text: '', timestamp: Date.now(), streaming: true };
+  state.ai.chatMessages.push(message);
+  state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+  renderAiChatMessages();
+  return message;
+}
+
+async function completeChatWithSelectedProvider(question, options = {}) {
   const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
   if (providerSettings.provider === 'local-backend') {
+    if (typeof options.onToken === 'function' || typeof options.onReplace === 'function') {
+      return streamLocalBackendChat(question, options);
+    }
     const context = buildCompactAiSessionSummary('chat');
     const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/ai/chat`, {
       method: 'POST',
@@ -2728,6 +2795,99 @@ async function completeChatWithSelectedProvider(question) {
     temperature: providerSettings.temperature,
     responseFormat: 'text'
   });
+}
+
+async function streamLocalBackendChat(question, options = {}) {
+  const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+  const context = buildCompactAiSessionSummary('chat');
+  const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/ai/chat-stream`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
+    body: JSON.stringify({
+      message: question,
+      mode: 'chat',
+      sessionId: state.sessionId,
+      pageUrl: state.pageUrl,
+      currentUserMessage: question,
+      context,
+      history: state.ai.chatMessages
+        .filter((message) => ['user', 'assistant'].includes(message.role) && message.text && !message.streaming)
+        .slice(-6)
+        .map((message) => ({
+          role: message.role,
+          text: message.text
+        }))
+    })
+  }, 190000);
+  if (!response.ok) throw new Error(`AI backend returned ${response.status}`);
+  if (!response.body || typeof response.body.getReader !== 'function') {
+    const payload = await response.json().catch(() => ({}));
+    return {
+      text: String(payload.answer || payload.message || '').trim(),
+      raw: payload,
+      fallbackReason: payload.fallback ? (payload.fallbackReason || 'local backend fallback') : ''
+    };
+  }
+
+  const reader = response.body.getReader();
+  const decoder = new TextDecoder();
+  let buffer = '';
+  let finalText = '';
+  let raw = {};
+  let fallbackReason = '';
+
+  const handleEvent = (eventText) => {
+    const lines = String(eventText || '').split(/\r?\n/);
+    let type = 'message';
+    const dataLines = [];
+    for (const line of lines) {
+      if (line.startsWith('event:')) type = line.slice(6).trim();
+      if (line.startsWith('data:')) dataLines.push(line.slice(5).trimStart());
+    }
+    if (!dataLines.length) return;
+    let data = {};
+    try {
+      data = JSON.parse(dataLines.join('\n'));
+    } catch {
+      data = { text: dataLines.join('\n') };
+    }
+    if (type === 'token') {
+      const token = String(data.token || data.text || '');
+      if (token) {
+        finalText += token;
+        options.onToken?.(token);
+      }
+    } else if (type === 'replace') {
+      finalText = String(data.answer || data.text || '');
+      options.onReplace?.(finalText);
+    } else if (type === 'done') {
+      raw = data;
+      if (data.answer) finalText = String(data.answer);
+      fallbackReason = data.fallbackReason || '';
+    } else if (type === 'error') {
+      fallbackReason = data.error || 'stream failed';
+      if (data.answer) {
+        finalText = String(data.answer);
+        options.onReplace?.(finalText);
+      }
+    }
+  };
+
+  while (true) {
+    const { value, done } = await reader.read();
+    buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+    const parts = buffer.split(/\n\n/);
+    buffer = parts.pop() || '';
+    for (const part of parts) handleEvent(part);
+    if (done) break;
+  }
+  if (buffer.trim()) handleEvent(buffer);
+
+  return {
+    text: finalText.trim(),
+    raw,
+    fallbackReason
+  };
 }
 
 function isTestCaseGenerationPrompt(value) {
@@ -2827,10 +2987,32 @@ function linkEvidenceToAgentResult(agentResult) {
     ...agentResult,
     actionResults: enrichedActions,
     linkedEvidence: linkedGroups,
+    evidenceQuality: buildAgentEvidenceQuality(enrichedActions, linkedGroups, existingResult),
     result: {
       ...existingResult,
       evidence
     }
+  };
+}
+
+function buildAgentEvidenceQuality(actionResults, linkedGroups, result = {}) {
+  const total = actionResults.length;
+  const passed = actionResults.filter((item) => item.success).length;
+  const failed = total - passed;
+  const linkedCount = linkedGroups.reduce((sum, group) => sum + (group.evidence || []).length, 0);
+  const hasFailure = failed > 0 || ['failed', 'needs_review'].includes(result.status);
+  const confidence = linkedCount >= 2 || (total > 0 && failed === 0)
+    ? 'high'
+    : (linkedCount || total ? 'medium' : 'low');
+  return {
+    confidence,
+    actionCount: total,
+    passedActions: passed,
+    failedActions: failed,
+    linkedEvidenceCount: linkedCount,
+    filingGuidance: hasFailure
+      ? 'Review the failed or needs-review steps and linked evidence before filing.'
+      : 'Agent did not confirm a failing behavior. Treat this as passed evidence unless a tester observes otherwise.'
   };
 }
 
@@ -2851,25 +3033,30 @@ function formatAgentResultForChat(agentResult) {
   const result = agentResult.result || {};
   const plan = agentResult.plan || {};
   const actionResults = Array.isArray(agentResult.actionResults) ? agentResult.actionResults : [];
+  const quality = agentResult.evidenceQuality || buildAgentEvidenceQuality(actionResults, agentResult.linkedEvidence || [], result);
+  const status = String(result.status || 'needs_review').replace(/_/g, ' ');
   const lines = [
-    `Status: ${String(result.status || 'needs_review').replace(/_/g, ' ')}`,
+    `Outcome: ${status}`,
+    `Evidence confidence: ${quality.confidence}`,
     `Task: ${String(agentResult.taskType || plan.taskType || 'general_page_validation').replace(/_/g, ' ')}`,
     `Data Strategy: ${String(agentResult.dataStrategy || plan.dataStrategy || 'unknown').replace(/_/g, ' ')}`,
     '',
     result.summary || plan.summary || 'Agent completed the workflow.',
     ''
   ];
+  lines.push(`Evidence summary: ${quality.passedActions}/${quality.actionCount} action(s) passed, ${quality.failedActions} failed, ${quality.linkedEvidenceCount} linked API/console event(s).`);
+  lines.push(quality.filingGuidance, '');
   if (plan.steps && plan.steps.length) {
-    lines.push('Plan:');
+    lines.push('Safe plan:');
     for (const [index, step] of plan.steps.entries()) {
-      lines.push(`${index + 1}. ${step.action}${step.targetIndex ? ` #${step.targetIndex}` : ''} - ${step.reason || 'QA step'}`);
+      lines.push(`${index + 1}. Attempt ${step.action}${step.targetIndex ? ` #${step.targetIndex}` : ''} - ${step.reason || 'QA step'}`);
     }
     lines.push('');
   }
   if (actionResults.length) {
-    lines.push('Action log:');
+    lines.push('Observed action results:');
     for (const item of actionResults) {
-      lines.push(`${item.success ? 'PASS' : 'FAIL'} ${item.action}${item.targetIndex ? ` #${item.targetIndex}` : ''}: ${item.message}`);
+      lines.push(`${item.success ? 'PASS' : 'REVIEW'} ${item.action}${item.targetIndex ? ` #${item.targetIndex}` : ''}: ${item.message}`);
       for (const evidence of (item.linkedEvidence || []).slice(0, 3)) {
         lines.push(`  - Linked ${evidence.summary}`);
       }
@@ -4220,6 +4407,7 @@ function summarizeAgentResultForAi(agentResult) {
     summary: String(result.summary || plan.summary || '').slice(0, 1000),
     planSummary: String(plan.summary || '').slice(0, 500),
     riskLevel: plan.riskLevel || 'safe',
+    evidenceQuality: agentResult.evidenceQuality || null,
     actionResults: (agentResult.actionResults || []).slice(0, 12).map((item) => ({
       action: item.action,
       targetIndex: item.targetIndex,
@@ -4661,6 +4849,9 @@ function renderIssueCard(issue) {
     evidenceBadges.push(makeBadge(`${Math.round(Number(evidence.durationMs))} ms`, 'metric'));
   }
   evidenceBadges.push(makeBadge(`${issue.confidence} confidence`, 'confidence'));
+  if (issue.reviewStatus && issue.reviewStatus !== 'auto') {
+    evidenceBadges.push(makeBadge(`tester ${issue.reviewStatus}`, issue.reviewStatus === 'ignored' ? 'informational' : issue.category));
+  }
 
   const title = document.createElement('h3');
   title.textContent = issue.count > 1 ? `${issue.title} ×${issue.count}` : issue.title;
@@ -4670,13 +4861,28 @@ function renderIssueCard(issue) {
 
   const actions = document.createElement('div');
   actions.className = 'issue-actions';
+  const realBtn = document.createElement('button');
+  realBtn.textContent = 'Real Bug';
+  realBtn.className = issue.reviewStatus === 'confirmed' ? 'active-review' : '';
+  realBtn.title = 'Mark this finding as a tester-confirmed bug.';
+  realBtn.addEventListener('click', () => updateIssueReviewStatus(issue.id, 'confirmed'));
+  const reviewBtn = document.createElement('button');
+  reviewBtn.textContent = 'Needs Review';
+  reviewBtn.className = issue.reviewStatus === 'needs-review' ? 'active-review' : '';
+  reviewBtn.title = 'Keep this finding for manual confirmation.';
+  reviewBtn.addEventListener('click', () => updateIssueReviewStatus(issue.id, 'needs-review'));
+  const ignoreBtn = document.createElement('button');
+  ignoreBtn.textContent = 'Ignore';
+  ignoreBtn.className = issue.reviewStatus === 'ignored' ? 'active-review ignored' : '';
+  ignoreBtn.title = 'Mark this finding as ignored or likely false positive.';
+  ignoreBtn.addEventListener('click', () => updateIssueReviewStatus(issue.id, 'ignored'));
   const copyBtn = document.createElement('button');
   copyBtn.textContent = issue.includeInIssueCount ? 'Copy Bug' : 'Copy Details';
   copyBtn.title = issue.includeInIssueCount
     ? 'Copy a ready-to-file bug description'
     : 'Copy the finding details';
   copyBtn.addEventListener('click', () => copyText(issue.suggestedBugText, copyBtn));
-  actions.append(copyBtn);
+  actions.append(realBtn, reviewBtn, ignoreBtn, copyBtn);
 
   header.append(heading, actions);
 
@@ -4709,6 +4915,43 @@ function renderIssueCard(issue) {
 
   card.append(header, description, context, meta, details);
   return card;
+}
+
+function updateIssueReviewStatus(issueId, status) {
+  const issue = state.issues.find((item) => item.id === issueId);
+  if (!issue) return;
+  const nextStatus = ['confirmed', 'needs-review', 'ignored'].includes(status) ? status : 'needs-review';
+  issue.reviewStatus = nextStatus;
+  issue.reviewedAt = Date.now();
+
+  if (nextStatus === 'confirmed') {
+    issue.category = 'actionable';
+    issue.includeInIssueCount = true;
+    issue.includeInReport = true;
+    issue.confidence = issue.confidence === 'low' ? 'medium' : issue.confidence;
+    issue.recommendation = issue.recommendation || 'Tester confirmed this finding. File and fix the defect.';
+  } else if (nextStatus === 'needs-review') {
+    issue.category = 'needs-review';
+    issue.includeInIssueCount = true;
+    issue.includeInReport = true;
+    issue.recommendation = issue.recommendation || 'Manually verify reproducibility before filing.';
+  } else {
+    issue.category = 'informational';
+    issue.severity = issue.severity === 'critical' || issue.severity === 'high' ? 'low' : issue.severity;
+    issue.confidence = 'low';
+    issue.includeInIssueCount = false;
+    issue.includeInReport = true;
+    issue.userImpact = 'Tester marked this as ignored or likely false positive.';
+    issue.recommendation = 'Keep as context only. Do not file unless new user-impacting evidence appears.';
+  }
+
+  issue.suggestedBugText = buildSuggestedBugText(issue);
+  state.lastUpdatedAt = Date.now();
+  reportBuilderDirty = false;
+  populateReportBuilderDraft({ force: true });
+  schedulePersist();
+  render();
+  showToast(`Finding marked ${nextStatus.replace('-', ' ')}.`, 'success');
 }
 
 function makeBadge(text, className) {
@@ -5031,6 +5274,178 @@ function getActualResult(issue) {
   return issue.title;
 }
 
+function renderReportBuilderState() {
+  if (!els.reportBuilderTitle) return;
+  if (!reportBuilderDirty) populateReportBuilderDraft();
+  const hasDraft = Boolean(String(els.reportBuilderTitle.value || '').trim());
+  if (els.copyReportBuilderBtn) els.copyReportBuilderBtn.disabled = !hasDraft;
+  if (els.downloadReportBuilderBtn) els.downloadReportBuilderBtn.disabled = !hasDraft;
+}
+
+function populateReportBuilderDraft(options = {}) {
+  if (!els.reportBuilderTitle) return;
+  if (reportBuilderDirty && !options.force) return;
+  const draft = buildReportBuilderDraft();
+  writeReportBuilderDraft(draft);
+  reportBuilderDirty = false;
+  if (options.notify) showToast('Report builder refreshed from current evidence.', 'success');
+}
+
+function buildReportBuilderDraft() {
+  const bugDraft = getCurrentBugDrafts()[0];
+  if (bugDraft) {
+    return {
+      title: bugDraft.title || 'Untitled bug draft',
+      severity: bugDraft.severity || 'needs review',
+      status: bugDraft.severity === 'needs review' ? 'needs review' : 'confirmed',
+      summary: bugDraft.actualResult || bugDraft.evidenceSummary || 'Generated bug draft requires tester review.',
+      steps: (bugDraft.stepsToReproduce || []).map((step, index) => `${index + 1}. ${step}`).join('\n'),
+      expected: bugDraft.expectedResult || 'Expected behavior was not provided.',
+      actual: bugDraft.actualResult || 'Actual behavior was not provided.',
+      evidence: bugDraft.evidenceSummary || 'No evidence summary was provided.'
+    };
+  }
+
+  const issue = getPrimaryReportIssue();
+  if (issue) {
+    return {
+      title: issue.title,
+      severity: issue.reviewStatus === 'ignored' ? 'needs review' : issue.severity,
+      status: issue.reviewStatus === 'confirmed'
+        ? 'confirmed'
+        : (issue.reviewStatus === 'ignored' ? 'ignored' : 'needs review'),
+      summary: issue.description || issue.userImpact || 'TestPilot captured a finding for review.',
+      steps: [
+        `1. Open ${issue.url || state.pageUrl || 'the tested page'}.`,
+        '2. Start TestPilot and reload the page.',
+        '3. Repeat the tested flow that produced this evidence.',
+        '4. Review the matching TestPilot finding.'
+      ].join('\n'),
+      expected: getExpectedResult(issue),
+      actual: getActualResult(issue),
+      evidence: summarizeEvidence(serializeFinding(issue))
+    };
+  }
+
+  const agent = summarizeAgentResultForAi(state.ai.lastAgentResult);
+  if (agent) {
+    return {
+      title: `Agent result: ${String(agent.taskType || 'workflow').replace(/_/g, ' ')}`,
+      severity: agent.status === 'failed' ? 'high' : 'needs review',
+      status: agent.status === 'passed' ? 'confirmed' : 'needs review',
+      summary: agent.summary || 'Agent completed with evidence that needs review.',
+      steps: [
+        `1. Open ${state.pageUrl || 'the tested page'}.`,
+        `2. Run Agent command: ${agent.command || agent.taskType || 'current workflow'}.`,
+        '3. Review the action log and linked evidence.'
+      ].join('\n'),
+      expected: 'The agent workflow should complete safely and the observed page behavior should match the requested test.',
+      actual: agent.summary || agent.status || 'Agent result needs review.',
+      evidence: [
+        ...(agent.evidence || []),
+        ...(agent.linkedEvidence || []).flatMap((group) => (group.evidence || []).map((item) => item.summary))
+      ].filter(Boolean).slice(0, 8).join('\n')
+    };
+  }
+
+  return {
+    title: '',
+    severity: 'needs review',
+    status: 'needs review',
+    summary: '',
+    steps: '',
+    expected: '',
+    actual: '',
+    evidence: ''
+  };
+}
+
+function getPrimaryReportIssue() {
+  const reportable = state.issues
+    .filter((issue) => issue.includeInReport && issue.category !== 'framework-noise')
+    .sort((a, b) => {
+      const statusRank = { confirmed: 0, auto: 1, 'needs-review': 2, ignored: 3 };
+      return (statusRank[a.reviewStatus || 'auto'] ?? 1) - (statusRank[b.reviewStatus || 'auto'] ?? 1)
+        || severityRank(a.severity) - severityRank(b.severity)
+        || b.lastSeenAt - a.lastSeenAt;
+    });
+  return reportable[0] || null;
+}
+
+function writeReportBuilderDraft(draft) {
+  els.reportBuilderTitle.value = draft.title || '';
+  els.reportBuilderSeverity.value = normalizeReportBuilderOption(els.reportBuilderSeverity, draft.severity || 'needs review');
+  els.reportBuilderStatus.value = normalizeReportBuilderOption(els.reportBuilderStatus, draft.status || 'needs review');
+  els.reportBuilderSummary.value = draft.summary || '';
+  els.reportBuilderSteps.value = draft.steps || '';
+  els.reportBuilderExpected.value = draft.expected || '';
+  els.reportBuilderActual.value = draft.actual || '';
+  els.reportBuilderEvidence.value = draft.evidence || '';
+}
+
+function normalizeReportBuilderOption(select, value) {
+  const normalized = String(value || '').toLowerCase();
+  const options = Array.from(select?.options || []).map((option) => option.value);
+  return options.includes(normalized) ? normalized : (options[0] || normalized);
+}
+
+function readReportBuilderDraft() {
+  return {
+    title: String(els.reportBuilderTitle?.value || '').trim(),
+    severity: String(els.reportBuilderSeverity?.value || 'needs review').trim(),
+    status: String(els.reportBuilderStatus?.value || 'needs review').trim(),
+    summary: String(els.reportBuilderSummary?.value || '').trim(),
+    stepsToReproduce: String(els.reportBuilderSteps?.value || '').split(/\r?\n/).map((step) => step.trim()).filter(Boolean),
+    expectedResult: String(els.reportBuilderExpected?.value || '').trim(),
+    actualResult: String(els.reportBuilderActual?.value || '').trim(),
+    evidence: String(els.reportBuilderEvidence?.value || '').trim()
+  };
+}
+
+function buildReportBuilderMarkdown(draft = readReportBuilderDraft()) {
+  return [
+    `# ${draft.title || 'TestPilot bug draft'}`,
+    '',
+    `Severity: ${draft.severity || 'needs review'}`,
+    `Status: ${draft.status || 'needs review'}`,
+    `Page: ${state.pageUrl || 'N/A'}`,
+    '',
+    '## Summary',
+    draft.summary || 'No summary entered.',
+    '',
+    '## Steps to Reproduce',
+    draft.stepsToReproduce.length ? draft.stepsToReproduce.join('\n') : 'No steps entered.',
+    '',
+    '## Expected Result',
+    draft.expectedResult || 'N/A',
+    '',
+    '## Actual Result',
+    draft.actualResult || 'N/A',
+    '',
+    '## Evidence',
+    draft.evidence || 'N/A'
+  ].join('\n');
+}
+
+function copyReportBuilderDraft() {
+  const draft = readReportBuilderDraft();
+  if (!draft.title) {
+    showToast('No report builder draft to copy yet.', 'error');
+    return;
+  }
+  copyText(buildReportBuilderMarkdown(draft), els.copyReportBuilderBtn);
+}
+
+function downloadReportBuilderDraft() {
+  const draft = readReportBuilderDraft();
+  if (!draft.title) {
+    showToast('No report builder draft to export yet.', 'error');
+    return;
+  }
+  downloadBlob(buildReportBuilderMarkdown(draft), `testpilot-bug-draft-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
+  showToast('Bug draft Markdown exported.', 'success');
+}
+
 function capitalize(value) {
   return String(value || '').charAt(0).toUpperCase() + String(value || '').slice(1);
 }
@@ -5110,6 +5525,7 @@ function buildReport() {
     passedChecks,
     ignoredFindings,
     findings: reportable.map(serializeFinding),
+    reportBuilderDraft: els.reportBuilderTitle ? readReportBuilderDraft() : null,
     aiAnalysis: state.settings.includeAiSummaryInReport && state.ai.analysis ? state.ai.analysis : null,
     latestAgentResult: summarizeAgentResultForAi(state.ai.lastAgentResult),
     redactionNotice: 'Common credentials, tokens, cookies, secrets, and sensitive query values are replaced with [REDACTED].',
@@ -5144,6 +5560,8 @@ function serializeFinding(issue) {
     recommendation: issue.recommendation,
     includeInIssueCount: issue.includeInIssueCount,
     includeInReport: issue.includeInReport,
+    reviewStatus: issue.reviewStatus || 'auto',
+    reviewedAt: issue.reviewedAt ? new Date(issue.reviewedAt).toISOString() : null,
     pageUrl: issue.url || state.pageUrl,
     timestamp: new Date(issue.timestamp).toISOString(),
     firstSeenAt: new Date(issue.firstSeenAt).toISOString(),
@@ -5179,6 +5597,15 @@ function buildPassedChecks() {
 
 function buildIgnoredFindings() {
   const ignored = [];
+  const manuallyIgnored = state.issues.filter((issue) => issue.reviewStatus === 'ignored');
+  for (const issue of manuallyIgnored.slice(0, 12)) {
+    ignored.push({
+      type: issue.type,
+      title: issue.title,
+      count: issue.count || 1,
+      reason: 'Tester marked this finding as ignored or likely false positive.'
+    });
+  }
   if (state.uiStats.ignoredDecorativeElements > 0) {
     ignored.push({
       type: 'ui',
@@ -5291,6 +5718,23 @@ function renderHtmlReport(report) {
   const consoleFindings = report.findings.filter((finding) => finding.type === 'console');
   const uiFindings = report.findings.filter((finding) => finding.type === 'ui');
   const rawAppendix = report.findings.map((finding) => findingCard(finding, true)).join('');
+  const builder = report.reportBuilderDraft && report.reportBuilderDraft.title ? `
+    <section>
+      <h2>Ready-to-file draft</h2>
+      <article class="finding ${escapeHtml(report.reportBuilderDraft.severity || 'info')}">
+        <h3>${escapeHtml(report.reportBuilderDraft.title)}</h3>
+        <p><strong>Status:</strong> ${escapeHtml(report.reportBuilderDraft.status || 'needs review')} &nbsp; <strong>Severity:</strong> ${escapeHtml(report.reportBuilderDraft.severity || 'needs review')}</p>
+        <p>${escapeHtml(report.reportBuilderDraft.summary || 'No summary entered.')}</p>
+        <h3>Steps to reproduce</h3>
+        ${report.reportBuilderDraft.stepsToReproduce && report.reportBuilderDraft.stepsToReproduce.length
+          ? `<ol>${report.reportBuilderDraft.stepsToReproduce.map((step) => `<li>${escapeHtml(step.replace(/^\d+\.\s*/, ''))}</li>`).join('')}</ol>`
+          : '<p class="muted">No steps entered.</p>'}
+        <p><strong>Expected:</strong> ${escapeHtml(report.reportBuilderDraft.expectedResult || 'N/A')}</p>
+        <p><strong>Actual:</strong> ${escapeHtml(report.reportBuilderDraft.actualResult || 'N/A')}</p>
+        <p><strong>Evidence:</strong> ${escapeHtml(report.reportBuilderDraft.evidence || 'N/A')}</p>
+      </article>
+    </section>
+  ` : '';
 
   return `<!doctype html>
 <html>
@@ -5344,6 +5788,7 @@ function renderHtmlReport(report) {
     <p><strong>QA Health:</strong> ${escapeHtml(report.summary.healthLabel)} (${report.summary.healthScore}/100)</p>
     <p>${escapeHtml(report.summary.executiveSummary)}</p>
   </section>
+  ${builder}
   <section class="summary">
     <div class="metric"><span>Total Issues</span><strong>${report.summary.totalIssues}</strong></div>
     <div class="metric"><span>Actionable</span><strong>${report.summary.actionable}</strong></div>
@@ -5425,6 +5870,7 @@ function buildCsvReport(report) {
     'Type',
     'Severity',
     'Confidence',
+    'Review Status',
     'Title',
     'Page URL',
     'User Impact',
@@ -5439,6 +5885,7 @@ function buildCsvReport(report) {
     finding.type,
     finding.severity,
     finding.confidence,
+    finding.reviewStatus || 'auto',
     finding.title,
     finding.pageUrl,
     finding.userImpact,

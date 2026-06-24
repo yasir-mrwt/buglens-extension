@@ -1105,12 +1105,27 @@ textarea {
 .issue-actions {
   display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 6px;
 }
 
 .issue-actions button {
   min-height: 30px;
   padding: 5px 9px;
   font-size: 10px;
+}
+
+.issue-actions button.active-review {
+  border-color: #2563eb;
+  color: #1d4ed8;
+  background: #eff6ff;
+}
+
+.issue-actions button.active-review.ignored {
+  border-color: #cbd5e1;
+  color: #475569;
+  background: #f8fafc;
 }
 
 details {
@@ -1150,6 +1165,71 @@ pre {
 .report-panel {
   padding: 16px;
   border-radius: 12px;
+}
+
+.report-builder {
+  display: grid;
+  gap: 14px;
+  margin-top: 14px;
+  padding: 16px;
+  border: 1px solid var(--testpilot-line, var(--border));
+  border-radius: 14px;
+  background: #ffffff;
+}
+
+.report-builder-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.report-builder-head h2 {
+  margin: 2px 0 4px;
+  font-size: 17px;
+}
+
+.report-builder-head p {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.report-builder-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.report-builder-grid {
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(140px, 180px) minmax(140px, 180px);
+  gap: 10px;
+}
+
+.report-builder-grid label {
+  display: grid;
+  gap: 6px;
+  min-width: 0;
+  color: #475569;
+  font-size: 11px;
+  font-weight: 800;
+}
+
+.report-builder-grid input,
+.report-builder-grid select,
+.report-builder-grid textarea {
+  width: 100%;
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--testpilot-line, var(--border));
+  border-radius: 10px;
+  background: #fbfaf6;
+  color: var(--text);
+}
+
+.report-builder-grid textarea {
+  resize: vertical;
 }
 
 .ai-panel {
@@ -1774,6 +1854,23 @@ body[data-active-view="ui"] .info-callout.findings-only {
   }
 
   .export-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .report-builder-head {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .report-builder-actions {
+    justify-content: stretch;
+  }
+
+  .report-builder-actions button {
+    flex: 1 1 140px;
+  }
+
+  .report-builder-grid {
     grid-template-columns: 1fr;
   }
 }
