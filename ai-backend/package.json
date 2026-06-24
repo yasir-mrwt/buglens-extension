@@ -1,9 +1,9 @@
 {
-  "name": "buglens-ai-backend",
+  "name": "testpilot-ai-backend",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Local BugLens AI backend for Ollama-powered QA analysis.",
+  "description": "Local TestPilot AI backend for Ollama-powered QA analysis.",
   "scripts": {
     "start": "node server.js",
     "dev": "node server.js"

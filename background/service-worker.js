@@ -1,5 +1,7 @@
 const portsByTabId = new Map();
-const SESSION_STORAGE_PREFIX = 'buglensSession:v3:';
+const SESSION_STORAGE_PREFIX = 'testpilotSession:v4:';
+const CONTEXT_MENU_SEND_SELECTION = 'testpilot-send-selection-to-ai';
+const MAX_CONTEXT_MENU_SELECTION = 5000;
 
 const DEFAULT_SETTINGS = {
   slowApiMs: 1000,
@@ -41,41 +43,70 @@ function relayToPanels(tabId, payload) {
     try {
       port.postMessage(payload);
     } catch (error) {
-      console.warn('[BugLens] Failed to relay message to panel', error);
+      console.warn('[TestPilot] Failed to relay message to panel', error);
     }
   }
 }
 
 chrome.runtime.onInstalled.addListener(() => {
-  chrome.storage.local.get('buglensSettings', (stored) => {
+  chrome.contextMenus.create({
+    id: CONTEXT_MENU_SEND_SELECTION,
+    title: 'Send selected text to TestPilot AI',
+    contexts: ['selection']
+  });
+  chrome.storage.local.get('testpilotSettings', (stored) => {
     chrome.storage.local.set({
-      buglensSettings: {
+      testpilotSettings: {
         ...DEFAULT_SETTINGS,
-        ...(stored.buglensSettings || {})
+        ...(stored.testpilotSettings || {})
       }
     });
   });
   chrome.storage.session.get(null, (stored) => {
     const legacyKeys = Object.keys(stored || {}).filter((key) => (
-      key.startsWith('buglensSession:') && !key.startsWith(SESSION_STORAGE_PREFIX)
+      key.startsWith('testpilotSession:') && !key.startsWith(SESSION_STORAGE_PREFIX)
     ));
     if (legacyKeys.length > 0) chrome.storage.session.remove(legacyKeys);
   });
 });
 
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (!tab || typeof tab.id !== 'number') return;
+  if (info.menuItemId !== CONTEXT_MENU_SEND_SELECTION) return;
+  const selectedText = sanitizeContextMenuText(info.selectionText || '', MAX_CONTEXT_MENU_SELECTION);
+  if (!selectedText) return;
+  relayToPanels(tab.id, {
+    type: 'TESTPILOT_CONTENT_EVENT',
+    tabId: tab.id,
+    payload: {
+      source: 'testpilot-content',
+      kind: 'page-context',
+      sessionId: null,
+      payload: {
+        type: 'selected-text',
+        sourceLabel: 'Selected page text',
+        selectedText,
+        title: tab.title || '',
+        url: tab.url || '',
+        capturedAt: Date.now()
+      }
+    }
+  });
+});
+
 chrome.runtime.onConnect.addListener((port) => {
-  if (port.name !== 'buglens-devtools') return;
+  if (port.name !== 'testpilot-devtools') return;
 
   let connectedTabId = null;
 
   port.onMessage.addListener((message) => {
     if (!message || typeof message !== 'object') return;
 
-    if (message.type === 'BUGLENS_PANEL_INIT') {
+    if (message.type === 'TESTPILOT_PANEL_INIT') {
       connectedTabId = Number(message.tabId);
       addPort(connectedTabId, port);
       port.postMessage({
-        type: 'BUGLENS_BACKGROUND_READY',
+        type: 'TESTPILOT_BACKGROUND_READY',
         tabId: connectedTabId
       });
     }
@@ -89,7 +120,7 @@ chrome.runtime.onConnect.addListener((port) => {
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
   if (!message || typeof message !== 'object') return false;
 
-  if (message.source === 'buglens-content') {
+  if (message.source === 'testpilot-content') {
     const tabId = sender.tab && sender.tab.id;
     if (typeof tabId === 'number') {
       const storageKey = `${SESSION_STORAGE_PREFIX}${tabId}`;
@@ -97,7 +128,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
         const session = stored[storageKey];
         const sessionId = session && session.active ? session.sessionId : message.sessionId;
         relayToPanels(tabId, {
-          type: 'BUGLENS_CONTENT_EVENT',
+          type: 'TESTPILOT_CONTENT_EVENT',
           tabId,
           payload: {
             ...message,
@@ -110,10 +141,18 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     }
   }
 
-  if (message.type === 'BUGLENS_GET_BACKGROUND_STATUS') {
+  if (message.type === 'TESTPILOT_GET_BACKGROUND_STATUS') {
     sendResponse({ ok: true, activePanels: portsByTabId.size });
     return true;
   }
 
   return false;
 });
+
+function sanitizeContextMenuText(value, maxLength) {
+  let output = String(value || '').replace(/\s+/g, ' ').trim();
+  output = output.replace(/(authorization\s*[:=]\s*)(bearer\s+)?[a-z0-9._\-+/=]+/gi, '$1[REDACTED]');
+  output = output.replace(/\bbearer\s+[a-z0-9._\-+/=]+/gi, 'Bearer [REDACTED]');
+  output = output.replace(/((?:access_token|refresh_token|id_token|token|password|api_key|secret)=)([^&\s]+)/gi, '$1[REDACTED]');
+  return output.slice(0, maxLength);
+}

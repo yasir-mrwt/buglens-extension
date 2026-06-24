@@ -1,14 +1,30 @@
 (() => {
-  const PAGE_CONSOLE_SOURCE = 'buglens-page-console-listener';
+  const PAGE_CONSOLE_SOURCE = 'testpilot-page-console-listener';
   const MAX_ISSUES_PER_RULE_DEFAULT = 25;
   const MAX_UI_ISSUES_DEFAULT = 200;
   const MAX_UI_NODES_DEFAULT = 4000;
+  const MAX_SELECTED_TEXT_LENGTH = 5000;
+  const MAX_VISIBLE_SUMMARY_LENGTH = 3000;
+  const MAX_AGENT_ELEMENTS = 80;
+  const ALLOWED_AGENT_ACTIONS = new Set(['click', 'type', 'clear', 'select', 'check', 'uncheck', 'scroll', 'highlight', 'wait', 'observe', 'navigate']);
+  const SAFE_DUMMY_VALUES = {
+    email: 'invalid-email',
+    validEmail: 'qa.test@example.com',
+    password: 'TestPilot#12345',
+    invalidPassword: '123',
+    name: 'QA Test User',
+    phone: '1234567890',
+    invalidPhone: 'abc',
+    message: 'This is a QA validation test.',
+    search: 'test',
+    generic: 'test'
+  };
   let activeSessionId = null;
 
   function sendToExtension(kind, payload) {
     try {
       chrome.runtime.sendMessage({
-        source: 'buglens-content',
+        source: 'testpilot-content',
         kind,
         sessionId: activeSessionId,
         payload
@@ -27,10 +43,38 @@
     sendToExtension('console', event.data.payload);
   }, false);
 
+  document.addEventListener('click', (event) => {
+    const target = event.target && event.target.closest
+      ? event.target.closest('button, a, input, select, textarea, [role="button"], [onclick]')
+      : event.target;
+    if (!target) return;
+    const actionType = target.tagName && target.tagName.toLowerCase() === 'a' ? 'click-link' : 'click';
+    sendUserAction(actionType, target, {
+      href: target.getAttribute ? target.getAttribute('href') : null,
+      download: target.hasAttribute && target.hasAttribute('download')
+    });
+  }, true);
+
+  document.addEventListener('submit', (event) => {
+    sendUserAction('submit', event.target, {
+      method: event.target && event.target.method,
+      action: event.target && event.target.action
+    });
+  }, true);
+
+  document.addEventListener('change', (event) => {
+    const target = event.target;
+    if (!target || !target.matches || !target.matches('input, select, textarea')) return;
+    sendUserAction(target.type === 'file' ? 'file-upload' : 'input-change', target, {
+      inputType: target.type || target.tagName.toLowerCase(),
+      name: target.name || null
+    });
+  }, true);
+
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message !== 'object') return false;
 
-    if (message.type === 'BUGLENS_RUN_UI_SCAN') {
+    if (message.type === 'TESTPILOT_RUN_UI_SCAN') {
       const settings = message.settings || {};
       runWhenIdle(() => runUiScan(settings))
         .then((scan) => sendResponse({ ok: true, scan }))
@@ -41,19 +85,1120 @@
       return true;
     }
 
-    if (message.type === 'BUGLENS_PING_CONTENT') {
+    if (message.type === 'TESTPILOT_PING_CONTENT') {
       sendResponse({ ok: true, url: location.href });
       return true;
     }
 
-    if (message.type === 'BUGLENS_SET_SESSION') {
+    if (message.type === 'TESTPILOT_SET_SESSION') {
       activeSessionId = typeof message.sessionId === 'string' ? message.sessionId : null;
       sendResponse({ ok: true, sessionId: activeSessionId });
       return true;
     }
 
+    if (message.type === 'TESTPILOT_CAPTURE_PAGE_CONTEXT') {
+      try {
+        const context = capturePageContext(message.mode || 'selection');
+        sendResponse({ ok: true, context });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          error: error && error.message ? error.message : 'Page context capture failed.'
+        });
+      }
+      return true;
+    }
+
+    if (message.type === 'TESTPILOT_GET_AGENT_CONTEXT') {
+      try {
+        sendResponse({ ok: true, context: extractAgentPageContext() });
+      } catch (error) {
+        sendResponse({
+          ok: false,
+          error: error && error.message ? error.message : 'Agent page context extraction failed.'
+        });
+      }
+      return true;
+    }
+
+    if (message.type === 'TESTPILOT_RUN_AGENT') {
+      runWhenIdle(() => runAgentWorkflow(message.command || '', message.options || {}))
+        .then((result) => sendResponse({ ok: true, result }))
+        .catch((error) => sendResponse({
+          ok: false,
+          error: error && error.message ? error.message : 'Agent workflow failed.'
+        }));
+      return true;
+    }
+
     return false;
   });
+
+  async function runAgentWorkflow(command, options = {}) {
+    const userCommand = sanitizePageText(command, 1000);
+    const pageContext = extractAgentPageContext();
+    const dataStrategy = detectDataStrategy(userCommand);
+    const taskType = classifyAgentTask(userCommand, pageContext, dataStrategy);
+    const requestKey = buildAgentRequestKey({
+      sessionId: activeSessionId || options.sessionId || '',
+      pageUrl: pageContext.url,
+      mode: options.mode || 'agent',
+      userMessage: userCommand,
+      taskType,
+      dataStrategy,
+      pageContextHash: pageContext.contextHash
+    });
+    const fallbackPlan = buildAgentPlan(userCommand, taskType, pageContext, { ...options, dataStrategy });
+    const plan = normalizeStructuredAgentPlan(options.structuredPlan, fallbackPlan, taskType, pageContext);
+    const safety = validateAgentPlan(plan, pageContext);
+    const actionResults = [];
+
+    if (!safety.ok) {
+      const result = evaluateAgentResult(plan, actionResults, observeAgentPage(pageContext), safety);
+      return {
+        command: userCommand,
+        taskType,
+        dataStrategy,
+        requestKey,
+        pageContext: compactAgentContextForResponse(pageContext),
+        plan: { ...plan, riskLevel: safety.requiresConfirmation ? 'needs_confirmation' : 'blocked' },
+        safety,
+        actionResults,
+        result
+      };
+    }
+
+    for (let index = 0; index < plan.steps.length; index += 1) {
+      const step = plan.steps[index];
+      const actionResult = await executeAgentStep(step, index, pageContext);
+      actionResults.push(actionResult);
+      if (!actionResult.success && ['click', 'type', 'select', 'check', 'uncheck', 'navigate'].includes(step.action)) break;
+      if (['click', 'navigate', 'select'].includes(step.action)) await waitForAgent(350);
+    }
+
+    const observation = observeAgentPage(pageContext);
+    const result = evaluateAgentResult(plan, actionResults, observation, safety);
+    return {
+      command: userCommand,
+      taskType,
+      dataStrategy,
+      requestKey,
+      pageContext: compactAgentContextForResponse(pageContext),
+      plan,
+      safety,
+      actionResults,
+      observation,
+      result
+    };
+  }
+
+  function extractAgentPageContext() {
+    const candidates = getAgentCandidateElements();
+    const elements = candidates.map((element, index) => describeAgentElement(element, index + 1)).filter(Boolean);
+    const forms = Array.from(document.querySelectorAll('form')).filter((form) => isVisibleElement(form, false)).slice(0, 8).map((form, formIndex) => {
+      const contained = elements.filter((item) => item.selectorHint && form.contains && form.contains(getElementBySelector(item.selectorHint)));
+      return {
+        index: formIndex + 1,
+        name: sanitizePageText(form.getAttribute('name') || form.getAttribute('id') || getShortText(form), 120),
+        fields: contained.filter((item) => ['input', 'textarea', 'select', 'checkbox', 'radio', 'upload'].includes(item.role)).map((item) => item.index),
+        submitButtons: contained.filter((item) => item.role === 'button' && /submit|log in|login|sign in|sign up|send|save|continue|place|search/i.test(`${item.text || ''} ${item.label || ''}`)).map((item) => item.index)
+      };
+    });
+    const headings = getVisibleHeadings();
+    const visibleAlerts = getVisibleAlertTexts();
+    const importantText = getImportantVisibleText();
+    const pageType = inferAgentPageType(elements, forms, headings, importantText);
+    const availableSafeActions = inferAvailableSafeActions(elements);
+    const summary = sanitizePageText([
+      document.title ? `Title: ${document.title}` : '',
+      pageType ? `Page type: ${pageType}` : '',
+      headings.length ? `Headings: ${headings.join(' | ')}` : '',
+      importantText.length ? `Visible text: ${importantText.join(' | ')}` : '',
+      elements.length ? `${elements.length} visible interactive or QA-relevant elements indexed.` : 'No obvious visible interactive elements indexed.',
+      visibleAlerts.length ? `Visible alerts: ${visibleAlerts.join(' | ')}` : ''
+    ].filter(Boolean).join(' '), 900);
+    return {
+      url: location.href,
+      title: document.title || '',
+      summary,
+      pageType,
+      headings,
+      importantText,
+      visibleAlerts,
+      elements,
+      forms,
+      availableSafeActions,
+      contextHash: simpleHash(JSON.stringify({
+        url: location.href,
+        title: document.title || '',
+        pageType,
+        headings,
+        importantText,
+        elements: elements.map((item) => [item.index, item.role, item.label, item.text, item.placeholder, item.type]),
+        forms
+      }))
+    };
+  }
+
+  function getAgentCandidateElements() {
+    const selector = [
+      'button',
+      'a',
+      'input',
+      'textarea',
+      'select',
+      'summary',
+      '[role="button"]',
+      '[role="link"]',
+      '[role="tab"]',
+      '[role="checkbox"]',
+      '[role="radio"]',
+      '[aria-expanded]',
+      '[onclick]',
+      'table',
+      '[role="table"]',
+      '[role="dialog"]',
+      'dialog'
+    ].join(',');
+    const seen = new Set();
+    return Array.from(document.querySelectorAll(selector))
+      .filter((element) => {
+        if (!element || seen.has(element)) return false;
+        seen.add(element);
+        return isVisibleElement(element, true);
+      })
+      .slice(0, MAX_AGENT_ELEMENTS);
+  }
+
+  function describeAgentElement(element, index) {
+    const tag = element.tagName.toLowerCase();
+    const inputType = tag === 'input' ? String(element.type || 'text').toLowerCase() : '';
+    const role = inferAgentRole(element, tag, inputType);
+    const selectorHint = getSelector(element);
+    const label = getElementLabel(element) || getAssociatedLabel(element);
+    return {
+      index,
+      role,
+      text: sanitizePageText(getShortText(element), 120),
+      label: sanitizePageText(label, 120),
+      placeholder: sanitizePageText(element.getAttribute && element.getAttribute('placeholder') || '', 120),
+      type: inputType || tag,
+      required: Boolean(element.required || element.getAttribute && element.getAttribute('aria-required') === 'true'),
+      disabled: Boolean(element.disabled || element.getAttribute && element.getAttribute('aria-disabled') === 'true'),
+      visible: true,
+      selectorHint,
+      href: tag === 'a' ? sanitizePageText(element.getAttribute('href') || '', 240) : undefined
+    };
+  }
+
+  function inferAgentRole(element, tag, inputType) {
+    const text = `${getShortText(element)} ${getElementLabel(element)} ${element.getAttribute && (element.getAttribute('aria-label') || element.getAttribute('class') || '')}`.toLowerCase();
+    if (tag === 'table' || element.getAttribute && element.getAttribute('role') === 'table') return 'table';
+    if (tag === 'textarea') return 'textarea';
+    if (tag === 'select') return 'select';
+    if (tag === 'a' && element.hasAttribute && element.hasAttribute('download')) return 'download';
+    if (tag === 'a') return 'link';
+    if (tag === 'input' && inputType === 'file') return 'upload';
+    if (tag === 'input' && inputType === 'checkbox') return 'checkbox';
+    if (tag === 'input' && inputType === 'radio') return 'radio';
+    if (tag === 'input') return 'input';
+    if (element.getAttribute && element.getAttribute('role') === 'tab') return 'tab';
+    if (tag === 'summary' || element.getAttribute && element.hasAttribute('aria-expanded')) {
+      if (/accordion|faq|expand|collapse/.test(text)) return 'accordion';
+    }
+    if (/modal|dialog|popup|open/.test(text)) return 'modal_trigger';
+    if (/next|previous|prev|page \d|pagination/.test(text)) return 'pagination';
+    if (tag === 'button' || element.getAttribute && ['button', 'checkbox', 'radio'].includes(element.getAttribute('role'))) return 'button';
+    return 'other';
+  }
+
+  function detectDataStrategy(command) {
+    const value = String(command || '').toLowerCase();
+    const asksEmpty = /\b(empty|required|blank|missing)\b/.test(value);
+    const asksInvalid = /\b(invalid|fake|wrong|negative|bad|dummy login|fake email|fake emails)\b/.test(value);
+    const asksValid = /\b(valid|real|realistic|signup|sign up|register|account|create account|dummy account)\b/.test(value);
+    const hasProvidedData = /(?:email|username|password|phone|name)\s*[:=]\s*\S+/i.test(String(command || ''));
+    if (asksEmpty && asksInvalid) return 'fake_invalid';
+    if (asksEmpty) return 'empty';
+    if (asksInvalid) return asksValid ? 'fake_invalid' : 'invalid';
+    if (asksValid) return hasProvidedData ? 'real_user_provided' : 'valid_dummy';
+    return 'unknown';
+  }
+
+  function classifyAgentTask(command, context, dataStrategy = 'unknown') {
+    const value = String(command || '').toLowerCase();
+    if (/highlight|show.*interactive|index.*element|interactive element/.test(value)) return 'highlight_interactions';
+    if (/summari[sz]e|describe.*page|page summary/.test(value)) return 'page_summary';
+    if (/generate.*test|test case|qa scenario/.test(value)) return 'test_case_generation';
+    if (/bug report|create.*bug|draft.*bug|jira|github issue/.test(value)) return 'bug_report_generation';
+    if (/accessib|a11y|alt text|label|heading/.test(value)) return 'accessibility_check';
+    if (/signup|sign up|register|account|create account/.test(value) && ['invalid', 'fake_invalid'].includes(dataStrategy)) return 'invalid_signup_validation';
+    if (/signup|sign up|register|account|create account/.test(value) && ['valid_dummy', 'real_user_provided'].includes(dataStrategy)) return 'valid_dummy_data_flow';
+    if (/empty|required|blank/.test(value) && /invalid|fake|dummy|wrong/.test(value) && /field|form|input|login|signup|sign up|email|credential/.test(value)) return 'login_validation';
+    if (/empty|required|blank/.test(value) && /field|form|input|login|signup|sign up/.test(value)) return 'required_field_validation';
+    if (/invalid|fake|dummy|wrong/.test(value) && /email|credential|login|password/.test(value)) return 'invalid_login_test';
+    if (['valid_dummy', 'real_user_provided'].includes(dataStrategy) && /login|form|password|contact/.test(value)) return 'valid_dummy_data_flow';
+    if (/login|signup|sign up|form|password|contact/.test(value)) return 'form_validation';
+    if (/search/.test(value)) return 'search_test';
+    if (/filter|dropdown|select|category|sort/.test(value)) return 'filter_test';
+    if (/modal|dialog|popup/.test(value)) return 'modal_test';
+    if (/tab/.test(value)) return 'tab_test';
+    if (/accordion|faq|expand|collapse/.test(value)) return 'accordion_test';
+    if (/table|row|column/.test(value)) return 'table_test';
+    if (/pagination|next page|previous page|pager/.test(value)) return 'pagination_test';
+    if (/upload/.test(value)) return 'upload_test';
+    if (/download/.test(value)) return 'download_test';
+    if (/link|navigation|nav|menu/.test(value)) return 'link_navigation_test';
+    if (/button|cta|click/.test(value)) return 'button_test';
+    if (context.forms && context.forms.length) return 'form_validation';
+    return 'general_page_validation';
+  }
+
+  function getImportantVisibleText() {
+    return Array.from(document.querySelectorAll('main, h1, h2, h3, [role="main"], [role="alert"], [role="status"], .error, .success, .message'))
+      .filter((element) => isVisibleElement(element, true))
+      .map((element) => sanitizePageText(getShortText(element), 180))
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+
+  function inferAgentPageType(elements, forms, headings, importantText) {
+    const haystack = [
+      document.title || '',
+      ...(headings || []),
+      ...(importantText || []),
+      ...(elements || []).map((item) => `${item.role} ${item.label || ''} ${item.text || ''} ${item.placeholder || ''}`)
+    ].join(' ').toLowerCase();
+    if (/sign up|signup|register|create account|join/.test(haystack)) return 'signup';
+    if (/login|log in|sign in|password/.test(haystack)) return 'login';
+    if (/search|results|filter/.test(haystack)) return 'search';
+    if (/cart|checkout|payment|billing/.test(haystack)) return 'checkout';
+    if (/table|pagination|next page|previous page/.test(haystack)) return 'listing';
+    if (forms && forms.length) return 'form';
+    return 'general';
+  }
+
+  function inferAvailableSafeActions(elements) {
+    const roles = new Set((elements || []).map((item) => item.role));
+    return [
+      roles.has('button') ? 'click safe buttons' : '',
+      roles.has('link') ? 'test safe same-site links' : '',
+      roles.has('input') || roles.has('textarea') ? 'type safe QA data' : '',
+      roles.has('select') ? 'select safe options' : '',
+      roles.has('checkbox') || roles.has('radio') ? 'toggle safe choices' : '',
+      roles.has('table') ? 'review table/list content' : '',
+      roles.has('pagination') ? 'test pagination' : ''
+    ].filter(Boolean);
+  }
+
+  function buildAgentPlan(command, taskType, context, options = {}) {
+    const dataStrategy = options.dataStrategy || 'unknown';
+    const steps = [];
+    const targetElements = [];
+    const addStep = (step) => {
+      if (step.targetIndex) targetElements.push(step.targetIndex);
+      steps.push(step);
+    };
+    const elements = context.elements || [];
+    const first = (predicate) => elements.find((item) => predicate(item) && !item.disabled);
+    const many = (predicate, limit = 4) => elements.filter((item) => predicate(item) && !item.disabled).slice(0, limit);
+    const primaryForm = context.forms && context.forms[0];
+    const formFields = () => (primaryForm
+      ? primaryForm.fields.map((index) => elements.find((item) => item.index === index)).filter(Boolean)
+      : elements.filter((item) => ['input', 'textarea', 'select', 'checkbox', 'radio'].includes(item.role) && !item.disabled).slice(0, 6));
+    const submitButton = () => (primaryForm ? primaryForm.submitButtons : []).map((index) => elements.find((item) => item.index === index)).find(Boolean)
+      || first((item) => item.role === 'button' && /submit|log in|login|sign in|sign up|send|continue|save|search|place/i.test(`${item.text || ''} ${item.label || ''}`));
+
+    if (taskType === 'highlight_interactions') {
+      for (const item of many((element) => ['button', 'link', 'input', 'select', 'textarea', 'checkbox', 'radio', 'tab', 'accordion', 'pagination'].includes(element.role), 12)) {
+        addStep({ action: 'highlight', targetIndex: item.index, reason: 'Highlight this visible interactive element with its index.', expectedObservation: 'Element is visibly outlined for QA review.' });
+      }
+      addStep({ action: 'observe', reason: 'Summarize highlighted interactive coverage.', expectedObservation: 'Important interactive elements are indexed without typing or clicking.' });
+    } else if (taskType === 'required_field_validation') {
+      const fields = formFields();
+      for (const field of fields.slice(0, 6)) {
+        if (['input', 'textarea'].includes(field.role)) {
+          addStep({ action: 'clear', targetIndex: field.index, reason: 'Clear required field before empty-submit validation.', expectedObservation: 'Field is empty.' });
+        } else if (['checkbox', 'radio'].includes(field.role)) {
+          addStep({ action: 'uncheck', targetIndex: field.index, reason: 'Leave required choice unselected for validation.', expectedObservation: 'Choice is unselected.' });
+        }
+      }
+      const submit = submitButton();
+      if (submit) addStep({ action: 'click', targetIndex: submit.index, reason: 'Submit empty required fields safely.', expectedObservation: 'Required-field validation appears and submission is blocked.' });
+      addStep({ action: 'observe', reason: 'Observe required-field validation evidence.', expectedObservation: 'Required field messages or invalid field state are visible.' });
+    } else if (taskType === 'invalid_login_test' || taskType === 'invalid_signup_validation' || taskType === 'login_validation') {
+      const fields = formFields();
+      const submit = submitButton();
+      if (taskType === 'login_validation') {
+        for (const field of fields.slice(0, 5)) {
+          if (['input', 'textarea'].includes(field.role)) addStep({ action: 'clear', targetIndex: field.index, reason: 'Clear field for empty-login validation.', expectedObservation: 'Field is empty.' });
+        }
+        if (submit) addStep({ action: 'click', targetIndex: submit.index, reason: 'Submit empty login form to check required validation.', expectedObservation: 'Required-field validation appears.' });
+        addStep({ action: 'observe', reason: 'Observe empty-field validation before entering invalid data.', expectedObservation: 'Required validation is visible or marked needs-review.' });
+      }
+      const emailField = fields.find((field) => /email|user|login/.test(`${field.type || ''} ${field.label || ''} ${field.placeholder || ''}`.toLowerCase())) || fields.find((field) => field.role === 'input');
+      const passwordField = fields.find((field) => /password/.test(`${field.type || ''} ${field.label || ''} ${field.placeholder || ''}`.toLowerCase()));
+      const phoneField = fields.find((field) => /phone|tel|mobile/.test(`${field.type || ''} ${field.label || ''} ${field.placeholder || ''}`.toLowerCase()));
+      if (emailField) {
+        addStep({ action: 'clear', targetIndex: emailField.index, reason: 'Clear email/login field before invalid-email test.', expectedObservation: 'Email/login field is empty.' });
+        addStep({ action: 'type', targetIndex: emailField.index, value: SAFE_DUMMY_VALUES.email, reason: 'Enter invalid safe email value.', expectedObservation: 'Invalid email value is entered.' });
+      }
+      if (passwordField) {
+        addStep({ action: 'clear', targetIndex: passwordField.index, reason: 'Clear password field before dummy credential test.', expectedObservation: 'Password field is empty.' });
+        addStep({ action: 'type', targetIndex: passwordField.index, value: SAFE_DUMMY_VALUES.invalidPassword, reason: 'Enter intentionally weak safe password value.', expectedObservation: 'Weak password value is entered.' });
+      }
+      if (phoneField) {
+        addStep({ action: 'clear', targetIndex: phoneField.index, reason: 'Clear phone field before invalid phone test.', expectedObservation: 'Phone field is empty.' });
+        addStep({ action: 'type', targetIndex: phoneField.index, value: SAFE_DUMMY_VALUES.invalidPhone, reason: 'Enter invalid safe phone value.', expectedObservation: 'Invalid phone value is entered.' });
+      }
+      if (submit) addStep({ action: 'click', targetIndex: submit.index, reason: 'Submit safe dummy credentials to observe login validation.', expectedObservation: 'Invalid credential, validation, route, API, or console evidence appears.' });
+      addStep({ action: 'observe', reason: 'Observe invalid login result.', expectedObservation: 'Invalid email/credential evidence is visible or linked to API/console activity.' });
+    } else if (taskType === 'valid_dummy_data_flow') {
+      const fields = formFields();
+      for (const field of fields.slice(0, 7)) {
+        if (field.role === 'select') {
+          addStep({ action: 'select', targetIndex: field.index, value: '__FIRST_SAFE_OPTION__', reason: 'Select a safe option for valid dummy data flow.', expectedObservation: 'Field accepts a safe option.' });
+        } else if (['checkbox', 'radio'].includes(field.role)) {
+          addStep({ action: 'check', targetIndex: field.index, reason: 'Select safe required option for valid dummy data flow.', expectedObservation: 'Option becomes selected.' });
+        } else if (['input', 'textarea'].includes(field.role)) {
+          addStep({ action: 'clear', targetIndex: field.index, reason: 'Clear field before valid dummy QA input.', expectedObservation: 'Field is empty.' });
+          addStep({ action: 'type', targetIndex: field.index, value: validDummyValueForField(field), reason: realDataDisclaimer(dataStrategy), expectedObservation: 'Valid-looking dummy QA value is entered.' });
+        }
+      }
+      const submit = submitButton();
+      if (submit) addStep({ action: 'click', targetIndex: submit.index, reason: 'Submit valid-looking dummy QA data because the prompt requested valid/real/signup testing.', expectedObservation: 'Success, validation, route, API, or console evidence appears.' });
+      addStep({ action: 'observe', reason: 'Observe valid dummy data result.', expectedObservation: 'Success/error/result evidence is visible or linked to API/console activity.' });
+    } else if (taskType === 'form_validation') {
+      const fields = formFields();
+      for (const field of fields.slice(0, 5)) {
+        if (field.role === 'select') {
+          addStep({ action: 'select', targetIndex: field.index, value: '__FIRST_SAFE_OPTION__', reason: 'Select a safe non-empty option for form validation.', expectedObservation: 'Field accepts a test option.' });
+        } else if (['checkbox', 'radio'].includes(field.role)) {
+          addStep({ action: 'check', targetIndex: field.index, reason: 'Select required option safely.', expectedObservation: 'Option becomes selected.' });
+        } else if (['input', 'textarea'].includes(field.role)) {
+          addStep({ action: 'clear', targetIndex: field.index, reason: 'Clear field before QA input.', expectedObservation: 'Field is empty.' });
+          addStep({ action: 'type', targetIndex: field.index, value: dataStrategy === 'valid_dummy' ? validDummyValueForField(field) : dummyValueForField(field), reason: dataStrategy === 'valid_dummy' ? 'Enter valid-looking dummy QA test data.' : 'Enter safe QA test data.', expectedObservation: 'Field accepts safe QA value.' });
+        }
+      }
+      const submit = submitButton();
+      if (submit) addStep({ action: 'click', targetIndex: submit.index, reason: 'Submit safe dummy form data to check validation behavior.', expectedObservation: 'Validation, error, success, or route state becomes visible.' });
+      addStep({ action: 'observe', reason: 'Observe validation messages and page state after form interaction.', expectedObservation: 'Validation evidence is visible or marked needs-review.' });
+    } else if (taskType === 'search_test') {
+      const search = first((item) => ['input', 'textarea'].includes(item.role) && /search|query|keyword/.test(`${item.label || ''} ${item.placeholder || ''} ${item.text || ''} ${item.type || ''}`));
+      const button = first((item) => item.role === 'button' && /search|go|submit/.test(`${item.text || ''} ${item.label || ''}`));
+      if (search) {
+        addStep({ action: 'clear', targetIndex: search.index, reason: 'Clear search input.', expectedObservation: 'Search input is empty.' });
+        addStep({ action: 'type', targetIndex: search.index, value: SAFE_DUMMY_VALUES.search, reason: 'Enter safe search query.', expectedObservation: 'Search query is entered.' });
+      }
+      if (button) addStep({ action: 'click', targetIndex: button.index, reason: 'Submit the search query.', expectedObservation: 'Results, no-results state, or URL change appears.' });
+      addStep({ action: 'observe', reason: 'Observe search results or feedback.', expectedObservation: 'Search produces visible evidence.' });
+    } else if (taskType === 'filter_test') {
+      const filter = first((item) => item.role === 'select' || /filter|sort|category/.test(`${item.text || ''} ${item.label || ''}`));
+      if (filter) addStep({ action: filter.role === 'select' ? 'select' : 'click', targetIndex: filter.index, value: '__FIRST_SAFE_OPTION__', reason: 'Change visible filter safely.', expectedObservation: 'List, table, URL, or selected state changes.' });
+      addStep({ action: 'observe', reason: 'Observe filtered result state.', expectedObservation: 'Filter change is visible or needs review.' });
+    } else if (taskType === 'modal_test') {
+      const trigger = first((item) => ['modal_trigger', 'button', 'link'].includes(item.role) && /modal|dialog|popup|open|view|details/.test(`${item.text || ''} ${item.label || ''}`));
+      if (trigger) addStep({ action: 'click', targetIndex: trigger.index, reason: 'Open modal/dialog safely.', expectedObservation: 'Dialog or modal content appears.' });
+      addStep({ action: 'observe', reason: 'Observe modal state.', expectedObservation: 'Modal opens with visible content.' });
+      const close = first((item) => ['button', 'link'].includes(item.role) && /close|dismiss|cancel|×|x/.test(`${item.text || ''} ${item.label || ''}`));
+      if (close) addStep({ action: 'click', targetIndex: close.index, reason: 'Close modal if a safe close control is visible.', expectedObservation: 'Dialog closes.' });
+    } else if (taskType === 'pagination_test') {
+      const next = first((item) => ['button', 'link', 'pagination'].includes(item.role) && /next|›|»|page 2/.test(`${item.text || ''} ${item.label || ''}`));
+      if (next) addStep({ action: 'click', targetIndex: next.index, reason: 'Move to the next page of results safely.', expectedObservation: 'URL, active page, or table rows change.' });
+      addStep({ action: 'observe', reason: 'Observe pagination result.', expectedObservation: 'Pagination state changes or needs review.' });
+    } else if (taskType === 'link_navigation_test') {
+      const link = first((item) => item.role === 'link' && isSafeAgentLink(item.href));
+      if (link) addStep({ action: 'click', targetIndex: link.index, reason: 'Click a safe same-site navigation link.', expectedObservation: 'Route, hash, or page state changes.' });
+      addStep({ action: 'observe', reason: 'Observe navigation result.', expectedObservation: 'Navigation evidence is visible.' });
+    } else if (taskType === 'accessibility_check') {
+      addStep({ action: 'observe', reason: 'Inspect visible accessibility signals.', expectedObservation: 'Missing labels, alt text, headings, or link text are reported.' });
+    } else if (taskType === 'page_summary') {
+      addStep({ action: 'observe', reason: 'Summarize visible page context without changing the page.', expectedObservation: 'Headings, messages, forms, and interactive elements are summarized.' });
+    } else if (taskType === 'test_case_generation') {
+      addStep({ action: 'observe', reason: 'Collect page evidence to generate task-specific test cases.', expectedObservation: 'Relevant page elements and visible states are available for test case drafting.' });
+    } else if (taskType === 'bug_report_generation') {
+      addStep({ action: 'observe', reason: 'Collect visible evidence for a bug report draft.', expectedObservation: 'Current page evidence is summarized without inventing missing defects.' });
+    } else if (taskType === 'table_test') {
+      const table = first((item) => item.role === 'table');
+      if (table) addStep({ action: 'highlight', targetIndex: table.index, reason: 'Highlight table for QA review.', expectedObservation: 'Table is visible and highlighted.' });
+      addStep({ action: 'observe', reason: 'Observe table rows and controls.', expectedObservation: 'Table structure is available for review.' });
+    } else {
+      for (const item of many((element) => ['button', 'link', 'input', 'select', 'textarea', 'checkbox', 'radio'].includes(element.role), 5)) {
+        addStep({ action: 'highlight', targetIndex: item.index, reason: 'Highlight important interactive element for QA review.', expectedObservation: 'Element is visible and indexed.' });
+      }
+      addStep({ action: 'observe', reason: 'Observe general page quality and visible feedback.', expectedObservation: 'Important interactions and issues are summarized.' });
+    }
+
+    return {
+      summary: `Run ${taskType.replaceAll('_', ' ')} with ${dataStrategy} data strategy for: ${command || 'current page'}`,
+      taskType,
+      dataStrategy,
+      riskLevel: 'safe',
+      targetElements: Array.from(new Set(targetElements)),
+      steps: steps.slice(0, 12),
+      expectedOutcome: expectedOutcomeForTask(taskType)
+    };
+  }
+
+  function normalizeStructuredAgentPlan(candidatePlan, fallbackPlan, taskType, context) {
+    if (!candidatePlan || typeof candidatePlan !== 'object' || !Array.isArray(candidatePlan.steps)) {
+      return fallbackPlan;
+    }
+
+    const availableTargets = new Set((context.elements || []).map((item) => item.index));
+    const normalizedSteps = candidatePlan.steps
+      .slice(0, 12)
+      .map((step) => normalizeStructuredAgentStep(step, availableTargets))
+      .filter(Boolean);
+
+    if (!normalizedSteps.length) return fallbackPlan;
+    const targetElements = normalizedSteps
+      .map((step) => step.targetIndex)
+      .filter(Boolean);
+
+    return {
+      summary: sanitizePageText(candidatePlan.summary || fallbackPlan.summary || `Run ${taskType.replaceAll('_', ' ')}`, 300),
+      taskType: sanitizePageText(candidatePlan.taskType || taskType, 80),
+      dataStrategy: fallbackPlan.dataStrategy || 'unknown',
+      riskLevel: 'safe',
+      targetElements: Array.from(new Set(targetElements)),
+      steps: normalizedSteps,
+      expectedOutcome: sanitizePageText(candidatePlan.expectedOutcome || fallbackPlan.expectedOutcome || expectedOutcomeForTask(taskType), 300),
+      source: 'structured-json'
+    };
+  }
+
+  function normalizeStructuredAgentStep(step, availableTargets) {
+    if (!step || typeof step !== 'object') return null;
+    const action = String(step.action || '').toLowerCase().trim();
+    if (!ALLOWED_AGENT_ACTIONS.has(action)) return null;
+    const targetIndex = Number(step.targetIndex || 0);
+    const requiresTarget = !['observe', 'wait', 'scroll'].includes(action);
+    if (requiresTarget && (!Number.isFinite(targetIndex) || !availableTargets.has(targetIndex))) return null;
+    return {
+      action,
+      targetIndex: Number.isFinite(targetIndex) && targetIndex > 0 ? targetIndex : undefined,
+      value: sanitizeStructuredStepValue(action, step.value),
+      url: action === 'navigate' ? sanitizePageText(step.url || '', 300) : undefined,
+      reason: sanitizePageText(step.reason || 'Structured QA step.', 220),
+      expectedObservation: sanitizePageText(step.expectedObservation || 'Observe page evidence after this step.', 220)
+    };
+  }
+
+  function sanitizeStructuredStepValue(action, value) {
+    if (action === 'wait' || action === 'scroll') return Math.min(3000, Math.max(0, Number(value) || 0));
+    if (action === 'select' && value === '__FIRST_SAFE_OPTION__') return value;
+    return sanitizePageText(String(value || SAFE_DUMMY_VALUES.generic), 200);
+  }
+
+  function validateAgentPlan(plan, context) {
+    const blocked = [];
+    const needsConfirmation = [];
+    const indexed = new Map((context.elements || []).map((item) => [item.index, item]));
+    for (const step of plan.steps || []) {
+      const target = step.targetIndex ? indexed.get(step.targetIndex) : null;
+      const text = `${target?.text || ''} ${target?.label || ''} ${step.value || ''} ${step.url || ''}`.toLowerCase();
+      if (step.targetIndex && !target) blocked.push(`Step target #${step.targetIndex} is not available.`);
+      if (target && target.disabled) blocked.push(`Target #${target.index} is disabled.`);
+      if (/delete|remove|destroy|logout|log out|sign out|reset password|payment|checkout|pay now|purchase|subscribe|bank|billing/.test(text)) {
+        needsConfirmation.push(`Risky action blocked for target #${target?.index || 'unknown'}: ${target?.text || target?.label || step.action}`);
+      }
+      if (target && target.role === 'upload') needsConfirmation.push(`File upload requires explicit tester confirmation for target #${target.index}.`);
+      if (step.action === 'navigate' && step.url && !isSafeAgentLink(step.url)) {
+        needsConfirmation.push(`External navigation requires confirmation: ${step.url}`);
+      }
+      if (target && target.role === 'link' && target.href && !isSafeAgentLink(target.href)) {
+        needsConfirmation.push(`External or unsafe link requires confirmation: ${target.href}`);
+      }
+    }
+    return {
+      ok: blocked.length === 0 && needsConfirmation.length === 0,
+      blocked,
+      requiresConfirmation: needsConfirmation.length > 0,
+      needsConfirmation
+    };
+  }
+
+  async function executeAgentStep(step, stepIndex, context) {
+    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const element = target ? getElementBySelector(target.selectorHint) : null;
+    const startedAt = Date.now();
+    const base = {
+      stepIndex,
+      action: step.action,
+      targetIndex: step.targetIndex || null,
+      targetLabel: target ? (target.label || target.text || target.role) : '',
+      timestamp: startedAt,
+      startedAt
+    };
+    const finish = (result) => ({ ...base, ...result, completedAt: Date.now() });
+    try {
+      if (step.action === 'observe') {
+        const observation = observeAgentPage(context);
+        return finish({ success: true, message: formatObservationMessage(observation), observedText: observation.evidence });
+      }
+      if (step.action === 'wait') {
+        await waitForAgent(Number(step.value) || 500);
+        return finish({ success: true, message: 'Wait completed.' });
+      }
+      if (!element && step.action !== 'scroll') return finish({ success: false, message: 'Target element was not found on the page.' });
+      if (element && !isVisibleElement(element, true)) return finish({ success: false, message: 'Target element is hidden or outside the visible viewport.' });
+      if (element && (element.disabled || element.getAttribute && element.getAttribute('aria-disabled') === 'true')) {
+        return finish({ success: false, message: 'Target element is disabled.' });
+      }
+      if (step.action === 'highlight') {
+        highlightAgentElement(element);
+        return finish({ success: true, message: 'Element highlighted for QA review.' });
+      }
+      if (step.action === 'scroll') {
+        window.scrollBy({ top: Number(step.value) || Math.round(window.innerHeight * 0.6), behavior: 'smooth' });
+        return finish({ success: true, message: 'Page scrolled.' });
+      }
+      if (step.action === 'clear') {
+        setElementValue(element, '');
+        return finish({ success: true, message: 'Field cleared.' });
+      }
+      if (step.action === 'type') {
+        setElementValue(element, sanitizePageText(step.value || SAFE_DUMMY_VALUES.generic, 200));
+        return finish({ success: true, message: 'Safe QA value entered.' });
+      }
+      if (step.action === 'select') {
+        const selected = selectSafeOption(element, step.value);
+        return finish({ success: selected.ok, message: selected.message });
+      }
+      if (step.action === 'check' || step.action === 'uncheck') {
+        element.checked = step.action === 'check';
+        dispatchAgentInputEvents(element);
+        return finish({ success: true, message: `Control ${step.action === 'check' ? 'checked' : 'unchecked'}.` });
+      }
+      if (step.action === 'click') {
+        element.scrollIntoView?.({ block: 'center', inline: 'center' });
+        await waitForAgent(80);
+        element.click();
+        await waitForAgent(350);
+        const observation = observeAgentPage(context);
+        return finish({ success: true, message: `Clicked safe target. ${formatObservationMessage(observation)}`, observedText: observation.evidence });
+      }
+      if (step.action === 'navigate') {
+        if (!isSafeAgentLink(step.url)) return finish({ success: false, message: 'Unsafe navigation was blocked.' });
+        location.href = new URL(step.url, location.href).href;
+        return finish({ success: true, message: 'Safe navigation started.' });
+      }
+      return finish({ success: false, message: `Unsupported action: ${step.action}` });
+    } catch (error) {
+      return finish({ success: false, message: error && error.message ? error.message : 'Step failed.' });
+    }
+  }
+
+  function observeAgentPage(context) {
+    const alerts = getVisibleAlertTexts();
+    const validation = getFieldValidationEvidence();
+    const dialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]'))
+      .filter((element) => isVisibleElement(element, true))
+      .map((element) => sanitizePageText(getShortText(element), 160))
+      .filter(Boolean)
+      .slice(0, 5);
+    const tables = Array.from(document.querySelectorAll('table, [role="table"]'))
+      .filter((element) => isVisibleElement(element, true))
+      .map((table) => `${table.querySelectorAll ? table.querySelectorAll('tr, [role="row"]').length : 0} visible row(s)`)
+      .slice(0, 3);
+    const resultSignals = getResultCountSignals();
+    const buttonSignals = getButtonStateSignals();
+    const accessibility = getAccessibilityObservations();
+    const evidence = [
+      `URL: ${location.href}`,
+      document.title ? `Title: ${document.title}` : '',
+      alerts.length ? `Visible messages: ${alerts.join(' | ')}` : '',
+      validation.length ? `Field validation: ${validation.join(' | ')}` : '',
+      dialogs.length ? `Visible dialogs: ${dialogs.join(' | ')}` : '',
+      tables.length ? `Tables: ${tables.join(' | ')}` : '',
+      resultSignals.length ? `Results/lists: ${resultSignals.join(' | ')}` : '',
+      buttonSignals.length ? `Button states: ${buttonSignals.join(' | ')}` : '',
+      accessibility.length ? `Accessibility observations: ${accessibility.join(' | ')}` : ''
+    ].filter(Boolean);
+    return {
+      url: location.href,
+      title: document.title || '',
+      visibleAlerts: alerts,
+      fieldValidation: validation,
+      visibleDialogs: dialogs,
+      tableSignals: tables,
+      resultSignals,
+      buttonSignals,
+      accessibility,
+      evidence
+    };
+  }
+
+  function formatObservationMessage(observation) {
+    const lines = [];
+    if (observation.fieldValidation && observation.fieldValidation.length) lines.push(...observation.fieldValidation);
+    if (observation.visibleAlerts && observation.visibleAlerts.length) lines.push(...observation.visibleAlerts.map((item) => `Visible message: ${item}`));
+    if (observation.visibleDialogs && observation.visibleDialogs.length) lines.push(...observation.visibleDialogs.map((item) => `Dialog visible: ${item}`));
+    if (observation.resultSignals && observation.resultSignals.length) lines.push(...observation.resultSignals);
+    if (observation.tableSignals && observation.tableSignals.length) lines.push(...observation.tableSignals.map((item) => `Table signal: ${item}`));
+    if (observation.buttonSignals && observation.buttonSignals.length) lines.push(...observation.buttonSignals);
+    if (observation.accessibility && observation.accessibility.length) lines.push(...observation.accessibility);
+    if (!lines.length) lines.push(`No visible validation, dialog, toast, list, or table change detected on ${location.href}.`);
+    return lines.slice(0, 8).join(' ');
+  }
+
+  function getFieldValidationEvidence() {
+    const issues = [];
+    for (const field of Array.from(document.querySelectorAll('input, textarea, select')).filter((el) => isVisibleElement(el, true)).slice(0, 20)) {
+      if (field.type === 'hidden') continue;
+      const label = getAssociatedLabel(field) || getElementLabel(field) || field.getAttribute('placeholder') || field.getAttribute('name') || field.id || field.tagName.toLowerCase();
+      const validationMessage = typeof field.validationMessage === 'string' ? field.validationMessage : '';
+      const invalid = field.getAttribute('aria-invalid') === 'true' || (typeof field.checkValidity === 'function' && !field.checkValidity());
+      const describedBy = getDescribedByText(field);
+      if (validationMessage) {
+        issues.push(`${sanitizePageText(label, 80)} displayed "${sanitizePageText(validationMessage, 140)}"`);
+      } else if (describedBy) {
+        issues.push(`${sanitizePageText(label, 80)} described by "${sanitizePageText(describedBy, 140)}"`);
+      } else if (invalid) {
+        issues.push(`${sanitizePageText(label, 80)} is marked invalid`);
+      }
+    }
+    return issues.slice(0, 8);
+  }
+
+  function getDescribedByText(field) {
+    const ids = String(field.getAttribute('aria-describedby') || '').split(/\s+/).filter(Boolean);
+    const texts = [];
+    for (const id of ids.slice(0, 4)) {
+      const element = getElementBySelector(`#${cssEscape(id)}`);
+      if (element && isVisibleElement(element, true)) texts.push(getShortText(element));
+    }
+    return sanitizePageText(texts.filter(Boolean).join(' | '), 180);
+  }
+
+  function getResultCountSignals() {
+    const selector = [
+      '[role="status"]',
+      '[aria-live]',
+      '[class*="result"]',
+      '[class*="empty"]',
+      '[class*="no-result"]',
+      'ul',
+      'ol',
+      '[role="list"]'
+    ].join(',');
+    return Array.from(document.querySelectorAll(selector))
+      .filter((element) => isVisibleElement(element, true))
+      .map((element) => {
+        const text = sanitizePageText(getShortText(element), 120);
+        const itemCount = element.querySelectorAll ? element.querySelectorAll('li, [role="listitem"], article, tr').length : 0;
+        if (text && /result|found|empty|no\s+results?|success|error|invalid/i.test(text)) return `Visible result text: ${text}`;
+        if (itemCount > 0) return `${element.tagName.toLowerCase()} contains ${itemCount} visible item(s)`;
+        return '';
+      })
+      .filter(Boolean)
+      .slice(0, 5);
+  }
+
+  function getButtonStateSignals() {
+    return Array.from(document.querySelectorAll('button, input[type="submit"], input[type="button"], [role="button"]'))
+      .filter((element) => isVisibleElement(element, true))
+      .slice(0, 12)
+      .map((element) => {
+        const label = sanitizePageText(getShortText(element) || getElementLabel(element) || element.getAttribute('value') || 'button', 80);
+        if (element.disabled || element.getAttribute('aria-disabled') === 'true') return `${label} is disabled`;
+        if (element.getAttribute('aria-busy') === 'true') return `${label} is busy`;
+        return '';
+      })
+      .filter(Boolean)
+      .slice(0, 5);
+  }
+
+  function evaluateAgentResult(plan, actionResults, observation, safety) {
+    if (safety && !safety.ok) {
+      return {
+        status: safety.requiresConfirmation ? 'blocked' : 'blocked',
+        summary: safety.requiresConfirmation
+          ? 'Agent stopped before execution because the plan needs tester confirmation.'
+          : 'Agent stopped before execution because the plan was unsafe or invalid.',
+        passedChecks: [],
+        failedChecks: safety.blocked || [],
+        evidence: [...(safety.needsConfirmation || []), ...(safety.blocked || [])],
+        recommendedNextSteps: ['Review the blocked action and run a narrower, safer command.']
+      };
+    }
+    const failures = actionResults.filter((item) => !item.success);
+    const successCount = actionResults.filter((item) => item.success).length;
+    const evidence = [...(observation?.evidence || []), ...actionResults.map((item) => `${item.action}: ${item.message}`)].slice(0, 12);
+    const hasVisibleValidation = Boolean(
+      (observation.fieldValidation && observation.fieldValidation.length)
+      || (observation.visibleAlerts && observation.visibleAlerts.length)
+    );
+    const hasInteractionEvidence = Boolean(
+      hasVisibleValidation
+      || (observation.visibleDialogs && observation.visibleDialogs.length)
+      || (observation.resultSignals && observation.resultSignals.length)
+      || (observation.tableSignals && observation.tableSignals.length)
+      || (observation.buttonSignals && observation.buttonSignals.length)
+    );
+    let status = failures.length ? 'failed' : 'needs_review';
+    let summary = failures.length
+      ? `${failures.length} agent step${failures.length === 1 ? '' : 's'} failed and needs review.`
+      : `Agent completed ${successCount} step${successCount === 1 ? '' : 's'}; review the observations before filing.`;
+    if (plan.taskType === 'highlight_interactions' && !failures.length) {
+      const highlighted = actionResults.filter((item) => item.action === 'highlight' && item.success).length;
+      status = highlighted ? 'passed' : 'needs_review';
+      summary = highlighted
+        ? `Highlighted ${highlighted} visible interactive element${highlighted === 1 ? '' : 's'} without typing or clicking.`
+        : 'No visible interactive elements were available to highlight.';
+    } else if (['form_validation', 'required_field_validation', 'invalid_login_test', 'invalid_signup_validation', 'login_validation'].includes(plan.taskType) && !failures.length) {
+      if (hasVisibleValidation) {
+        status = 'passed';
+        summary = 'Validation produced visible field, alert, or message evidence with safe QA data.';
+      } else {
+        status = 'needs_review';
+        summary = 'Form interaction completed, but no visible validation, success, or failure message was detected.';
+      }
+    } else if (plan.taskType === 'valid_dummy_data_flow' && !failures.length) {
+      const validationText = [...(observation.fieldValidation || []), ...(observation.visibleAlerts || [])].join(' ').toLowerCase();
+      if (/invalid email|include an '@'|valid email|email.*invalid/.test(validationText)) {
+        status = 'failed';
+        summary = 'Valid-looking dummy data was submitted, but the page still showed email validation evidence.';
+      } else if (/success|created|registered|welcome|saved|submitted|thank you/.test(validationText)) {
+        status = 'passed';
+        summary = 'Valid-looking dummy data produced visible success evidence.';
+      } else {
+        status = 'needs_review';
+        summary = 'Valid-looking dummy data was entered, but success or failure evidence was not clear.';
+      }
+    } else if (plan.taskType === 'accessibility_check') {
+      status = observation.accessibility.length ? 'failed' : 'passed';
+      summary = observation.accessibility.length
+        ? `${observation.accessibility.length} accessibility observation${observation.accessibility.length === 1 ? '' : 's'} found.`
+        : 'No basic visible accessibility issues were detected by the agent.';
+    } else if (!failures.length && ['modal_test', 'pagination_test', 'link_navigation_test', 'search_test', 'filter_test'].includes(plan.taskType)) {
+      status = hasInteractionEvidence ? 'needs_review' : 'needs_review';
+      summary = hasInteractionEvidence
+        ? 'Agent executed the interaction and captured visible evidence. Confirm expected behavior before filing.'
+        : 'Agent executed the interaction, but visible evidence was weak. Manual review is required.';
+    } else if (!failures.length && ['page_summary', 'test_case_generation', 'bug_report_generation'].includes(plan.taskType)) {
+      status = 'needs_review';
+      summary = 'Agent collected visible page evidence without changing the page.';
+    }
+    return {
+      status,
+      summary,
+      passedChecks: actionResults.filter((item) => item.success).map((item) => `${item.action}: ${item.message}`),
+      failedChecks: failures.map((item) => `${item.action}: ${item.message}`),
+      evidence,
+      recommendedNextSteps: recommendedNextStepsForAgent(plan.taskType, status)
+    };
+  }
+
+  function getAccessibilityObservations() {
+    const issues = [];
+    for (const input of Array.from(document.querySelectorAll('input, textarea, select')).filter((el) => isVisibleElement(el, true)).slice(0, 20)) {
+      if (input.type === 'hidden') continue;
+      if (!getAssociatedLabel(input) && !input.getAttribute('aria-label') && !input.getAttribute('aria-labelledby') && !input.getAttribute('placeholder')) {
+        issues.push(`Unlabeled ${input.tagName.toLowerCase()} ${getSelector(input)}`);
+      }
+    }
+    for (const img of Array.from(document.images || []).filter((el) => isVisibleElement(el, true)).slice(0, 20)) {
+      if (!img.getAttribute('alt')) issues.push(`Image missing alt ${getSelector(img)}`);
+    }
+    for (const button of Array.from(document.querySelectorAll('button, [role="button"]')).filter((el) => isVisibleElement(el, true)).slice(0, 20)) {
+      if (!getShortText(button) && !getElementLabel(button)) issues.push(`Button missing accessible name ${getSelector(button)}`);
+    }
+    return issues.slice(0, 10);
+  }
+
+  function recommendedNextStepsForAgent(taskType, status) {
+    if (status === 'passed') return ['Re-run after code changes or at another viewport for confidence.'];
+    if (taskType === 'accessibility_check') return ['Fix listed accessibility observations, then run UI Scan for reportable evidence.'];
+    if (status === 'failed') return ['Review the failed step, inspect the target element, and retry with a narrower command.'];
+    return ['Manually confirm the observed behavior, then generate test cases or a bug report from the latest agent result.'];
+  }
+
+  function compactAgentContextForResponse(context) {
+    return {
+      url: context.url,
+      title: context.title,
+      pageType: context.pageType,
+      contextHash: context.contextHash,
+      summary: context.summary,
+      headings: context.headings,
+      importantText: context.importantText,
+      visibleAlerts: context.visibleAlerts,
+      availableSafeActions: context.availableSafeActions,
+      elements: (context.elements || []).slice(0, 40),
+      forms: context.forms || []
+    };
+  }
+
+  function dummyValueForField(field) {
+    const hint = `${field.type || ''} ${field.label || ''} ${field.placeholder || ''} ${field.text || ''}`.toLowerCase();
+    if (/email/.test(hint)) return SAFE_DUMMY_VALUES.email;
+    if (/password/.test(hint)) return SAFE_DUMMY_VALUES.invalidPassword;
+    if (/phone|tel|mobile/.test(hint)) return SAFE_DUMMY_VALUES.invalidPhone;
+    if (/name|first|last|user/.test(hint)) return SAFE_DUMMY_VALUES.name;
+    if (/message|comment|description|textarea/.test(hint) || field.role === 'textarea') return SAFE_DUMMY_VALUES.message;
+    if (/search|query|keyword/.test(hint)) return SAFE_DUMMY_VALUES.search;
+    return SAFE_DUMMY_VALUES.generic;
+  }
+
+  function validDummyValueForField(field) {
+    const hint = `${field.type || ''} ${field.label || ''} ${field.placeholder || ''} ${field.text || ''}`.toLowerCase();
+    if (/email/.test(hint)) return makeUniqueQaEmail();
+    if (/password/.test(hint)) return SAFE_DUMMY_VALUES.password;
+    if (/phone|tel|mobile/.test(hint)) return SAFE_DUMMY_VALUES.phone;
+    if (/name|first|last|user/.test(hint)) return SAFE_DUMMY_VALUES.name;
+    if (/message|comment|description|textarea/.test(hint) || field.role === 'textarea') return SAFE_DUMMY_VALUES.message;
+    if (/search|query|keyword/.test(hint)) return SAFE_DUMMY_VALUES.search;
+    return SAFE_DUMMY_VALUES.generic;
+  }
+
+  function makeUniqueQaEmail() {
+    return `qa.test+${Date.now()}@example.com`;
+  }
+
+  function realDataDisclaimer(dataStrategy) {
+    return dataStrategy === 'real_user_provided'
+      ? 'Use safe realistic dummy QA data instead of private real user credentials.'
+      : 'Enter valid-looking dummy QA data requested by the prompt.';
+  }
+
+  function expectedOutcomeForTask(taskType) {
+    return {
+      highlight_interactions: 'Visible interactive elements are highlighted with indexes without typing, clicking, or submitting.',
+      required_field_validation: 'Submitting empty required fields produces visible validation or invalid field state.',
+      invalid_login_test: 'Safe dummy credentials produce validation, login failure, route, API, or console evidence.',
+      invalid_signup_validation: 'Invalid signup data produces validation, route, API, or console evidence.',
+      valid_dummy_data_flow: 'Valid-looking dummy QA data produces success, validation, route, API, or console evidence.',
+      login_validation: 'Empty-field, invalid-email, and dummy-credential checks are performed separately with evidence.',
+      form_validation: 'Visible validation, success, disabled state, or route feedback is observed after safe form input.',
+      button_test: 'Safe button click produces visible state change, modal, feedback, or needs-review evidence.',
+      link_navigation_test: 'Safe same-site link changes route, hash, title, or visible page state.',
+      search_test: 'Search query changes results, URL, no-results state, or visible feedback.',
+      filter_test: 'Filter control changes selected state, results, table, or list.',
+      modal_test: 'Modal opens with visible content and can be closed when a close control exists.',
+      tab_test: 'Tab selection changes visible panel state.',
+      accordion_test: 'Accordion expands or collapses visible content.',
+      table_test: 'Table structure and controls are visible for QA review.',
+      pagination_test: 'Pagination changes page, active state, URL, or visible rows.',
+      upload_test: 'Upload is blocked unless explicitly confirmed.',
+      download_test: 'Download link is identified but not triggered automatically unless safe.',
+      accessibility_check: 'Visible accessibility basics are inspected and concrete observations are reported.',
+      page_summary: 'Visible page context is summarized without changing the page.',
+      test_case_generation: 'Page evidence is collected for test case drafting.',
+      bug_report_generation: 'Visible evidence is collected for a bug report draft.',
+      general_page_validation: 'Important interactions are highlighted and observable page evidence is summarized.'
+    }[taskType] || 'Agent observes page state and reports evidence.';
+  }
+
+  function getElementBySelector(selector) {
+    if (!selector || !document.querySelector) return null;
+    try {
+      return document.querySelector(selector);
+    } catch {
+      return null;
+    }
+  }
+
+  function getAssociatedLabel(element) {
+    if (!element || !element.getAttribute) return '';
+    const id = element.getAttribute('id');
+    if (id && document.querySelector) {
+      try {
+        const label = document.querySelector(`label[for="${cssEscape(id)}"]`);
+        if (label) return getShortText(label);
+      } catch {
+        // Ignore malformed labels.
+      }
+    }
+    const wrapped = element.closest && element.closest('label');
+    return wrapped ? getShortText(wrapped) : '';
+  }
+
+  function isSafeAgentLink(href) {
+    const value = String(href || '').trim();
+    if (!value || value === '#') return false;
+    if (/^(javascript|data|blob):/i.test(value)) return false;
+    try {
+      const url = new URL(value, location.href);
+      const current = new URL(location.href);
+      return url.origin === current.origin;
+    } catch {
+      return false;
+    }
+  }
+
+  function buildAgentRequestKey(parts) {
+    return simpleHash([
+      parts.sessionId || '',
+      parts.pageUrl || '',
+      parts.mode || 'agent',
+      parts.userMessage || '',
+      parts.taskType || '',
+      parts.dataStrategy || 'unknown',
+      parts.pageContextHash || ''
+    ].join('|'));
+  }
+
+  function simpleHash(input) {
+    const text = String(input || '');
+    let hash = 0;
+    for (let index = 0; index < text.length; index += 1) {
+      hash = ((hash << 5) - hash) + text.charCodeAt(index);
+      hash |= 0;
+    }
+    return Math.abs(hash).toString(36);
+  }
+
+  function waitForAgent(ms) {
+    return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+  }
+
+  function highlightAgentElement(element) {
+    if (!element || !element.style) return;
+    const previousOutline = element.style.outline;
+    const previousOutlineOffset = element.style.outlineOffset;
+    element.style.outline = '3px solid #2563eb';
+    element.style.outlineOffset = '2px';
+    setTimeout(() => {
+      try {
+        element.style.outline = previousOutline;
+        element.style.outlineOffset = previousOutlineOffset;
+      } catch {
+        // Element may have been removed.
+      }
+    }, 1800);
+  }
+
+  function setElementValue(element, value) {
+    if (!element) return;
+    element.focus?.();
+    const prototype = element.tagName === 'TEXTAREA'
+      ? window.HTMLTextAreaElement && window.HTMLTextAreaElement.prototype
+      : window.HTMLInputElement && window.HTMLInputElement.prototype;
+    const descriptor = prototype ? Object.getOwnPropertyDescriptor(prototype, 'value') : null;
+    if (descriptor && descriptor.set) {
+      descriptor.set.call(element, value);
+    } else {
+      element.value = value;
+    }
+    dispatchAgentInputEvents(element);
+  }
+
+  function dispatchAgentInputEvents(element) {
+    try {
+      element.dispatchEvent(new Event('input', { bubbles: true }));
+      element.dispatchEvent(new Event('change', { bubbles: true }));
+    } catch {
+      // Some host pages override event constructors; ignore if dispatch fails.
+    }
+  }
+
+  function selectSafeOption(element, requestedValue) {
+    if (!element || element.tagName.toLowerCase() !== 'select') {
+      return { ok: false, message: 'Target is not a select control.' };
+    }
+    const options = Array.from(element.options || []);
+    const next = requestedValue && requestedValue !== '__FIRST_SAFE_OPTION__'
+      ? options.find((option) => option.value === requestedValue && !option.disabled)
+      : options.find((option) => !option.disabled && String(option.value || option.textContent || '').trim());
+    if (!next) return { ok: false, message: 'No safe selectable option was available.' };
+    element.value = next.value;
+    dispatchAgentInputEvents(element);
+    return { ok: true, message: `Selected option "${sanitizePageText(next.textContent || next.value, 80)}".` };
+  }
+
+  function capturePageContext(mode) {
+    const normalizedMode = mode === 'visible-summary' ? 'visible-summary' : 'selection';
+    const selectedText = getSelectedText();
+    if (normalizedMode === 'selection') {
+      if (!selectedText) throw new Error('Select text on the page first, then capture it.');
+      return {
+        type: 'selected-text',
+        selectedText: sanitizePageText(selectedText, MAX_SELECTED_TEXT_LENGTH),
+        title: document.title || '',
+        url: location.href,
+        clickedElementText: sanitizePageText(getActiveElementText(), 500),
+        capturedAt: Date.now()
+      };
+    }
+
+    const headings = getVisibleHeadings();
+    const visibleAlerts = getVisibleAlertTexts();
+    const activeText = getActiveElementText();
+    const summary = [
+      document.title ? `Title: ${document.title}` : '',
+      headings.length ? `Visible headings: ${headings.join(' | ')}` : '',
+      visibleAlerts.length ? `Visible alerts/errors: ${visibleAlerts.join(' | ')}` : '',
+      activeText ? `Focused/selected element: ${activeText}` : '',
+      selectedText ? `Selected text: ${selectedText}` : ''
+    ].filter(Boolean).join('\n');
+
+    return {
+      type: 'visible-summary',
+      summary: sanitizePageText(summary, MAX_VISIBLE_SUMMARY_LENGTH),
+      title: document.title || '',
+      url: location.href,
+      headings,
+      visibleAlerts,
+      clickedElementText: sanitizePageText(activeText, 500),
+      capturedAt: Date.now()
+    };
+  }
+
+  function getSelectedText() {
+    try {
+      return String(window.getSelection && window.getSelection().toString() || '').trim();
+    } catch {
+      return '';
+    }
+  }
+
+  function getVisibleHeadings() {
+    return Array.from(document.querySelectorAll('h1, h2, h3, [role="heading"]'))
+      .filter((element) => isVisibleElement(element, true))
+      .map((element) => sanitizePageText(getShortText(element), 160))
+      .filter(Boolean)
+      .slice(0, 8);
+  }
+
+  function getVisibleAlertTexts() {
+    const selector = [
+      '[role="alert"]',
+      '[aria-live]',
+      '.error',
+      '.errors',
+      '.alert',
+      '.warning',
+      '.toast',
+      '.notification',
+      '.message',
+      '.validation',
+      '[class*="error"]',
+      '[class*="alert"]',
+      '[class*="toast"]'
+    ].join(',');
+    return Array.from(document.querySelectorAll(selector))
+      .filter((element) => isVisibleElement(element, true))
+      .map((element) => sanitizePageText(getShortText(element), 220))
+      .filter(Boolean)
+      .slice(0, 10);
+  }
+
+  function getActiveElementText() {
+    const element = document.activeElement;
+    if (!element || element === document.body || element === document.documentElement) return '';
+    return getShortText(element);
+  }
+
+  function sanitizePageText(value, maxLength) {
+    let output = String(value || '').replace(/\s+/g, ' ').trim();
+    output = output.replace(/(authorization\s*[:=]\s*)(bearer\s+)?[a-z0-9._\-+/=]+/gi, '$1[REDACTED]');
+    output = output.replace(/\bbearer\s+[a-z0-9._\-+/=]+/gi, 'Bearer [REDACTED]');
+    output = output.replace(/((?:access_token|refresh_token|id_token|token|password|api_key|secret)=)([^&\s]+)/gi, '$1[REDACTED]');
+    output = output.replace(/("?(?:access_token|refresh_token|id_token|token|password|api_key|secret)"?\s*[:=]\s*")([^"&\s]+)(")/gi, '$1[REDACTED]$3');
+    return output.slice(0, maxLength);
+  }
 
   function runUiScan(settings) {
     const startedAt = performance.now();
@@ -447,6 +1592,41 @@
       durationMs: Math.round(performance.now() - startedAt),
       issues
     };
+  }
+
+  function sendUserAction(type, element, extra = {}) {
+    if (!activeSessionId || !element) return;
+    sendToExtension('user-action', {
+      type,
+      label: getShortText(element) || getElementLabel(element),
+      selector: getSelector(element),
+      url: location.href,
+      timestamp: Date.now(),
+      ...sanitizeActionExtra(extra)
+    });
+  }
+
+  function sanitizeActionExtra(extra) {
+    const output = {};
+    for (const [key, value] of Object.entries(extra || {})) {
+      if (typeof value === 'boolean' || typeof value === 'number') {
+        output[key] = value;
+      } else if (value !== undefined && value !== null) {
+        output[key] = String(value).slice(0, 240);
+      } else {
+        output[key] = null;
+      }
+    }
+    return output;
+  }
+
+  function getElementLabel(element) {
+    if (!element || !element.getAttribute) return '';
+    return element.getAttribute('aria-label')
+      || element.getAttribute('title')
+      || element.getAttribute('name')
+      || element.getAttribute('id')
+      || element.tagName.toLowerCase();
   }
 
   function runWhenIdle(task) {

@@ -1,5 +1,5 @@
 chrome.devtools.panels.create(
-  'BugLens',
+  'TestPilot',
   '../assets/icons/icon48.png',
   'devtools/panel.html',
   function onPanelCreated(panel) {

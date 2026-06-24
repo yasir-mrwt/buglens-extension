@@ -55,7 +55,7 @@ const chrome = {
       eval(_expression, callback) {
         callback({
           url: 'https://example.test/',
-          userAgent: 'BugLens test',
+          userAgent: 'TestPilot test',
           viewport: { width: 1280, height: 720 }
         }, null);
       }
@@ -239,7 +239,7 @@ globalThis.__migrated = consolidateStoredFindings([
   }
 ].map(migrateStoredIssue));
 chrome.runtime.lastError = { message: 'Could not establish connection. Receiving end does not exist.' };
-sendTabMessage({ type: 'BUGLENS_PING_CONTENT' }).then((result) => {
+sendTabMessage({ type: 'TESTPILOT_PING_CONTENT' }).then((result) => {
   globalThis.__messageErrorResult = result;
   chrome.runtime.lastError = null;
 });

@@ -19,6 +19,13 @@ class FakeElement {
     this._rect = options.rect;
     this._style = options.style;
     this._attrs = options.attrs || {};
+    this.type = options.type || this._attrs.type || '';
+    this.value = options.value || '';
+    this.required = Boolean(options.required);
+    this.disabled = Boolean(options.disabled);
+    this.checked = Boolean(options.checked);
+    this.style = {};
+    this.clicked = false;
   }
 
   getBoundingClientRect() {
@@ -36,8 +43,37 @@ class FakeElement {
     return null;
   }
 
+  contains(element) {
+    return this === element || this.children.includes(element);
+  }
+
+  closest(selector) {
+    if (selector === 'label' && this.tagName === 'LABEL') return this;
+    return null;
+  }
+
+  matches(selector) {
+    const tag = this.tagName.toLowerCase();
+    if (selector.includes(tag)) return true;
+    if (selector.includes('[role="button"]') && this._attrs.role === 'button') return true;
+    if (selector.includes('[onclick]') && this._attrs.onclick) return true;
+    return false;
+  }
+
+  hasAttribute(name) {
+    return Object.prototype.hasOwnProperty.call(this._attrs, name);
+  }
+
   getAttribute(name) {
     return Object.prototype.hasOwnProperty.call(this._attrs, name) ? this._attrs[name] : null;
+  }
+
+  focus() {}
+
+  dispatchEvent() {}
+
+  click() {
+    this.clicked = true;
   }
 }
 
@@ -114,8 +150,24 @@ const document = {
   querySelectorAll(selector) {
     if (selector === 'body *') return bodyElements;
     if (selector === 'a') return bodyElements.filter((element) => element.tagName === 'A');
+    if (selector === 'form') return bodyElements.filter((element) => element.tagName === 'FORM');
+    if (selector.includes('button')
+      || selector.includes('input')
+      || selector.includes('textarea')
+      || selector.includes('select')
+      || selector.includes('[role="button"]')) {
+      return bodyElements.filter((element) => ['BUTTON', 'INPUT', 'TEXTAREA', 'SELECT'].includes(element.tagName));
+    }
     return [];
   },
+  querySelector(selector) {
+    if (selector.startsWith('#')) {
+      const id = selector.slice(1);
+      return bodyElements.find((element) => element.id === id) || null;
+    }
+    return null;
+  },
+  addEventListener() {},
   getElementById(id) {
     return bodyElements.find((element) => element.id === id) || null;
   }
@@ -138,7 +190,10 @@ const context = {
     innerHeight: 720,
     devicePixelRatio: 1,
     addEventListener() {},
-    CSS: { escape(value) { return value; } }
+    CSS: { escape(value) { return value; } },
+    HTMLInputElement: FakeElement,
+    HTMLTextAreaElement: FakeElement,
+    scrollBy() {}
   },
   document,
   location: { href: 'https://example.test/' },
@@ -149,6 +204,11 @@ const context = {
   Element: FakeElement,
   Node: { ELEMENT_NODE: 1, TEXT_NODE: 3 },
   setTimeout,
+  Event: class Event {
+    constructor(type) {
+      this.type = type;
+    }
+  },
   console
 };
 
@@ -160,7 +220,7 @@ vm.runInContext(fs.readFileSync('content/content-script.js', 'utf8'), context, {
 function scan() {
   return new Promise((resolve, reject) => {
     messageListener({
-      type: 'BUGLENS_RUN_UI_SCAN',
+      type: 'TESTPILOT_RUN_UI_SCAN',
       settings: {
         uiVisibleViewportOnly: true,
         uiIncludeDecorativeElements: false,
@@ -251,6 +311,45 @@ function scan() {
   }
   if (!linkScan.issues.some((issue) => issue.evidence.ruleId === 'missing-anchor-target')) {
     throw new Error('Visible hash link with missing target was not detected.');
+  }
+
+  const emailInput = new FakeElement('input', {
+    id: 'email',
+    type: 'email',
+    attrs: { id: 'email', type: 'email', placeholder: 'Email' },
+    rect: { left: 30, top: 140, width: 220, height: 36 },
+    style: missingHref._style
+  });
+  const submitButton = new FakeElement('button', {
+    id: 'submit',
+    text: 'Submit',
+    attrs: { id: 'submit' },
+    rect: { left: 30, top: 190, width: 110, height: 36 },
+    childNodes: [{ nodeType: 3, textContent: 'Submit' }],
+    style: missingHref._style
+  });
+  bodyElements = [emailInput, submitButton];
+  const agentResult = await new Promise((resolve, reject) => {
+    messageListener({
+      type: 'TESTPILOT_RUN_AGENT',
+      command: 'Validate this login form',
+      options: {}
+    }, {}, (response) => {
+      if (!response.ok) {
+        reject(new Error(response.error || 'Agent workflow failed.'));
+        return;
+      }
+      resolve(response.result);
+    });
+  });
+  if (agentResult.taskType !== 'form_validation') {
+    throw new Error(`Expected form_validation task, received ${agentResult.taskType}.`);
+  }
+  if (!agentResult.plan.steps.some((step) => step.action === 'type')) {
+    throw new Error('Agent did not plan safe typing for form validation.');
+  }
+  if (!emailInput.value) {
+    throw new Error('Agent did not enter safe QA data into the input.');
   }
 
   console.log('UI scanner regression test passed.');

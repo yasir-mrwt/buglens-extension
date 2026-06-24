@@ -1,12 +1,12 @@
 (() => {
-  if (window.__BUGLENS_CONSOLE_LISTENER_INSTALLED__) return;
-  window.__BUGLENS_CONSOLE_LISTENER_INSTALLED__ = true;
+  if (window.__TESTPILOT_CONSOLE_LISTENER_INSTALLED__) return;
+  window.__TESTPILOT_CONSOLE_LISTENER_INSTALLED__ = true;
 
-  const SOURCE = 'buglens-page-console-listener';
+  const SOURCE = 'testpilot-page-console-listener';
   const MAX_ARG_LENGTH = 1500;
   const MAX_OBJECT_KEYS = 20;
   const MAX_ARRAY_ITEMS = 10;
-  const CAPTURE_CONSOLE_METHODS = window.__BUGLENS_CAPTURE_CONSOLE_METHODS__ === true;
+  const CAPTURE_CONSOLE_METHODS = window.__TESTPILOT_CAPTURE_CONSOLE_METHODS__ === true;
 
   function isErrorLike(value) {
     return Boolean(value
@@ -106,7 +106,7 @@
     const originalConsole = {};
     for (const level of ['error', 'warn']) {
       originalConsole[level] = console[level];
-      console[level] = function buglensConsoleProxy(...args) {
+      console[level] = function testpilotConsoleProxy(...args) {
         emit({
           channel: 'console',
           level,

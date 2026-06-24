@@ -1,7 +1,109 @@
 const inspectedTabId = chrome.devtools.inspectedWindow.tabId;
-const port = chrome.runtime.connect({ name: 'buglens-devtools' });
-const VERSION = '0.4.0';
-const SESSION_STORAGE_KEY = `buglensSession:v4:${inspectedTabId}`;
+const port = chrome.runtime.connect({ name: 'testpilot-devtools' });
+const VERSION = '0.4.1';
+const SESSION_STORAGE_KEY = `testpilotSession:v4:${inspectedTabId}`;
+
+const AI_PROVIDER_DEFAULTS = {
+  'local-backend': {
+    label: 'Local Backend',
+    baseUrl: 'http://localhost:8787',
+    model: 'auto',
+    needsApiKey: false,
+    adapter: 'local-backend'
+  },
+  'ollama-direct': {
+    label: 'Ollama Direct',
+    baseUrl: 'http://localhost:11434/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'llama3.2:3b',
+    needsApiKey: false,
+    adapter: 'openai-compatible'
+  },
+  openai: {
+    label: 'OpenAI',
+    baseUrl: 'https://api.openai.com/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'gpt-4o-mini',
+    needsApiKey: true,
+    adapter: 'openai-compatible'
+  },
+  grok: {
+    label: 'Grok / xAI',
+    baseUrl: 'https://api.x.ai/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'grok-3-mini',
+    needsApiKey: true,
+    adapter: 'openai-compatible'
+  },
+  gemini: {
+    label: 'Gemini',
+    baseUrl: 'https://generativelanguage.googleapis.com/v1beta/models',
+    model: 'auto',
+    recommendedModel: 'gemini-1.5-flash',
+    needsApiKey: true,
+    adapter: 'gemini'
+  },
+  anthropic: {
+    label: 'Anthropic Claude',
+    baseUrl: 'https://api.anthropic.com/v1/messages',
+    model: 'auto',
+    recommendedModel: 'claude-3-5-haiku-latest',
+    needsApiKey: true,
+    adapter: 'anthropic'
+  },
+  openrouter: {
+    label: 'OpenRouter',
+    baseUrl: 'https://openrouter.ai/api/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'openai/gpt-4o-mini',
+    needsApiKey: true,
+    adapter: 'openai-compatible'
+  },
+  together: {
+    label: 'Together AI',
+    baseUrl: 'https://api.together.xyz/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'meta-llama/Llama-3.3-70B-Instruct-Turbo-Free',
+    needsApiKey: true,
+    adapter: 'openai-compatible'
+  },
+  mistral: {
+    label: 'Mistral',
+    baseUrl: 'https://api.mistral.ai/v1/chat/completions',
+    model: 'auto',
+    recommendedModel: 'mistral-small-latest',
+    needsApiKey: true,
+    adapter: 'openai-compatible'
+  },
+  'custom-openai-compatible': {
+    label: 'Custom OpenAI-Compatible API',
+    baseUrl: '',
+    model: 'auto',
+    needsApiKey: false,
+    adapter: 'openai-compatible'
+  },
+  'custom-api': {
+    label: 'Custom API',
+    baseUrl: '',
+    model: 'auto',
+    needsApiKey: false,
+    adapter: 'custom-api'
+  }
+};
+
+const DEFAULT_AI_PROVIDER_SETTINGS = {
+  provider: 'local-backend',
+  apiKey: '',
+  baseUrl: AI_PROVIDER_DEFAULTS['local-backend'].baseUrl,
+  modelMode: 'auto',
+  model: '',
+  temperature: 0.2,
+  maxTokens: 900,
+  status: 'not_configured',
+  lastCheckedAt: null,
+  lastError: '',
+  usage: null
+};
 
 const DEFAULT_SETTINGS = {
   slowApiMs: 1000,
@@ -21,7 +123,9 @@ const DEFAULT_SETTINGS = {
   uiIncludeDecorativeElements: false,
   exportFrameworkNoise: true,
   csvExportEnabled: true,
+  aiContextMode: 'fast',
   aiBackendUrl: 'http://localhost:8787',
+  aiProvider: { ...DEFAULT_AI_PROVIDER_SETTINGS },
   includeAiSummaryInReport: false,
   allowedColors: []
 };
@@ -39,6 +143,10 @@ const MAX_PERSISTED_TIMELINE_EVENTS = 120;
 const MAX_PERSISTED_ISSUES = 300;
 const MAX_PERSISTED_AI_LOGS = 20;
 const MAX_STORAGE_STRING_LENGTH = 2000;
+const AGENT_EVIDENCE_WINDOW_MS = 5000;
+const MAX_RECENT_EVIDENCE_EVENTS = 120;
+const AI_HEALTH_INTERVAL_MS = 25000;
+const AUTO_UI_SCAN_COOLDOWN_MS = 10000;
 
 const SENSITIVE_KEYS = [
   'authorization',
@@ -63,7 +171,7 @@ const SENSITIVE_KEYS = [
 ];
 
 const state = {
-  activeView: 'dashboard',
+  activeView: 'ai',
   sessionId: null,
   active: false,
   startedAt: null,
@@ -114,6 +222,8 @@ const state = {
     analysis: null,
     lastTask: '',
     activeMode: 'analysis',
+    chatMessages: [],
+    lastAgentResult: null,
     error: '',
     log: ['Backend not checked yet. Start ai-backend with npm start, then click Check AI.']
   },
@@ -126,6 +236,12 @@ let toastTimer = null;
 let clearConfirmationTimer = null;
 let clearConfirmationArmed = false;
 let uiScanInProgress = false;
+let aiChatBusy = false;
+let recentEvidenceEvents = [];
+let aiHealthTimer = null;
+let autoUiScanTimer = null;
+let lastAutoUiScanAt = 0;
+let aiApiKeyTouched = false;
 
 const els = {
   startBtn: document.getElementById('startBtn'),
@@ -191,10 +307,24 @@ const els = {
   reportReview: document.getElementById('reportReview'),
   reportRoutes: document.getElementById('reportRoutes'),
   aiStatusPill: document.getElementById('aiStatusPill'),
+  testPilotCurrentView: document.getElementById('testPilotCurrentView'),
   aiStatusTitle: document.getElementById('aiStatusTitle'),
   aiStatusText: document.getElementById('aiStatusText'),
   aiBackendUrl: document.getElementById('aiBackendUrl'),
   aiConnectionLog: document.getElementById('aiConnectionLog'),
+  aiProviderSelect: document.getElementById('aiProviderSelect'),
+  aiApiKeyInput: document.getElementById('aiApiKeyInput'),
+  aiApiKeyHelp: document.getElementById('aiApiKeyHelp'),
+  clearAiApiKeyBtn: document.getElementById('clearAiApiKeyBtn'),
+  aiProviderStatusText: document.getElementById('aiProviderStatusText'),
+  aiProviderStatusPill: document.getElementById('aiProviderStatusPill'),
+  testAiProviderBtn: document.getElementById('testAiProviderBtn'),
+  aiBaseUrlInput: document.getElementById('aiBaseUrlInput'),
+  aiModelModeSelect: document.getElementById('aiModelModeSelect'),
+  aiModelInput: document.getElementById('aiModelInput'),
+  aiContextModeSelect: document.getElementById('aiContextModeSelect'),
+  aiTemperatureInput: document.getElementById('aiTemperatureInput'),
+  aiMaxTokensInput: document.getElementById('aiMaxTokensInput'),
   checkAiBtn: document.getElementById('checkAiBtn'),
   analyzeAiBtn: document.getElementById('analyzeAiBtn'),
   generateTestsBtn: document.getElementById('generateTestsBtn'),
@@ -206,6 +336,29 @@ const els = {
   downloadAiJsonReportBtn: document.getElementById('downloadAiJsonReportBtn'),
   includeAiSummaryInReport: document.getElementById('includeAiSummaryInReport'),
   aiOutput: document.getElementById('aiOutput'),
+  aiChatForm: document.getElementById('aiChatForm'),
+  aiChatInput: document.getElementById('aiChatInput'),
+  aiChatMessages: document.getElementById('aiChatMessages'),
+  sendAiChatBtn: document.getElementById('sendAiChatBtn'),
+  testPilotChatModeBtn: document.getElementById('testPilotChatModeBtn'),
+  testPilotAgentModeBtn: document.getElementById('testPilotAgentModeBtn'),
+  testPilotAgentNotice: document.getElementById('testPilotAgentNotice'),
+  testPilotAgentCommands: document.getElementById('testPilotAgentCommands'),
+  testCaseTypeSelect: document.getElementById('testCaseTypeSelect'),
+  testCaseFormatSelect: document.getElementById('testCaseFormatSelect'),
+  generateTestCasesTabBtn: document.getElementById('generateTestCasesTabBtn'),
+  copyTestCasesBtn: document.getElementById('copyTestCasesBtn'),
+  exportTestCasesMarkdownBtn: document.getElementById('exportTestCasesMarkdownBtn'),
+  clearTestCasesBtn: document.getElementById('clearTestCasesBtn'),
+  testCasesStatus: document.getElementById('testCasesStatus'),
+  testCasesOutput: document.getElementById('testCasesOutput'),
+  generateBugReportTabBtn: document.getElementById('generateBugReportTabBtn'),
+  copyBugReportDraftsBtn: document.getElementById('copyBugReportDraftsBtn'),
+  exportBugReportMarkdownBtn: document.getElementById('exportBugReportMarkdownBtn'),
+  exportBugReportJsonBtn: document.getElementById('exportBugReportJsonBtn'),
+  clearBugReportsBtn: document.getElementById('clearBugReportsBtn'),
+  bugReportsStatus: document.getElementById('bugReportsStatus'),
+  bugReportsOutput: document.getElementById('bugReportsOutput'),
   findingsHeading: document.getElementById('findingsHeading'),
   slowApiMs: document.getElementById('slowApiMs'),
   verySlowApiMs: document.getElementById('verySlowApiMs'),
@@ -238,14 +391,36 @@ const tabButtons = typeof document.querySelectorAll === 'function'
 const shortcutTabButtons = typeof document.querySelectorAll === 'function'
   ? Array.from(document.querySelectorAll('[data-shortcut-tab]'))
   : [];
+const menuToggleBtn = document.getElementById('menuToggleBtn');
+const menuCloseBtn = document.getElementById('menuCloseBtn');
+const workspaceNav = document.getElementById('workspaceNav');
 const aiModeButtons = typeof document.querySelectorAll === 'function'
   ? Array.from(document.querySelectorAll('[data-ai-mode]'))
   : [];
+const qaActionButtons = typeof document.querySelectorAll === 'function'
+  ? Array.from(document.querySelectorAll('[data-qa-action]'))
+  : [];
+const agentCommandButtons = typeof document.querySelectorAll === 'function'
+  ? Array.from(document.querySelectorAll('[data-agent-command]'))
+  : [];
+const viewVisibilityRules = {
+  ai: ['ai-only'],
+  dashboard: ['dashboard-only'],
+  findings: ['findings-only'],
+  api: ['api-only', 'findings-only'],
+  console: ['console-only', 'findings-only'],
+  ui: ['ui-only', 'findings-only'],
+  'test-cases': ['test-cases-only'],
+  'bug-reports': ['bug-reports-only'],
+  reports: ['reports-only'],
+  settings: ['settings-only']
+};
+const viewScopedClasses = Array.from(new Set(Object.values(viewVisibilityRules).flat()));
 
 init().catch((error) => {
-  console.warn('[BugLens] Panel initialization failed', error);
+  console.warn('[TestPilot] Panel initialization failed', error);
   state.active = false;
-  state.unsupportedReason = 'BugLens could not initialize this panel. Reload the extension, the page, and DevTools.';
+  state.unsupportedReason = 'TestPilot could not initialize this panel. Reload the extension, the page, and DevTools.';
   try {
     render();
   } catch {
@@ -254,9 +429,10 @@ init().catch((error) => {
 });
 
 async function init() {
-  port.postMessage({ type: 'BUGLENS_PANEL_INIT', tabId: inspectedTabId });
+  port.postMessage({ type: 'TESTPILOT_PANEL_INIT', tabId: inspectedTabId });
   port.onMessage.addListener(handlePortMessage);
   bindEvents();
+  setActiveView(state.activeView);
   await loadSettings();
   await restoreSession();
   await refreshInspectedPage();
@@ -264,9 +440,15 @@ async function init() {
   render();
   registerNetworkListener();
   registerNavigationListener();
+  void checkAiHealth({ silent: true, reason: 'panel-load' });
+  aiHealthTimer = setInterval(() => {
+    void checkAiHealth({ silent: true, reason: 'periodic' });
+  }, AI_HEALTH_INTERVAL_MS);
   durationTimer = setInterval(renderSessionDuration, 1000);
   window.addEventListener('beforeunload', () => {
     if (durationTimer) clearInterval(durationTimer);
+    if (aiHealthTimer) clearInterval(aiHealthTimer);
+    if (autoUiScanTimer) clearTimeout(autoUiScanTimer);
   });
 }
 
@@ -275,8 +457,17 @@ function bindEvents() {
   els.stopBtn.addEventListener('click', stopSession);
   els.clearBtn.addEventListener('click', requestClearSession);
   els.uiScanBtn.addEventListener('click', runUiScan);
+  if (menuToggleBtn && workspaceNav) {
+    menuToggleBtn.addEventListener('click', toggleMenu);
+  }
+  if (menuCloseBtn) {
+    menuCloseBtn.addEventListener('click', () => toggleMenu(false));
+  }
   for (const button of tabButtons) {
-    button.addEventListener('click', () => setActiveView(button.dataset.tab));
+    button.addEventListener('click', () => {
+      setActiveView(button.dataset.tab);
+      if (workspaceNav?.contains(button)) toggleMenu(false);
+    });
     button.addEventListener('keydown', handleTabKeydown);
   }
   for (const button of shortcutTabButtons) {
@@ -289,6 +480,27 @@ function bindEvents() {
       schedulePersist();
     });
   }
+  for (const button of qaActionButtons) {
+    button.addEventListener('click', () => handleQaMenuAction(button.dataset.qaAction));
+  }
+  for (const button of agentCommandButtons) {
+    button.addEventListener('click', () => {
+      setTestPilotChatMode('agent');
+      setActiveView('ai');
+      void submitAiChat(button.dataset.agentCommand || button.textContent || '');
+    });
+  }
+  els.testPilotChatModeBtn.addEventListener('click', () => setTestPilotChatMode('chat'));
+  els.testPilotAgentModeBtn.addEventListener('click', () => setTestPilotChatMode('agent'));
+  els.aiChatForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    void submitAiChat(els.aiChatInput.value);
+  });
+  els.aiChatInput.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter' || event.shiftKey || event.metaKey || event.ctrlKey || event.altKey) return;
+    event.preventDefault();
+    if (!els.sendAiChatBtn.disabled) void submitAiChat(els.aiChatInput.value);
+  });
   els.typeFilter.addEventListener('change', renderIssues);
   els.categoryFilter.addEventListener('change', renderIssues);
   els.severityFilter.addEventListener('change', renderIssues);
@@ -305,15 +517,72 @@ function bindEvents() {
   els.viewReportsBtn.addEventListener('click', () => setActiveView('reports'));
   els.quickExportBtn.addEventListener('click', exportHtml);
   els.quickCopyBtn.addEventListener('click', copyBugReport);
-  els.checkAiBtn.addEventListener('click', checkAiHealth);
-  els.analyzeAiBtn.addEventListener('click', () => runAiTask('analyze-session'));
-  els.generateTestsBtn.addEventListener('click', () => runAiTask('generate-test-cases'));
-  els.generateBugsBtn.addEventListener('click', () => runAiTask('generate-bug-report'));
-  els.copyAiSummaryBtn.addEventListener('click', copyAiSummary);
-  els.downloadAiMarkdownBtn.addEventListener('click', downloadAiMarkdown);
-  els.downloadAiJsonBtn.addEventListener('click', downloadAiJson);
+  els.checkAiBtn.addEventListener('click', () => checkAiHealth({ silent: false, reason: 'manual' }));
+  els.analyzeAiBtn?.addEventListener('click', () => runAiTask('analyze-session'));
+  els.generateTestsBtn?.addEventListener('click', () => runAiTask('generate-test-cases'));
+  els.generateBugsBtn?.addEventListener('click', () => runAiTask('generate-bug-report'));
+  els.copyAiSummaryBtn?.addEventListener('click', copyAiSummary);
+  els.downloadAiMarkdownBtn?.addEventListener('click', downloadAiMarkdown);
+  els.downloadAiJsonBtn?.addEventListener('click', downloadAiJson);
   els.downloadAiMarkdownReportBtn.addEventListener('click', downloadAiMarkdown);
   els.downloadAiJsonReportBtn.addEventListener('click', downloadAiJson);
+  els.aiProviderSelect?.addEventListener('change', handleAiProviderFormChange);
+  els.aiModelModeSelect?.addEventListener('change', handleAiProviderFormChange);
+  els.aiApiKeyInput?.addEventListener('input', () => {
+    aiApiKeyTouched = true;
+    updateAiProviderFormHelp();
+  });
+  els.aiBaseUrlInput?.addEventListener('input', updateAiProviderFormHelp);
+  els.clearAiApiKeyBtn?.addEventListener('click', clearAiApiKey);
+  els.testAiProviderBtn?.addEventListener('click', () => checkAiHealth({ silent: false, reason: 'manual-provider-test', force: true }));
+  els.generateTestCasesTabBtn?.addEventListener('click', () => runAiTask('generate-test-cases', { source: 'test-cases-tab' }));
+  els.copyTestCasesBtn?.addEventListener('click', copyTestCases);
+  els.exportTestCasesMarkdownBtn?.addEventListener('click', exportTestCasesMarkdown);
+  els.clearTestCasesBtn?.addEventListener('click', clearTestCases);
+  els.testCaseTypeSelect?.addEventListener('change', renderTestCasesState);
+  els.testCaseFormatSelect?.addEventListener('change', renderTestCasesState);
+  els.generateBugReportTabBtn?.addEventListener('click', () => runAiTask('generate-bug-report', { source: 'bug-reports-tab' }));
+  els.copyBugReportDraftsBtn?.addEventListener('click', copyBugReportDrafts);
+  els.exportBugReportMarkdownBtn?.addEventListener('click', exportBugReportMarkdown);
+  els.exportBugReportJsonBtn?.addEventListener('click', exportBugReportJson);
+  els.clearBugReportsBtn?.addEventListener('click', clearBugReports);
+}
+
+function handleAiProviderFormChange() {
+  state.settings.aiProvider = readAiProviderSettingsFromForm();
+  aiApiKeyTouched = false;
+  writeAiProviderSettingsToForm();
+}
+
+function updateAiProviderFormHelp() {
+  const settings = readAiProviderSettingsFromForm();
+  const defaults = AI_PROVIDER_DEFAULTS[settings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  if (els.aiApiKeyHelp) {
+    if (defaults.needsApiKey && !settings.apiKey) {
+      els.aiApiKeyHelp.textContent = 'Required before this provider can be tested.';
+    } else if (settings.apiKey) {
+      els.aiApiKeyHelp.textContent = `Saved key will be masked as ${maskApiKey(settings.apiKey)}.`;
+    } else {
+      els.aiApiKeyHelp.textContent = 'Not required for this provider.';
+    }
+  }
+  if (els.aiModelInput) els.aiModelInput.disabled = settings.modelMode !== 'custom';
+}
+
+function clearAiApiKey() {
+  aiApiKeyTouched = true;
+  if (els.aiApiKeyInput) {
+    els.aiApiKeyInput.value = '';
+    els.aiApiKeyInput.placeholder = 'API key cleared. Save settings to apply.';
+  }
+  state.settings.aiProvider = {
+    ...normalizeAiProviderSettings(state.settings.aiProvider),
+    apiKey: '',
+    status: 'not_configured',
+    lastError: 'API key cleared.'
+  };
+  renderAiProviderStatus();
+  showToast('API key cleared locally. Save settings to persist.', 'success');
 }
 
 function handleTabKeydown(event) {
@@ -333,15 +602,55 @@ function handleTabKeydown(event) {
 
 function handlePortMessage(message) {
   if (!message || typeof message !== 'object') return;
-  if (message.type === 'BUGLENS_CONTENT_EVENT') {
+  if (message.type === 'TESTPILOT_CONTENT_EVENT') {
     handleContentEvent(message.payload);
   }
 }
 
 async function loadSettings() {
-  const stored = await chrome.storage.local.get('buglensSettings');
-  state.settings = { ...DEFAULT_SETTINGS, ...(stored.buglensSettings || {}) };
+  const stored = await chrome.storage.local.get('testpilotSettings');
+  state.settings = normalizeSettings({ ...DEFAULT_SETTINGS, ...(stored.testpilotSettings || {}) });
   writeSettingsToForm();
+}
+
+function normalizeSettings(settings) {
+  const merged = { ...DEFAULT_SETTINGS, ...(settings || {}) };
+  merged.aiProvider = normalizeAiProviderSettings(merged.aiProvider || {
+    provider: 'local-backend',
+    baseUrl: merged.aiBackendUrl || DEFAULT_SETTINGS.aiBackendUrl
+  });
+  merged.aiBackendUrl = getAiProviderBaseUrl(merged.aiProvider);
+  return merged;
+}
+
+function normalizeAiProviderSettings(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const provider = AI_PROVIDER_DEFAULTS[source.provider] ? source.provider : 'local-backend';
+  const defaults = AI_PROVIDER_DEFAULTS[provider];
+  const modelMode = source.modelMode === 'custom' ? 'custom' : 'auto';
+  const baseUrl = String(source.baseUrl || defaults.baseUrl || '').trim();
+  const maxTokens = clampNumber(source.maxTokens, 32, 12000, DEFAULT_AI_PROVIDER_SETTINGS.maxTokens);
+  const temperature = clampNumber(source.temperature, 0, 2, DEFAULT_AI_PROVIDER_SETTINGS.temperature);
+  return {
+    ...DEFAULT_AI_PROVIDER_SETTINGS,
+    provider,
+    apiKey: String(source.apiKey || ''),
+    baseUrl,
+    modelMode,
+    model: modelMode === 'custom' ? String(source.model || '').trim() : '',
+    temperature,
+    maxTokens,
+    status: normalizeProviderStatus(source.status),
+    lastCheckedAt: Number(source.lastCheckedAt || 0) || null,
+    lastError: String(source.lastError || ''),
+    usage: source.usage && typeof source.usage === 'object' ? source.usage : null
+  };
+}
+
+function normalizeProviderStatus(status) {
+  return ['live', 'checking', 'offline', 'model_error', 'not_configured'].includes(status)
+    ? status
+    : 'not_configured';
 }
 
 function writeSettingsToForm() {
@@ -359,29 +668,74 @@ function writeSettingsToForm() {
   els.uiIncludeDecorativeElements.checked = Boolean(state.settings.uiIncludeDecorativeElements);
   els.exportFrameworkNoise.checked = Boolean(state.settings.exportFrameworkNoise);
   els.csvExportEnabled.checked = Boolean(state.settings.csvExportEnabled);
-  els.aiBackendUrl.value = String(state.settings.aiBackendUrl || DEFAULT_SETTINGS.aiBackendUrl);
-  els.includeAiSummaryInReport.checked = Boolean(state.settings.includeAiSummaryInReport);
+  if (els.aiBackendUrl) els.aiBackendUrl.value = String(state.settings.aiBackendUrl || DEFAULT_SETTINGS.aiBackendUrl);
+  if (els.includeAiSummaryInReport) els.includeAiSummaryInReport.checked = Boolean(state.settings.includeAiSummaryInReport);
+  writeAiProviderSettingsToForm();
   els.allowedColors.value = (state.settings.allowedColors || []).join('\n');
+}
+
+function writeAiProviderSettingsToForm() {
+  const settings = normalizeAiProviderSettings(state.settings.aiProvider);
+  state.settings.aiProvider = settings;
+  const defaults = AI_PROVIDER_DEFAULTS[settings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  if (els.aiProviderSelect) els.aiProviderSelect.value = settings.provider;
+  if (els.aiApiKeyInput) {
+    els.aiApiKeyInput.value = '';
+    els.aiApiKeyInput.placeholder = settings.apiKey
+      ? maskApiKey(settings.apiKey)
+      : (defaults.needsApiKey ? 'Paste provider API key' : 'No API key required');
+  }
+  if (els.aiApiKeyHelp) {
+    els.aiApiKeyHelp.textContent = defaults.needsApiKey
+      ? 'Required for this hosted provider. Stored only in Chrome local storage.'
+      : 'Not required for this provider.';
+  }
+  if (els.aiBaseUrlInput) els.aiBaseUrlInput.value = settings.baseUrl || defaults.baseUrl || '';
+  if (els.aiModelModeSelect) els.aiModelModeSelect.value = settings.modelMode || 'auto';
+  if (els.aiModelInput) {
+    els.aiModelInput.value = settings.model || '';
+    els.aiModelInput.placeholder = defaults.recommendedModel
+      ? `Auto / Recommended: ${defaults.recommendedModel}`
+      : 'Auto / Recommended';
+    els.aiModelInput.disabled = settings.modelMode !== 'custom';
+  }
+  if (els.aiContextModeSelect) els.aiContextModeSelect.value = ['fast', 'balanced', 'deep'].includes(state.settings.aiContextMode) ? state.settings.aiContextMode : 'fast';
+  if (els.aiTemperatureInput) els.aiTemperatureInput.value = String(settings.temperature ?? DEFAULT_AI_PROVIDER_SETTINGS.temperature);
+  if (els.aiMaxTokensInput) els.aiMaxTokensInput.value = String(settings.maxTokens ?? DEFAULT_AI_PROVIDER_SETTINGS.maxTokens);
+  renderAiProviderStatus();
+}
+
+function maskApiKey(value) {
+  const text = String(value || '');
+  if (!text) return '';
+  const tail = text.slice(-4);
+  const prefix = text.includes('_') ? text.split('_')[0] : text.slice(0, 3);
+  return `${prefix || 'key'}-${'•'.repeat(8)}${tail}`;
 }
 
 async function saveSettingsFromForm() {
   const settings = readSettingsFromForm();
-  state.settings = settings;
-  await chrome.storage.local.set({ buglensSettings: settings });
+  state.settings = normalizeSettings(settings);
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
+  aiApiKeyTouched = false;
+  writeSettingsToForm();
   setTemporaryText(els.saveSettingsBtn, 'Saved');
   showToast('Settings saved locally.', 'success');
+  void checkAiHealth({ silent: true, reason: 'settings-saved', force: true });
   render();
 }
 
 async function resetSettingsToDefaults() {
-  state.settings = { ...DEFAULT_SETTINGS };
+  state.settings = normalizeSettings({ ...DEFAULT_SETTINGS });
+  aiApiKeyTouched = false;
   writeSettingsToForm();
-  await chrome.storage.local.set({ buglensSettings: state.settings });
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
   showToast('Default settings restored.', 'success');
   render();
 }
 
 function readSettingsFromForm() {
+  const aiProvider = readAiProviderSettingsFromForm();
   return {
     ...DEFAULT_SETTINGS,
     ...state.settings,
@@ -399,8 +753,14 @@ function readSettingsFromForm() {
     uiIncludeDecorativeElements: Boolean(els.uiIncludeDecorativeElements.checked),
     exportFrameworkNoise: Boolean(els.exportFrameworkNoise.checked),
     csvExportEnabled: Boolean(els.csvExportEnabled.checked),
-    aiBackendUrl: normalizeBackendUrl(els.aiBackendUrl.value || DEFAULT_SETTINGS.aiBackendUrl),
-    includeAiSummaryInReport: Boolean(els.includeAiSummaryInReport.checked),
+    aiProvider,
+    aiContextMode: ['fast', 'balanced', 'deep'].includes(els.aiContextModeSelect?.value)
+      ? els.aiContextModeSelect.value
+      : 'fast',
+    aiBackendUrl: getAiProviderBaseUrl(aiProvider),
+    includeAiSummaryInReport: els.includeAiSummaryInReport
+      ? Boolean(els.includeAiSummaryInReport.checked)
+      : Boolean(state.settings.includeAiSummaryInReport),
     allowedColors: els.allowedColors.value
       .split(/\n|,/) 
       .map((item) => item.trim())
@@ -408,10 +768,43 @@ function readSettingsFromForm() {
   };
 }
 
+function readAiProviderSettingsFromForm() {
+  const previous = normalizeAiProviderSettings(state.settings.aiProvider);
+  const provider = AI_PROVIDER_DEFAULTS[els.aiProviderSelect?.value]
+    ? els.aiProviderSelect.value
+    : previous.provider;
+  const defaults = AI_PROVIDER_DEFAULTS[provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  const rawApiKey = String(els.aiApiKeyInput?.value || '').trim();
+  const apiKey = aiApiKeyTouched ? rawApiKey : previous.apiKey;
+  const modelMode = els.aiModelModeSelect?.value === 'custom' ? 'custom' : 'auto';
+  return normalizeAiProviderSettings({
+    ...previous,
+    provider,
+    apiKey,
+    baseUrl: String(els.aiBaseUrlInput?.value || defaults.baseUrl || '').trim(),
+    modelMode,
+    model: modelMode === 'custom' ? String(els.aiModelInput?.value || '').trim() : '',
+    temperature: els.aiTemperatureInput?.value,
+    maxTokens: els.aiMaxTokensInput?.value,
+    status: previous.provider === provider ? previous.status : 'not_configured',
+    lastCheckedAt: previous.provider === provider ? previous.lastCheckedAt : null,
+    lastError: previous.provider === provider ? previous.lastError : '',
+    usage: previous.provider === provider ? previous.usage : null
+  });
+}
+
+function getAiProviderBaseUrl(settings = state.settings.aiProvider) {
+  const providerSettings = normalizeAiProviderSettings(settings);
+  const defaults = AI_PROVIDER_DEFAULTS[providerSettings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  return normalizeBackendUrl(providerSettings.baseUrl || defaults.baseUrl || DEFAULT_SETTINGS.aiBackendUrl);
+}
+
 function setActiveView(view) {
-  const allowed = ['dashboard', 'findings', 'ui', 'ai', 'reports', 'settings'];
-  state.activeView = allowed.includes(view) ? view : 'dashboard';
+  const allowed = ['dashboard', 'findings', 'console', 'ui', 'ai', 'test-cases', 'bug-reports', 'reports', 'settings'];
+  state.activeView = allowed.includes(view) ? view : 'ai';
   if (document.body && document.body.dataset) document.body.dataset.activeView = state.activeView;
+  applyActiveViewVisibility();
+  updateTestPilotCurrentView();
   for (const button of tabButtons) {
     const isActive = button.dataset.tab === state.activeView;
     button.classList.toggle('active', isActive);
@@ -423,6 +816,8 @@ function setActiveView(view) {
   for (const button of shortcutTabButtons) {
     button.classList.toggle('active', button.dataset.shortcutTab === state.activeView);
   }
+
+  toggleMenu(false);
 
   if (state.activeView === 'findings' && state.settings.hideFrameworkNoise) {
     els.categoryFilter.value = 'counted';
@@ -437,6 +832,51 @@ function setActiveView(view) {
   render();
 }
 
+function applyActiveViewVisibility() {
+  if (typeof document.querySelectorAll !== 'function') return;
+  const visibleClasses = new Set(viewVisibilityRules[state.activeView] || viewVisibilityRules.ai);
+  for (const className of viewScopedClasses) {
+    const shouldShow = visibleClasses.has(className);
+    for (const element of document.querySelectorAll(`.${className}`)) {
+      if (shouldShow) {
+        element.removeAttribute('hidden');
+      } else {
+        element.setAttribute('hidden', '');
+      }
+    }
+  }
+
+  if (state.activeView === 'ui') {
+    for (const selector of ['.page-heading.findings-only', '.api-breakdown.findings-only', '.info-callout.findings-only']) {
+      for (const element of document.querySelectorAll(selector)) element.setAttribute('hidden', '');
+    }
+  }
+}
+
+function updateTestPilotCurrentView() {
+  if (!els.testPilotCurrentView) return;
+  const labels = {
+    ai: 'Main Chat',
+    dashboard: 'Dashboard',
+    findings: 'Network / Findings',
+    console: 'Console',
+    ui: 'UI Bugs',
+    'test-cases': 'Test Cases',
+    'bug-reports': 'Bug Reports',
+    reports: 'Reports',
+    settings: 'Settings'
+  };
+  const label = labels[state.activeView] || 'Main Chat';
+  if (typeof els.testPilotCurrentView.setAttribute === 'function') {
+    els.testPilotCurrentView.setAttribute('aria-label', label);
+  }
+  if (els.testPilotCurrentView.dataset) {
+    els.testPilotCurrentView.dataset.currentView = state.activeView;
+  } else {
+    els.testPilotCurrentView.textContent = label;
+  }
+}
+
 function resetFilters() {
   els.typeFilter.value = 'all';
   els.categoryFilter.value = 'counted';
@@ -444,6 +884,79 @@ function resetFilters() {
   els.searchInput.value = '';
   renderIssues();
   showToast('Finding filters reset.', 'success');
+}
+
+function toggleMenu() {
+  if (!workspaceNav || !menuToggleBtn) return;
+  const shouldOpen = arguments.length ? Boolean(arguments[0]) : !workspaceNav.classList.contains('open');
+  workspaceNav.classList.toggle('open', shouldOpen);
+  if (typeof menuToggleBtn.setAttribute === 'function') {
+    menuToggleBtn.setAttribute('aria-expanded', String(shouldOpen));
+  }
+  if (menuToggleBtn.classList && typeof menuToggleBtn.classList.toggle === 'function') {
+    menuToggleBtn.classList.toggle('active', shouldOpen);
+  }
+}
+
+function setTestPilotChatMode(mode) {
+  const activeMode = mode === 'agent' ? 'agent' : 'chat';
+  const previousMode = document.body?.dataset?.testpilotMode || 'chat';
+  if (document.body && document.body.dataset) document.body.dataset.testpilotMode = activeMode;
+  els.testPilotChatModeBtn.classList.toggle('active', activeMode === 'chat');
+  els.testPilotAgentModeBtn.classList.toggle('active', activeMode === 'agent');
+  els.aiChatInput.placeholder = activeMode === 'agent'
+    ? 'Tell the agent exactly what to test on this page...'
+    : 'Ask about this QA session...';
+  if (previousMode !== activeMode) {
+    addChatModeSeparator(activeMode);
+  }
+  void checkAiHealth({ silent: true, reason: `${activeMode}-mode` });
+}
+
+function addChatModeSeparator(mode) {
+  state.ai.chatMessages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  state.ai.chatMessages.push({
+    role: 'system',
+    type: 'separator',
+    text: mode === 'agent'
+      ? 'Switched to Agent mode. TestPilot can inspect the page, take safe actions, and report evidence.'
+      : 'Switched to Chat mode. Ask questions about the current QA session and captured evidence.',
+    timestamp: Date.now()
+  });
+  state.ai.chatMessages = state.ai.chatMessages.slice(-24);
+  schedulePersist();
+  renderAiChatMessages();
+}
+
+function scheduleAutoUiScan(reason) {
+  if (!state.active || uiScanInProgress) return;
+  const now = Date.now();
+  if (now - lastAutoUiScanAt < AUTO_UI_SCAN_COOLDOWN_MS) return;
+  lastAutoUiScanAt = now;
+  if (autoUiScanTimer) clearTimeout(autoUiScanTimer);
+  els.uiStatus.textContent = 'Auto scan queued';
+  autoUiScanTimer = setTimeout(() => {
+    autoUiScanTimer = null;
+    void runUiScan({ automatic: true, reason });
+  }, 900);
+}
+
+async function handleQaMenuAction(action) {
+  toggleMenu(false);
+  if (action === 'generate-test-cases') {
+    setActiveView('test-cases');
+    await runAiTask('generate-test-cases', { source: 'test-cases-menu' });
+    return;
+  }
+  if (action === 'generate-bug-report') {
+    setActiveView('bug-reports');
+    await runAiTask('generate-bug-report', { source: 'bug-reports-menu' });
+    return;
+  }
+  if (action === 'accessibility') {
+    setActiveView('ui');
+    await runUiScan();
+  }
 }
 
 function focusPriorityFindings() {
@@ -501,7 +1014,7 @@ async function restoreSession() {
       lastUpdatedAt: saved.lastUpdatedAt || null,
       unsupportedReason: typeof saved.unsupportedReason === 'string' ? saved.unsupportedReason : ''
     });
-    state.settings = { ...DEFAULT_SETTINGS, ...(saved.settings || state.settings || {}) };
+    state.settings = normalizeSettings({ ...DEFAULT_SETTINGS, ...(saved.settings || state.settings || {}) });
     state.capabilities = { network: true, console: false, ui: false, ...(saved.capabilities || {}) };
     state.environment = { userAgent: '', viewport: { width: 0, height: 0 }, ...(saved.environment || {}) };
     state.uiStats = {
@@ -536,7 +1049,7 @@ async function restoreSession() {
     }
     state.duplicateCache = new Map();
   } catch (error) {
-    console.warn('[BugLens] Session restore failed', error);
+    console.warn('[TestPilot] Session restore failed', error);
   }
 }
 
@@ -568,7 +1081,7 @@ async function refreshInspectedPage() {
 }
 
 async function isContentScriptAvailable() {
-  const result = await sendTabMessage({ type: 'BUGLENS_PING_CONTENT' });
+  const result = await sendTabMessage({ type: 'TESTPILOT_PING_CONTENT' });
   return Boolean(result.ok && result.response && result.response.ok);
 }
 
@@ -633,6 +1146,8 @@ async function startSession() {
   state.issues = [];
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = new Map();
+  recentEvidenceEvents = [];
+  lastAutoUiScanAt = 0;
   state.ai = {
     status: 'not-configured',
     lastCheckedAt: null,
@@ -643,11 +1158,12 @@ async function startSession() {
     log: ['New QA session started. AI is optional; click Check AI before analysis.']
   };
   state.settings = readSettingsFromForm();
-  await chrome.storage.local.set({ buglensSettings: state.settings });
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
   await setContentSession(state.sessionId);
   await persistSession();
   render();
   showToast('Session started. Reload the inspected page for complete capture.', 'success');
+  scheduleAutoUiScan('session start');
 }
 
 function stopSession() {
@@ -709,6 +1225,7 @@ async function clearSession() {
   state.issues = [];
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = new Map();
+  recentEvidenceEvents = [];
   await setContentSession(null);
   await chrome.storage.session.remove(SESSION_STORAGE_KEY);
   render();
@@ -723,7 +1240,7 @@ function schedulePersist() {
 
 async function setContentSession(sessionId) {
   await sendTabMessage({
-    type: 'BUGLENS_SET_SESSION',
+    type: 'TESTPILOT_SET_SESSION',
     sessionId
   });
 }
@@ -761,7 +1278,7 @@ async function persistSession() {
     const serializable = buildSessionSnapshot();
     await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: serializable });
   } catch (error) {
-    console.warn('[BugLens] Session persistence failed:', error && error.message ? error.message : error);
+    console.warn('[TestPilot] Session persistence failed:', error && error.message ? error.message : error);
   }
 }
 
@@ -818,6 +1335,12 @@ function compactAiStateForStorage(ai) {
     analysis: compactStorageValue(safeAi.analysis, 0),
     lastTask: safeAi.lastTask || '',
     activeMode: normalizeAiMode(safeAi.activeMode),
+    chatMessages: boundedArray(safeAi.chatMessages, 20).map((message) => ({
+      role: message && message.role === 'user' ? 'user' : 'assistant',
+      text: String(message && message.text ? message.text : '').slice(0, MAX_STORAGE_STRING_LENGTH),
+      timestamp: message && message.timestamp ? message.timestamp : Date.now()
+    })),
+    lastAgentResult: compactStorageValue(safeAi.lastAgentResult, 0),
     error: safeAi.error || '',
     log: boundedArray(safeAi.log, MAX_PERSISTED_AI_LOGS)
   };
@@ -892,8 +1415,26 @@ function registerNavigationListener() {
       await refreshInspectedPage();
       if (state.active && state.sessionId) await setContentSession(state.sessionId);
       render();
+      scheduleAutoUiScan('page navigation');
     }, 500);
   });
+}
+
+function recordRecentEvidenceEvent(event) {
+  if (!state.active || !event || typeof event !== 'object') return;
+  const normalized = {
+    type: event.type || 'event',
+    timestamp: Number(event.timestamp || Date.now()),
+    title: redactText(String(event.title || 'TestPilot evidence'), 180),
+    summary: redactText(String(event.summary || ''), 500),
+    severity: event.severity || 'info',
+    url: event.url ? redactUrl(event.url) : '',
+    evidence: compactStorageValue(redactObject(event.evidence || {}), 0)
+  };
+  recentEvidenceEvents.push(normalized);
+  recentEvidenceEvents = recentEvidenceEvents
+    .filter((item) => item.timestamp >= Date.now() - 10 * 60 * 1000)
+    .slice(-MAX_RECENT_EVIDENCE_EVENTS);
 }
 
 function processNetworkEntry(entry) {
@@ -1010,6 +1551,23 @@ function processNetworkEntry(entry) {
     bodyStatus,
     requestBody: redactText(request.postData && request.postData.text ? request.postData.text : '')
   };
+
+  recordRecentEvidenceEvent({
+    type: 'api',
+    timestamp: Date.now(),
+    title: `${method} ${shortUrlPath(url)} ${status || 'no status'}`,
+    summary: `${method} ${shortUrlPath(url)} returned ${status || 'no HTTP status'} in ${durationMs}ms`,
+    severity: status >= 500 ? 'critical' : (status >= 400 || status === 0 ? 'high' : (durationMs >= state.settings.slowApiMs ? 'medium' : 'info')),
+    url,
+    evidence: {
+      method,
+      url: redactUrl(url),
+      status,
+      durationMs,
+      resourceType,
+      bodyStatus
+    }
+  });
 
   if (status >= 500) {
     state.networkStats.failed += 1;
@@ -1302,6 +1860,15 @@ function handleContentEvent(message) {
   state.lastUpdatedAt = Date.now();
   const issue = analyzeConsolePayload(payload);
   addIssue(issue);
+  recordRecentEvidenceEvent({
+    type: 'console',
+    timestamp: payload.timestamp || Date.now(),
+    title: issue.title,
+    summary: issue.description || issue.title,
+    severity: issue.severity,
+    url: payload.url || state.pageUrl,
+    evidence: issue.evidence
+  });
   render();
 }
 
@@ -1335,28 +1902,30 @@ function analyzeConsolePayload(payload) {
   };
 }
 
-async function runUiScan() {
+async function runUiScan(options = {}) {
+  const automatic = Boolean(options.automatic);
   if (!state.active) {
     els.sessionHint.textContent = 'Start a session before running a UI scan so the result belongs to a report.';
-    showToast('Start a session before running the UI scan.', 'error');
+    if (!automatic) showToast('Start a session before running the UI scan.', 'error');
     return;
   }
   if (state.unsupportedReason || !state.capabilities.ui) {
     els.sessionHint.textContent = state.unsupportedReason || 'UI scanner is unavailable. Reload the inspected page to reconnect it.';
-    showToast('UI scanner is unavailable. Reload the inspected page.', 'error');
+    els.uiStatus.textContent = 'Unavailable';
+    if (!automatic) showToast('UI scanner is unavailable. Reload the inspected page.', 'error');
     return;
   }
 
   state.settings = readSettingsFromForm();
-  await chrome.storage.local.set({ buglensSettings: state.settings });
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
   uiScanInProgress = true;
   setScanButtonState(true);
-  els.uiStatus.textContent = 'Scanning';
+  els.uiStatus.textContent = automatic ? 'Auto scanning' : 'Scanning';
 
   try {
     const result = await sendTabMessage({
-      type: 'BUGLENS_RUN_UI_SCAN',
-      settings: state.settings
+      type: 'TESTPILOT_RUN_UI_SCAN',
+      settings: buildContentScriptSettings()
     });
     const response = result.response;
 
@@ -1399,7 +1968,7 @@ async function runUiScan() {
 
     if (issues.length === 0) {
       state.timeline.push({
-        type: 'ui-scan-completed',
+        type: automatic ? 'auto-ui-scan-completed' : 'ui-scan-completed',
         timestamp: state.lastUpdatedAt,
         pageUrl: state.pageUrl,
         issueCount: 0,
@@ -1409,12 +1978,14 @@ async function runUiScan() {
     els.uiStatus.textContent = scan.hitNodeLimit
       ? `Complete (limit ${scan.maxUiNodes})`
       : `Complete (${scan.scannedElementCount || 0} nodes)`;
-    showToast(
-      issues.length
-        ? `UI scan completed with ${issues.length} finding${issues.length === 1 ? '' : 's'}.`
-        : 'UI scan completed with no findings.',
-      'success'
-    );
+    if (!automatic) {
+      showToast(
+        issues.length
+          ? `UI scan completed with ${issues.length} finding${issues.length === 1 ? '' : 's'}.`
+          : 'UI scan completed with no findings.',
+        'success'
+      );
+    }
   } catch (error) {
     addIssue({
       type: 'ui',
@@ -1426,14 +1997,25 @@ async function runUiScan() {
         hint: 'Reload the page after installing/enabling the extension. Chrome internal pages cannot be scanned.'
       }
     });
-    els.uiStatus.textContent = 'Unavailable';
-    showToast(error.message || 'UI scan could not run.', 'error');
+    els.uiStatus.textContent = automatic ? 'Auto scan failed' : 'Unavailable';
+    if (!automatic) showToast(error.message || 'UI scan could not run.', 'error');
   } finally {
     uiScanInProgress = false;
     setScanButtonState(false);
     schedulePersist();
     render();
   }
+}
+
+function buildContentScriptSettings() {
+  const settings = normalizeSettings(state.settings);
+  return {
+    uiVisibleViewportOnly: settings.uiVisibleViewportOnly,
+    uiIncludeDecorativeElements: settings.uiIncludeDecorativeElements,
+    maxUiNodes: settings.maxUiNodes,
+    maxIssuesPerRule: settings.maxIssuesPerRule,
+    allowedColors: settings.allowedColors
+  };
 }
 
 function setScanButtonState(scanning) {
@@ -1500,7 +2082,7 @@ function normalizeIssue(issue) {
   const timestamp = issue.timestamp || Date.now();
   const rawUrl = typeof issue.url === 'string' ? issue.url : getEvidenceUrl(issue.evidence) || '';
   const url = redactUrl(rawUrl);
-  let title = redactText(String(issue.title || 'BugLens issue'), 180);
+  let title = redactText(String(issue.title || 'TestPilot issue'), 180);
   let description = redactText(String(issue.description || ''), 1000);
   const evidence = redactObject(issue.evidence || {});
   if (category === 'framework-noise') {
@@ -1773,14 +2355,28 @@ function render() {
   els.quickCopyBtn.disabled = !hasSession;
   const aiBusy = state.ai.status === 'checking' || state.ai.status === 'analyzing';
   els.checkAiBtn.disabled = aiBusy;
-  els.analyzeAiBtn.disabled = aiBusy || !hasSession;
-  els.generateTestsBtn.disabled = aiBusy || !hasSession;
-  els.generateBugsBtn.disabled = aiBusy || !hasSession;
-  els.copyAiSummaryBtn.disabled = !state.ai.analysis;
-  els.downloadAiMarkdownBtn.disabled = !state.ai.analysis;
-  els.downloadAiJsonBtn.disabled = !state.ai.analysis;
+  if (els.analyzeAiBtn) els.analyzeAiBtn.disabled = aiBusy || !hasSession;
+  if (els.generateTestsBtn) els.generateTestsBtn.disabled = aiBusy || !hasSession;
+  if (els.generateBugsBtn) els.generateBugsBtn.disabled = aiBusy || !hasSession;
+  els.sendAiChatBtn.disabled = aiChatBusy;
+  if (els.copyAiSummaryBtn) els.copyAiSummaryBtn.disabled = !state.ai.analysis;
+  if (els.downloadAiMarkdownBtn) els.downloadAiMarkdownBtn.disabled = !state.ai.analysis;
+  if (els.downloadAiJsonBtn) els.downloadAiJsonBtn.disabled = !state.ai.analysis;
   els.downloadAiMarkdownReportBtn.disabled = !state.ai.analysis;
   els.downloadAiJsonReportBtn.disabled = !state.ai.analysis;
+  const hasTestCases = getCurrentTestCases().length > 0;
+  if (els.generateTestCasesTabBtn) els.generateTestCasesTabBtn.disabled = aiBusy || !hasSession;
+  if (els.copyTestCasesBtn) els.copyTestCasesBtn.disabled = !hasTestCases;
+  if (els.exportTestCasesMarkdownBtn) els.exportTestCasesMarkdownBtn.disabled = !hasTestCases;
+  if (els.clearTestCasesBtn) els.clearTestCasesBtn.disabled = !hasTestCases;
+  const hasBugDrafts = getCurrentBugDrafts().length > 0;
+  if (els.generateBugReportTabBtn) els.generateBugReportTabBtn.disabled = aiBusy || !hasSession;
+  if (els.copyBugReportDraftsBtn) els.copyBugReportDraftsBtn.disabled = !hasBugDrafts;
+  if (els.exportBugReportMarkdownBtn) els.exportBugReportMarkdownBtn.disabled = !hasBugDrafts;
+  if (els.exportBugReportJsonBtn) els.exportBugReportJsonBtn.disabled = !hasBugDrafts;
+  if (els.clearBugReportsBtn) els.clearBugReportsBtn.disabled = !hasBugDrafts;
+  if (els.testAiProviderBtn) els.testAiProviderBtn.disabled = aiBusy;
+  if (els.clearAiApiKeyBtn) els.clearAiApiKeyBtn.disabled = aiBusy;
   els.viewAiBtn.disabled = !hasSession;
   els.reportHealth.textContent = `${health.score}/100`;
   els.reportActionable.textContent = counts.actionable;
@@ -1794,11 +2390,55 @@ function render() {
 }
 
 function getAiStatusLabel() {
-  if (state.ai.status === 'ready') return 'Ready';
+  if (state.ai.status === 'ready') return 'AI Live';
   if (state.ai.status === 'analyzing') return 'Running';
-  if (state.ai.status === 'complete') return 'Done';
-  if (state.ai.status === 'failed') return 'Failed';
-  return 'Off';
+  if (state.ai.status === 'complete') return 'AI Live';
+  if (state.ai.status === 'failed') {
+    return state.ai.error && /provider|model|ollama/i.test(state.ai.error) ? 'Model Error' : 'Offline';
+  }
+  if (state.ai.status === 'checking') return 'Checking';
+  return 'Not Configured';
+}
+
+function renderAiProviderStatus() {
+  const settings = normalizeAiProviderSettings(state.settings.aiProvider);
+  const status = normalizeProviderStatus(settings.status);
+  const label = providerStatusLabel(status);
+  if (els.aiProviderStatusPill) {
+    els.aiProviderStatusPill.textContent = label;
+    if (els.aiProviderStatusPill.dataset) els.aiProviderStatusPill.dataset.status = status;
+  }
+  if (els.aiProviderStatusText) {
+    const checked = settings.lastCheckedAt ? ` Last checked ${new Date(settings.lastCheckedAt).toLocaleTimeString()}.` : '';
+    const error = settings.lastError ? ` ${settings.lastError}` : '';
+    els.aiProviderStatusText.textContent = `${AI_PROVIDER_DEFAULTS[settings.provider]?.label || 'AI provider'} is ${label.toLowerCase()}.${checked}${error}`.trim();
+  }
+}
+
+function providerStatusLabel(status) {
+  return {
+    live: 'Live',
+    checking: 'Checking',
+    offline: 'Offline',
+    model_error: 'Model Error',
+    not_configured: 'Not Configured'
+  }[status] || 'Not Configured';
+}
+
+function syncAiStateFromProviderStatus(settings = state.settings.aiProvider) {
+  const status = normalizeProviderStatus(settings.status);
+  if (status === 'live') {
+    state.ai.status = 'ready';
+    state.ai.error = '';
+  } else if (status === 'checking') {
+    state.ai.status = 'checking';
+  } else if (status === 'model_error' || status === 'offline') {
+    state.ai.status = 'failed';
+    state.ai.error = settings.lastError || providerStatusLabel(status);
+  } else {
+    state.ai.status = 'not-configured';
+    state.ai.error = settings.lastError || '';
+  }
 }
 
 function getHealthSummaryText(counts, health) {
@@ -1848,8 +2488,18 @@ function renderDashboardGuidance(counts) {
 }
 
 function renderAiState() {
+  renderAiProviderStatus();
   const statusLabel = getAiStatusLabel();
   els.aiStatusPill.textContent = statusLabel;
+  if (els.aiStatusPill.dataset) {
+    els.aiStatusPill.dataset.status = state.ai.status || 'not-configured';
+  } else if (typeof els.aiStatusPill.setAttribute === 'function') {
+    els.aiStatusPill.setAttribute('data-status', state.ai.status || 'not-configured');
+  }
+  if (els.checkAiBtn) {
+    const shouldShowRetry = state.ai.status === 'failed';
+    els.checkAiBtn.classList.toggle('hidden', !shouldShowRetry);
+  }
   const activeMode = normalizeAiMode(state.ai.activeMode);
   state.ai.activeMode = activeMode;
   for (const button of aiModeButtons) {
@@ -1859,41 +2509,433 @@ function renderAiState() {
       button.setAttribute('aria-selected', String(isActive));
     }
   }
-  els.analyzeAiBtn.classList.toggle('active-task', activeMode === 'analysis');
-  els.generateTestsBtn.classList.toggle('active-task', activeMode === 'test-cases');
-  els.generateBugsBtn.classList.toggle('active-task', activeMode === 'bug-reports');
-  els.aiStatusTitle.textContent = {
-    'not-configured': 'AI not configured',
-    checking: 'Checking AI backend',
-    ready: 'AI ready',
+  els.analyzeAiBtn?.classList.toggle('active-task', activeMode === 'analysis');
+  els.generateTestsBtn?.classList.toggle('active-task', activeMode === 'test-cases');
+  els.generateBugsBtn?.classList.toggle('active-task', activeMode === 'bug-reports');
+  const statusTitle = {
+    'not-configured': 'Local AI: Not checked',
+    checking: 'Local AI: Checking',
+    ready: 'Local AI: Connected',
     analyzing: 'Analyzing session',
     complete: 'Analysis complete',
-    failed: 'AI failed'
+    failed: state.ai.error && /provider|model|ollama/i.test(state.ai.error)
+      ? 'Local AI: Model unavailable'
+      : 'Local AI: Disconnected'
   }[state.ai.status] || 'AI not configured';
 
-  els.aiStatusText.textContent = {
-    'not-configured': 'Start the local BugLens AI backend, then check the connection.',
+  const statusText = {
+    'not-configured': 'Start ai-backend with npm start. TestPilot checks the connection automatically.',
     checking: 'Contacting the local backend.',
-    ready: 'Local backend is reachable. AI will run only when you click an action.',
+    ready: 'Local backend is reachable. Chat can use the local model; Agent actions still run through safe local execution.',
     analyzing: 'Sending a sanitized session summary to the local backend.',
     complete: 'AI analysis is ready and can be copied or included in reports.',
-    failed: state.ai.error || 'AI analysis failed. BugLens deterministic checks are still available.'
-  }[state.ai.status] || 'Start the local BugLens AI backend, then check the connection.';
+    failed: state.ai.error || 'Local AI backend is not available. Start ai-backend with npm start and retry.'
+  }[state.ai.status] || 'Start the local TestPilot AI backend, then check the connection.';
 
+  if (els.aiStatusTitle) els.aiStatusTitle.textContent = statusTitle;
+  if (els.aiStatusText) els.aiStatusText.textContent = statusText;
   if (els.aiConnectionLog) {
     els.aiConnectionLog.textContent = Array.isArray(state.ai.log) && state.ai.log.length
       ? state.ai.log.slice(-8).join('\n')
       : 'Backend not checked yet. Start ai-backend with npm start, then click Check AI.';
   }
+  renderAiChatMessages();
+  renderTestCasesState();
+  renderBugReportsState();
 
   if (!state.ai.analysis) {
-    els.aiOutput.classList.toggle('empty', true);
-    els.aiOutput.innerHTML = '<strong>No AI analysis yet</strong><p>AI runs only when you click a button. BugLens still works without AI.</p>';
+    if (els.aiOutput) {
+      els.aiOutput.classList.toggle('empty', true);
+      els.aiOutput.innerHTML = '<strong>No AI analysis yet</strong><p>AI runs only when you click a button. TestPilot still works without AI.</p>';
+    }
     return;
   }
 
-  els.aiOutput.classList.toggle('empty', false);
-  renderAiAnalysis(state.ai.analysis, activeMode);
+  if (els.aiOutput) {
+    els.aiOutput.classList.toggle('empty', false);
+    renderAiAnalysis(state.ai.analysis, activeMode);
+  }
+}
+
+function renderAiChatMessages() {
+  if (!els.aiChatMessages) return;
+  const messages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  if (typeof els.aiChatMessages.replaceChildren === 'function') {
+    els.aiChatMessages.replaceChildren();
+  } else {
+    els.aiChatMessages.innerHTML = '';
+    if (Array.isArray(els.aiChatMessages.children)) els.aiChatMessages.children.length = 0;
+  }
+  if (!messages.length && !aiChatBusy) {
+    const empty = document.createElement('div');
+    empty.className = 'testpilot-empty-chat';
+    empty.textContent = 'Tell TestPilot what to test on this page.';
+    els.aiChatMessages.appendChild(empty);
+    return;
+  }
+
+  for (const message of messages) {
+    if (message.type === 'separator') {
+      const separator = document.createElement('div');
+      separator.className = 'ai-chat-separator';
+      separator.textContent = message.text || 'Mode changed';
+      els.aiChatMessages.appendChild(separator);
+      continue;
+    }
+    const article = document.createElement('article');
+    article.className = `ai-chat-message ${message.role === 'user' ? 'user' : 'assistant'}`;
+    const label = document.createElement('span');
+    label.textContent = message.role === 'user' ? 'Tester' : 'TestPilot AI';
+    const body = document.createElement('div');
+    body.className = 'ai-chat-message-body';
+    body.textContent = message.text || '';
+    article.append(label, body);
+    els.aiChatMessages.appendChild(article);
+  }
+
+  if (aiChatBusy) {
+    const thinking = document.createElement('article');
+    thinking.className = 'ai-chat-message assistant thinking';
+    const label = document.createElement('span');
+    label.textContent = 'TestPilot AI';
+    const body = document.createElement('div');
+    body.className = 'ai-chat-message-body';
+    body.textContent = 'Thinking';
+    thinking.append(label, body);
+    els.aiChatMessages.appendChild(thinking);
+  }
+
+  els.aiChatMessages.scrollTop = els.aiChatMessages.scrollHeight;
+}
+
+async function submitAiChat(value) {
+  const question = String(value || '').trim();
+  if (!question || aiChatBusy) return;
+  els.aiChatInput.value = '';
+  state.ai.chatMessages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  state.ai.chatMessages.push({ role: 'user', text: question, timestamp: Date.now() });
+  state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+  aiChatBusy = true;
+  render();
+
+  if (isTestCaseGenerationPrompt(question)) {
+    state.ai.chatMessages.push({
+      role: 'assistant',
+      text: 'Opening Test Cases and generating scenarios from the current session evidence.',
+      timestamp: Date.now()
+    });
+    aiChatBusy = false;
+    state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+    setActiveView('test-cases');
+    await runAiTask('generate-test-cases', { source: 'chat' });
+    return;
+  }
+
+  if (isBugReportGenerationPrompt(question)) {
+    state.ai.chatMessages.push({
+      role: 'assistant',
+      text: 'Opening Bug Reports and drafting from the current session evidence.',
+      timestamp: Date.now()
+    });
+    aiChatBusy = false;
+    state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+    setActiveView('bug-reports');
+    await runAiTask('generate-bug-report', { source: 'chat' });
+    return;
+  }
+
+  if (document.body?.dataset?.testpilotMode === 'agent') {
+    void checkAiHealth({ silent: true, reason: 'agent-send' });
+    await runAgentCommand(question);
+    return;
+  }
+
+  try {
+    state.settings = readSettingsFromForm();
+    await chrome.storage.local.set({ testpilotSettings: state.settings });
+    const backendReady = state.ai.status === 'ready' || await checkAiHealth({ silent: true, reason: 'chat-send' });
+    if (!backendReady) {
+      state.ai.chatMessages.push({
+        role: 'assistant',
+        text: 'Local AI backend is not available. Start the backend with `cd ai-backend && npm start`, then click Retry or send the message again.',
+        timestamp: Date.now()
+      });
+      return;
+    }
+    const providerResponse = await completeChatWithSelectedProvider(question);
+    const answer = String(providerResponse.text || '').trim() || buildLocalChatFallback(question);
+    state.ai.chatMessages.push({ role: 'assistant', text: answer, timestamp: Date.now() });
+    if (providerResponse.usage) recordAiUsage(providerResponse.usage);
+    if (providerResponse.fallbackReason) addAiLog(`chat used fallback: ${providerResponse.fallbackReason}`);
+  } catch (error) {
+    state.ai.chatMessages.push({
+      role: 'assistant',
+      text: `Local AI backend is not available. Start the backend and try again.\n\nReason: ${formatAiError(error)}`,
+      timestamp: Date.now()
+    });
+    addAiLog(`chat failed: ${formatAiError(error)}`);
+  } finally {
+    aiChatBusy = false;
+    state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+    schedulePersist();
+    render();
+  }
+}
+
+async function completeChatWithSelectedProvider(question) {
+  const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+  if (providerSettings.provider === 'local-backend') {
+    const context = buildCompactAiSessionSummary('chat');
+    const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/ai/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        message: question,
+        mode: 'chat',
+        sessionId: state.sessionId,
+        pageUrl: state.pageUrl,
+        currentUserMessage: question,
+        cacheKey: simpleHash(JSON.stringify({
+          sessionId: state.sessionId,
+          pageUrl: state.pageUrl,
+          mode: 'chat',
+          userMessage: question,
+          context
+        })),
+        context,
+        history: state.ai.chatMessages.slice(-6).map((message) => ({
+          role: message.role,
+          text: message.text
+        }))
+      })
+    }, 180000);
+    if (!response.ok) throw new Error(`AI backend returned ${response.status}`);
+    const payload = await response.json().catch(() => ({}));
+    return {
+      text: String(payload.answer || payload.message || '').trim(),
+      raw: payload,
+      usage: payload.usage || null,
+      fallbackReason: payload.fallback ? (payload.fallbackReason || 'local backend fallback') : ''
+    };
+  }
+
+  const messages = buildProviderChatMessages(question);
+  return completeWithAiProvider({
+    settings: providerSettings,
+    messages,
+    mode: 'chat',
+    maxTokens: getProviderMaxTokens('chat'),
+    temperature: providerSettings.temperature,
+    responseFormat: 'text'
+  });
+}
+
+function isTestCaseGenerationPrompt(value) {
+  const text = String(value || '').toLowerCase();
+  return /\b(generate|create|make|write|draft|prepare)\b/.test(text)
+    && /\b(test cases?|qa scenarios?|test scenarios?|gherkin|regression tests?|smoke tests?)\b/.test(text);
+}
+
+function isBugReportGenerationPrompt(value) {
+  const text = String(value || '').toLowerCase();
+  return /\b(generate|create|make|write|draft|prepare)\b/.test(text)
+    && /\b(bug reports?|defect reports?|issue reports?|jira ticket|bug draft|defect draft)\b/.test(text);
+}
+
+async function runAgentCommand(command) {
+  try {
+    const result = await sendTabMessage({
+      type: 'TESTPILOT_RUN_AGENT',
+      command,
+      options: {
+        mode: document.body?.dataset?.testpilotMode || 'agent',
+        sessionId: state.sessionId,
+        pageUrl: state.pageUrl,
+        contextMode: state.settings.aiContextMode || 'fast',
+        history: (state.ai.chatMessages || []).slice(-6)
+      }
+    });
+    if (!result.ok || !result.response || !result.response.ok) {
+      throw new Error((result.response && result.response.error) || result.error || 'Agent could not connect to the inspected page.');
+    }
+    await waitForPanel(650);
+    const agentResult = linkEvidenceToAgentResult(result.response.result);
+    state.ai.lastAgentResult = agentResult;
+    state.ai.chatMessages.push({
+      role: 'assistant',
+      text: formatAgentResultForChat(agentResult),
+      timestamp: Date.now()
+    });
+    addAiLog(`agent ${agentResult.taskType || 'task'} completed: ${agentResult.result?.status || 'needs_review'}`);
+  } catch (error) {
+    state.ai.chatMessages.push({
+      role: 'assistant',
+      text: `Agent could not complete the workflow.\n\nReason: ${formatAiError(error)}\n\nReload the inspected page, confirm this is a normal web page, then try a narrower command such as "Test the search box."`,
+      timestamp: Date.now()
+    });
+    addAiLog(`agent failed: ${formatAiError(error)}`);
+  } finally {
+    aiChatBusy = false;
+    state.ai.chatMessages = state.ai.chatMessages.slice(-20);
+    schedulePersist();
+    render();
+  }
+}
+
+function waitForPanel(ms) {
+  return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
+}
+
+function linkEvidenceToAgentResult(agentResult) {
+  if (!agentResult || typeof agentResult !== 'object') return agentResult;
+  const actionResults = Array.isArray(agentResult.actionResults) ? agentResult.actionResults : [];
+  if (!actionResults.length) return agentResult;
+
+  const linkedGroups = [];
+  const enrichedActions = actionResults.map((action, index) => {
+    const actionAt = Number(action.timestamp || 0);
+    if (!actionAt) return { ...action, linkedEvidence: [] };
+    const nextActionAt = Number(actionResults[index + 1]?.timestamp || 0);
+    const windowEnd = nextActionAt
+      ? Math.min(actionAt + AGENT_EVIDENCE_WINDOW_MS, nextActionAt + 250)
+      : actionAt + AGENT_EVIDENCE_WINDOW_MS;
+    const linkedEvidence = recentEvidenceEvents
+      .filter((event) => event.timestamp >= actionAt - 250 && event.timestamp <= windowEnd)
+      .slice(0, 6)
+      .map(formatLinkedEvidenceEvent);
+    if (linkedEvidence.length) {
+      linkedGroups.push({
+        stepIndex: index,
+        action: action.action,
+        targetIndex: action.targetIndex || null,
+        evidence: linkedEvidence
+      });
+    }
+    return { ...action, linkedEvidence };
+  });
+
+  const flattenedEvidence = linkedGroups.flatMap((group) => (
+    group.evidence.map((event) => `Step ${group.stepIndex + 1} ${group.action}: ${event.summary}`)
+  ));
+  const existingResult = agentResult.result && typeof agentResult.result === 'object' ? agentResult.result : {};
+  const evidence = [
+    ...(Array.isArray(existingResult.evidence) ? existingResult.evidence : []),
+    ...flattenedEvidence
+  ].slice(0, 16);
+
+  return {
+    ...agentResult,
+    actionResults: enrichedActions,
+    linkedEvidence: linkedGroups,
+    result: {
+      ...existingResult,
+      evidence
+    }
+  };
+}
+
+function formatLinkedEvidenceEvent(event) {
+  const prefix = event.type === 'console' ? 'Console' : 'API';
+  return {
+    type: event.type,
+    severity: event.severity || 'info',
+    title: event.title,
+    summary: `${prefix}: ${event.summary || event.title}`,
+    timestamp: event.timestamp,
+    url: event.url,
+    evidence: event.evidence
+  };
+}
+
+function formatAgentResultForChat(agentResult) {
+  const result = agentResult.result || {};
+  const plan = agentResult.plan || {};
+  const actionResults = Array.isArray(agentResult.actionResults) ? agentResult.actionResults : [];
+  const lines = [
+    `Status: ${String(result.status || 'needs_review').replace(/_/g, ' ')}`,
+    `Task: ${String(agentResult.taskType || plan.taskType || 'general_page_validation').replace(/_/g, ' ')}`,
+    `Data Strategy: ${String(agentResult.dataStrategy || plan.dataStrategy || 'unknown').replace(/_/g, ' ')}`,
+    '',
+    result.summary || plan.summary || 'Agent completed the workflow.',
+    ''
+  ];
+  if (plan.steps && plan.steps.length) {
+    lines.push('Plan:');
+    for (const [index, step] of plan.steps.entries()) {
+      lines.push(`${index + 1}. ${step.action}${step.targetIndex ? ` #${step.targetIndex}` : ''} - ${step.reason || 'QA step'}`);
+    }
+    lines.push('');
+  }
+  if (actionResults.length) {
+    lines.push('Action log:');
+    for (const item of actionResults) {
+      lines.push(`${item.success ? 'PASS' : 'FAIL'} ${item.action}${item.targetIndex ? ` #${item.targetIndex}` : ''}: ${item.message}`);
+      for (const evidence of (item.linkedEvidence || []).slice(0, 3)) {
+        lines.push(`  - Linked ${evidence.summary}`);
+      }
+    }
+    lines.push('');
+  }
+  if (agentResult.linkedEvidence && agentResult.linkedEvidence.length) {
+    lines.push('Linked API / console evidence:');
+    for (const group of agentResult.linkedEvidence.slice(0, 6)) {
+      for (const evidence of group.evidence.slice(0, 3)) {
+        lines.push(`- Step ${group.stepIndex + 1}: ${evidence.summary}`);
+      }
+    }
+    lines.push('');
+  }
+  if (result.evidence && result.evidence.length) {
+    lines.push('Evidence:');
+    for (const item of result.evidence.slice(0, 6)) lines.push(`- ${item}`);
+    lines.push('');
+  }
+  lines.push('Passed Checks:');
+  const passedChecks = Array.isArray(result.passedChecks) ? result.passedChecks : [];
+  if (passedChecks.length) {
+    for (const item of passedChecks.slice(0, 8)) lines.push(`- ${item}`);
+  } else {
+    lines.push('- No passed checks were confirmed.');
+  }
+  lines.push('');
+
+  lines.push('Failed Checks:');
+  const failedChecks = Array.isArray(result.failedChecks) ? result.failedChecks : [];
+  if (failedChecks.length) {
+    for (const item of failedChecks.slice(0, 8)) lines.push(`- ${item}`);
+  } else {
+    lines.push('- No failed checks were confirmed.');
+  }
+  lines.push('');
+
+  if (result.recommendedNextSteps && result.recommendedNextSteps.length) {
+    lines.push('Recommended Next Steps:');
+    for (const item of result.recommendedNextSteps.slice(0, 4)) lines.push(`- ${item}`);
+  }
+  return lines.join('\n').trim();
+}
+
+function buildLocalChatFallback(question, reason = '') {
+  const counts = countIssues(state.issues);
+  const health = calculateHealthScore(state.issues);
+  const prefix = reason ? `Local fallback note: ${reason}\n\n` : '';
+  const lower = String(question || '').toLowerCase();
+  if (!state.startedAt) {
+    return `${prefix}Start a session, reload the inspected page, then repeat the flow you want to test. After that, ask me about API failures, UI bugs, console errors, or report drafts.`;
+  }
+  if (lower.includes('score') || lower.includes('health')) {
+    return `${prefix}Health is ${health.score}/100 (${health.label}). Fix actionable findings first, then manually confirm needs-review items. Noise and framework/internal traffic do not reduce the score.`;
+  }
+  if (lower.includes('api') || lower.includes('network')) {
+    return `${prefix}Current network evidence: ${state.networkStats.api} business API requests, ${state.networkStats.failed} failed requests, and ${counts.actionable} actionable finding(s). Open Network / Findings from the menu to inspect the evidence.`;
+  }
+  if (lower.includes('ui') || lower.includes('access')) {
+    return `${prefix}Run Accessibility / UI Scan from Menu > QA Tools on the exact screen state you want to test. UI findings need tester confirmation before filing.`;
+  }
+  if (lower.includes('bug') || lower.includes('report')) {
+    return `${prefix}Open Reports or use Menu > QA Tools > Generate Bug Report. TestPilot will draft from actionable findings and avoid inventing bugs from uncertain evidence.`;
+  }
+  return `${prefix}I can help with this TestPilot QA session. Current summary: ${counts.actionable} actionable, ${counts.needsReview} needs review, ${state.networkStats.total} network requests, and ${state.uiStats.scans} UI scan(s).`;
 }
 
 function addAiLog(message) {
@@ -1915,10 +2957,11 @@ function aiModeForTask(task) {
 }
 
 function renderAiAnalysis(analysis, mode = 'analysis') {
+  if (!els.aiOutput) return;
   els.aiOutput.innerHTML = '';
   if (mode === 'test-cases') {
     els.aiOutput.append(
-      makeAiHero('Generated test cases', 'Downloadable QA scenarios based on the current BugLens evidence.'),
+      makeAiHero('Generated test cases', 'Downloadable QA scenarios based on the current TestPilot evidence.'),
       makeTestCaseSection(analysis.testCases),
       makeAiSection('Extra recommended checks', analysis.recommendedNextTests)
     );
@@ -1949,7 +2992,7 @@ function makeAiHero(title, copy) {
   const heading = document.createElement('h3');
   heading.textContent = title;
   const p = document.createElement('p');
-  p.textContent = copy || 'AI generated this from the sanitized BugLens session.';
+  p.textContent = copy || 'AI generated this from the sanitized TestPilot session.';
   section.append(heading, p);
   return section;
 }
@@ -1999,7 +3042,7 @@ function makeTestCaseSection(testCases) {
     meta.className = 'ai-item-meta';
     meta.textContent = [testCase.priority, testCase.type, testCase.sourceFinding].filter(Boolean).join(' · ');
     const objective = document.createElement('p');
-    objective.textContent = testCase.objective || 'Verify the behavior described by BugLens evidence.';
+    objective.textContent = testCase.objective || 'Verify the behavior described by TestPilot evidence.';
     const list = document.createElement('ol');
     for (const step of testCase.steps || []) {
       const li = document.createElement('li');
@@ -2007,11 +3050,331 @@ function makeTestCaseSection(testCases) {
       list.appendChild(li);
     }
     const expected = document.createElement('p');
-    expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(testCase.expectedResult || 'The flow works without a confirmed BugLens issue.')}`;
+    expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(testCase.expectedResult || 'The flow works without a confirmed TestPilot issue.')}`;
     article.append(title, meta, objective, list, expected);
     section.appendChild(article);
   }
   return section;
+}
+
+function renderTestCasesState() {
+  if (!els.testCasesOutput || !els.testCasesStatus) return;
+  const isGenerating = state.ai.status === 'analyzing' && state.ai.lastTask === 'generate-test-cases';
+  const allCases = getCurrentTestCases();
+  const filteredCases = filterTestCasesForSelectedType(allCases);
+  const hasCases = allCases.length > 0;
+  const format = getSelectedTestCaseFormat();
+  const type = getSelectedTestCaseType();
+
+  if (isGenerating) {
+    els.testCasesStatus.textContent = 'Generating test cases from the current page context and evidence...';
+    els.testCasesOutput.classList.toggle('empty', false);
+    els.testCasesOutput.innerHTML = '<div class="test-cases-loader"><span></span><strong>Building QA scenarios</strong><p>TestPilot is using findings, page context, and latest Agent evidence.</p></div>';
+    return;
+  }
+
+  if (!hasCases) {
+    els.testCasesStatus.textContent = 'No generated test cases yet.';
+    els.testCasesOutput.classList.toggle('empty', true);
+    els.testCasesOutput.innerHTML = '<strong>Ready to generate</strong><p>Start a session and run Agent or manual QA first for richer, page-specific test cases.</p>';
+    return;
+  }
+
+  els.testCasesStatus.textContent = `${filteredCases.length} of ${allCases.length} test case${allCases.length === 1 ? '' : 's'} shown · ${type} · ${format}`;
+  els.testCasesOutput.classList.toggle('empty', false);
+  els.testCasesOutput.innerHTML = '';
+
+  if (!filteredCases.length) {
+    const empty = document.createElement('article');
+    empty.className = 'test-case-card muted';
+    empty.innerHTML = '<h3>No matching test cases</h3><p>Change the test type filter or regenerate cases with the selected type.</p>';
+    els.testCasesOutput.appendChild(empty);
+    return;
+  }
+
+  for (const testCase of filteredCases) {
+    els.testCasesOutput.appendChild(renderTestCaseCard(testCase));
+  }
+}
+
+function renderTestCaseCard(testCase) {
+  const article = document.createElement('article');
+  article.className = 'test-case-card';
+
+  const meta = document.createElement('div');
+  meta.className = 'test-case-meta';
+  const priority = document.createElement('span');
+  priority.textContent = testCase.priority || 'P2';
+  const type = document.createElement('span');
+  type.textContent = testCase.type || 'functional';
+  meta.append(priority, type);
+
+  const title = document.createElement('h3');
+  title.textContent = testCase.title || 'Untitled test case';
+
+  const objective = document.createElement('p');
+  objective.textContent = testCase.objective || 'Verify the behavior described by TestPilot evidence.';
+
+  const steps = document.createElement('ol');
+  for (const step of testCase.steps || []) {
+    const item = document.createElement('li');
+    item.textContent = step;
+    steps.appendChild(item);
+  }
+
+  const expected = document.createElement('p');
+  expected.className = 'test-case-expected';
+  expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(testCase.expectedResult || 'The flow completes without confirmed defects.')}`;
+
+  const source = document.createElement('small');
+  source.textContent = [testCase.sourceFinding, testCase.dataNeeded].filter(Boolean).join(' · ');
+
+  article.append(meta, title, objective, steps, expected, source);
+  return article;
+}
+
+function getCurrentTestCases() {
+  return Array.isArray(state.ai.analysis?.testCases) ? state.ai.analysis.testCases : [];
+}
+
+function getSelectedTestCaseType() {
+  return String(els.testCaseTypeSelect?.value || 'All Types').trim();
+}
+
+function getSelectedTestCaseFormat() {
+  return String(els.testCaseFormatSelect?.value || 'Step-by-step').trim();
+}
+
+function filterTestCasesForSelectedType(testCases) {
+  const selected = getSelectedTestCaseType().toLowerCase();
+  if (!selected || selected === 'all types') return testCases;
+  return testCases.filter((testCase) => String(testCase.type || '').toLowerCase().includes(selected.replace(/\s+/g, ' ')));
+}
+
+function readTestCasePreferences() {
+  return {
+    type: getSelectedTestCaseType(),
+    format: getSelectedTestCaseFormat()
+  };
+}
+
+function copyTestCases() {
+  const testCases = filterTestCasesForSelectedType(getCurrentTestCases());
+  if (!testCases.length) {
+    showToast('No test cases to copy yet.', 'error');
+    return;
+  }
+  copyText(buildTestCasesMarkdown(testCases), els.copyTestCasesBtn);
+}
+
+function exportTestCasesMarkdown() {
+  const testCases = filterTestCasesForSelectedType(getCurrentTestCases());
+  if (!testCases.length) {
+    showToast('No test cases to export yet.', 'error');
+    return;
+  }
+  downloadBlob(buildTestCasesMarkdown(testCases), `testpilot-test-cases-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
+  showToast('Test cases exported.', 'success');
+}
+
+function clearTestCases() {
+  if (!state.ai.analysis) return;
+  state.ai.analysis = {
+    ...state.ai.analysis,
+    testCases: []
+  };
+  state.ai.activeMode = 'test-cases';
+  schedulePersist();
+  render();
+  showToast('Test cases cleared.', 'success');
+}
+
+function buildTestCasesMarkdown(testCases) {
+  const format = getSelectedTestCaseFormat();
+  const lines = [
+    '# TestPilot Test Cases',
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Page: ${state.pageUrl || 'N/A'}`,
+    `Type: ${getSelectedTestCaseType()}`,
+    `Format: ${format}`,
+    ''
+  ];
+
+  if (format === 'Gherkin') {
+    for (const testCase of testCases) {
+      lines.push(`Feature: ${testCase.title || 'TestPilot QA scenario'}`);
+      lines.push(`  Scenario: ${testCase.objective || 'Verify captured behavior'}`);
+      const steps = Array.isArray(testCase.steps) ? testCase.steps : [];
+      steps.forEach((step, index) => {
+        const keyword = index === 0 ? 'Given' : (index === steps.length - 1 ? 'Then' : 'When');
+        lines.push(`    ${keyword} ${step}`);
+      });
+      lines.push(`    Then ${testCase.expectedResult || 'the flow should complete without confirmed defects'}`, '');
+    }
+    return lines.join('\n').trim();
+  }
+
+  if (format === 'Markdown table') {
+    lines.push('| Priority | Type | Title | Objective | Expected |');
+    lines.push('| --- | --- | --- | --- | --- |');
+    for (const testCase of testCases) {
+      lines.push(`| ${markdownCell(testCase.priority || 'P2')} | ${markdownCell(testCase.type || 'functional')} | ${markdownCell(testCase.title || 'Untitled test case')} | ${markdownCell(testCase.objective || '')} | ${markdownCell(testCase.expectedResult || '')} |`);
+    }
+    return lines.join('\n').trim();
+  }
+
+  for (const testCase of testCases) {
+    lines.push(`## ${testCase.title || 'Untitled test case'}`);
+    lines.push(`- Priority: ${testCase.priority || 'P2'}`);
+    lines.push(`- Type: ${testCase.type || 'functional'}`);
+    lines.push(`- Source: ${testCase.sourceFinding || 'TestPilot session'}`);
+    lines.push(`- Data Needed: ${testCase.dataNeeded || 'Standard QA test data.'}`);
+    lines.push('', testCase.objective || 'Verify the behavior described by TestPilot evidence.', '');
+    lines.push('Steps:');
+    (testCase.steps || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+    lines.push('', `Expected Result: ${testCase.expectedResult || 'The flow completes without confirmed defects.'}`, '');
+  }
+  return lines.join('\n').trim();
+}
+
+function markdownCell(value) {
+  return String(value ?? '').replace(/\s+/g, ' ').replaceAll('|', '\\|').trim();
+}
+
+function renderBugReportsState() {
+  if (!els.bugReportsOutput || !els.bugReportsStatus) return;
+  const isGenerating = state.ai.status === 'analyzing' && state.ai.lastTask === 'generate-bug-report';
+  const drafts = getCurrentBugDrafts();
+
+  if (isGenerating) {
+    els.bugReportsStatus.textContent = 'Drafting bug reports from current findings and latest Agent evidence...';
+    els.bugReportsOutput.classList.toggle('empty', false);
+    els.bugReportsOutput.innerHTML = '<div class="bug-reports-loader"><span></span><strong>Building defect drafts</strong><p>TestPilot is using confirmed evidence and marking weak items for review.</p></div>';
+    return;
+  }
+
+  if (!drafts.length) {
+    els.bugReportsStatus.textContent = 'No generated bug reports yet.';
+    els.bugReportsOutput.classList.toggle('empty', true);
+    els.bugReportsOutput.innerHTML = '<strong>Ready to draft</strong><p>Capture findings or run Agent first, then generate bug reports from real evidence.</p>';
+    return;
+  }
+
+  els.bugReportsStatus.textContent = `${drafts.length} bug draft${drafts.length === 1 ? '' : 's'} ready for tester review.`;
+  els.bugReportsOutput.classList.toggle('empty', false);
+  els.bugReportsOutput.innerHTML = '';
+  for (const draft of drafts) {
+    els.bugReportsOutput.appendChild(renderBugDraftCard(draft));
+  }
+}
+
+function renderBugDraftCard(draft) {
+  const article = document.createElement('article');
+  article.className = 'bug-draft-card';
+
+  const meta = document.createElement('div');
+  meta.className = 'bug-draft-meta';
+  const severity = document.createElement('span');
+  severity.textContent = draft.severity || 'needs review';
+  meta.appendChild(severity);
+
+  const title = document.createElement('h3');
+  title.textContent = draft.title || 'Untitled bug draft';
+
+  const steps = document.createElement('ol');
+  for (const step of draft.stepsToReproduce || []) {
+    const item = document.createElement('li');
+    item.textContent = step;
+    steps.appendChild(item);
+  }
+
+  const expected = document.createElement('p');
+  expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(draft.expectedResult || 'Expected behavior was not provided.')}`;
+  const actual = document.createElement('p');
+  actual.innerHTML = `<strong>Actual:</strong> ${escapeHtml(draft.actualResult || 'Actual behavior was not provided.')}`;
+  const evidence = document.createElement('p');
+  evidence.className = 'bug-draft-evidence';
+  evidence.innerHTML = `<strong>Evidence:</strong> ${escapeHtml(draft.evidenceSummary || 'Evidence summary was not provided.')}`;
+
+  article.append(meta, title);
+  if (steps.children.length) article.appendChild(steps);
+  article.append(expected, actual, evidence);
+  return article;
+}
+
+function getCurrentBugDrafts() {
+  return Array.isArray(state.ai.analysis?.bugReportDrafts) ? state.ai.analysis.bugReportDrafts : [];
+}
+
+function copyBugReportDrafts() {
+  const drafts = getCurrentBugDrafts();
+  if (!drafts.length) {
+    showToast('No bug reports to copy yet.', 'error');
+    return;
+  }
+  copyText(buildBugReportsMarkdown(drafts), els.copyBugReportDraftsBtn);
+}
+
+function exportBugReportMarkdown() {
+  const drafts = getCurrentBugDrafts();
+  if (!drafts.length) {
+    showToast('No bug reports to export yet.', 'error');
+    return;
+  }
+  downloadBlob(buildBugReportsMarkdown(drafts), `testpilot-bug-reports-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
+  showToast('Bug report Markdown exported.', 'success');
+}
+
+function exportBugReportJson() {
+  const drafts = getCurrentBugDrafts();
+  if (!drafts.length) {
+    showToast('No bug reports to export yet.', 'error');
+    return;
+  }
+  const payload = {
+    tool: 'TestPilot',
+    version: VERSION,
+    generatedAt: new Date().toISOString(),
+    pageUrl: state.pageUrl,
+    bugReportDrafts: drafts
+  };
+  downloadBlob(JSON.stringify(payload, null, 2), `testpilot-bug-reports-${dateFilePart()}.json`, 'application/json');
+  showToast('Bug report JSON exported.', 'success');
+}
+
+function clearBugReports() {
+  if (!state.ai.analysis) return;
+  state.ai.analysis = {
+    ...state.ai.analysis,
+    bugReportDrafts: []
+  };
+  state.ai.activeMode = 'bug-reports';
+  schedulePersist();
+  render();
+  showToast('Bug reports cleared.', 'success');
+}
+
+function buildBugReportsMarkdown(drafts) {
+  const lines = [
+    '# TestPilot Bug Reports',
+    '',
+    `Generated: ${new Date().toISOString()}`,
+    `Page: ${state.pageUrl || 'N/A'}`,
+    ''
+  ];
+
+  for (const draft of drafts) {
+    lines.push(`## ${draft.title || 'Untitled bug draft'}`);
+    lines.push(`Severity: ${draft.severity || 'needs review'}`, '');
+    lines.push('Steps to Reproduce:');
+    (draft.stepsToReproduce || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
+    lines.push('', `Expected Result: ${draft.expectedResult || 'N/A'}`);
+    lines.push(`Actual Result: ${draft.actualResult || 'N/A'}`);
+    lines.push(`Evidence: ${draft.evidenceSummary || 'N/A'}`, '');
+  }
+
+  return lines.join('\n').trim();
 }
 
 function makeBugDraftSection(drafts) {
@@ -2053,46 +3416,453 @@ function makeBugDraftSection(drafts) {
   return section;
 }
 
-async function checkAiHealth() {
+async function checkAiHealth(options = {}) {
+  const silent = Boolean(options.silent);
   state.settings = readSettingsFromForm();
-  await chrome.storage.local.set({ buglensSettings: state.settings });
+  state.settings.aiProvider = {
+    ...normalizeAiProviderSettings(state.settings.aiProvider),
+    status: 'checking',
+    lastError: ''
+  };
+  syncAiStateFromProviderStatus(state.settings.aiProvider);
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
   state.ai.status = 'checking';
   state.ai.error = '';
-  addAiLog(`Checking backend ${state.settings.aiBackendUrl}/api/health`);
+  const providerLabel = AI_PROVIDER_DEFAULTS[state.settings.aiProvider.provider]?.label || 'AI provider';
+  addAiLog(`Checking ${providerLabel}${options.reason ? ` (${options.reason})` : ''}`);
   render();
   try {
-    const response = await fetchWithTimeout(`${state.settings.aiBackendUrl}/api/health`, { method: 'GET' }, 8000);
-    if (!response.ok) throw new Error(`Backend returned ${response.status}`);
-    const payload = await response.json().catch(() => ({}));
+    const result = await testAiProviderConnection(state.settings.aiProvider);
     state.ai.lastCheckedAt = Date.now();
-    addAiLog(`Backend running: ${payload.provider || 'provider unknown'} ${payload.model || ''}`.trim());
-    if (payload.ai && payload.ai.ok === false) {
-      state.ai.status = 'failed';
-      state.ai.error = `Backend is running, but ${payload.ai.error || payload.ai.note || 'the AI provider is not ready.'}`;
-      addAiLog(`Provider warning: ${state.ai.error}`);
-      showToast('Backend is running, but Ollama is not ready.', 'error');
-    } else {
-      state.ai.status = 'ready';
-      state.ai.error = '';
-      showToast('AI backend is ready.', 'success');
-    }
+    state.settings.aiProvider = {
+      ...normalizeAiProviderSettings(state.settings.aiProvider),
+      status: 'live',
+      lastCheckedAt: state.ai.lastCheckedAt,
+      lastError: '',
+      usage: result.usage || null
+    };
+    state.settings.aiBackendUrl = getAiProviderBaseUrl(state.settings.aiProvider);
+    syncAiStateFromProviderStatus(state.settings.aiProvider);
+    addAiLog(`${providerLabel} is live.`);
+    if (!silent) showToast('AI provider is live.', 'success');
+    await chrome.storage.local.set({ testpilotSettings: state.settings });
+    schedulePersist();
+    render();
+    return true;
   } catch (error) {
-    state.ai.status = 'failed';
-    state.ai.error = formatAiError(error);
+    const message = formatAiError(error);
+    const status = /model|not found|unavailable/i.test(message) ? 'model_error' : 'offline';
+    state.settings.aiProvider = {
+      ...normalizeAiProviderSettings(state.settings.aiProvider),
+      status,
+      lastCheckedAt: Date.now(),
+      lastError: message
+    };
+    syncAiStateFromProviderStatus(state.settings.aiProvider);
+    state.ai.error = message;
     addAiLog(`Connection failed: ${state.ai.error}`);
-    showToast('AI backend is not reachable.', 'error');
+    if (!silent) showToast('AI provider is not ready.', 'error');
+    await chrome.storage.local.set({ testpilotSettings: state.settings });
+    schedulePersist();
+    render();
+    return false;
   }
-  schedulePersist();
-  render();
 }
 
-async function runAiTask(task) {
+async function testAiProviderConnection(settings) {
+  const providerSettings = normalizeAiProviderSettings(settings);
+  validateAiProviderSettings(providerSettings);
+  if (providerSettings.provider === 'local-backend') {
+    const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/health`, { method: 'GET' }, 8000);
+    if (!response.ok) throw new Error(`Backend returned ${response.status}`);
+    const payload = await response.json().catch(() => ({}));
+    if (payload.ai && payload.ai.ok === false) {
+      throw new Error(payload.ai.error || payload.ai.note || 'Local model unavailable.');
+    }
+    return { text: 'OK', raw: payload };
+  }
+
+  const response = await completeWithAiProvider({
+    settings: providerSettings,
+    messages: [
+      { role: 'system', content: 'You are a connection test endpoint.' },
+      { role: 'user', content: 'Reply with only OK.' }
+    ],
+    mode: 'chat',
+    maxTokens: 8,
+    temperature: 0
+  });
+  if (!/ok/i.test(String(response.text || ''))) {
+    throw new Error('Parse failed: provider did not return OK.');
+  }
+  return response;
+}
+
+function validateAiProviderSettings(settings) {
+  const providerSettings = normalizeAiProviderSettings(settings);
+  const defaults = AI_PROVIDER_DEFAULTS[providerSettings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  if (defaults.needsApiKey && !providerSettings.apiKey) {
+    throw new Error('Invalid API key: this provider requires an API key.');
+  }
+  if (['custom-api', 'custom-openai-compatible'].includes(providerSettings.provider) && !providerSettings.baseUrl) {
+    throw new Error('Provider unreachable: Base URL is required for custom providers.');
+  }
+}
+
+function buildProviderChatMessages(question) {
+  const context = buildCompactAiSessionSummary('chat');
+  const history = (state.ai.chatMessages || [])
+    .filter((message) => ['user', 'assistant'].includes(message.role) && message.text)
+    .slice(-6)
+    .map((message) => ({
+      role: message.role,
+      content: String(message.text).slice(0, 1200)
+    }));
+  return [
+    {
+      role: 'system',
+      content: [
+        'You are TestPilot, a concise QA assistant inside a Chrome DevTools extension.',
+        'Answer only from the provided sanitized QA session context.',
+        'Do not invent bugs. If evidence is missing, ask for the next useful test.',
+        'Never request or reveal API keys, cookies, passwords, or tokens.'
+      ].join(' ')
+    },
+    ...history,
+    {
+      role: 'user',
+      content: JSON.stringify({
+        question,
+        context,
+        responseStyle: 'Clear, helpful, tester-friendly, no raw logs unless needed.'
+      })
+    }
+  ];
+}
+
+function buildProviderTaskMessages(task) {
+  const session = buildCompactAiSessionSummary(task);
+  if (task === 'generate-test-cases') session.testCasePreferences = readTestCasePreferences();
+  const taskLabel = {
+    'analyze-session': 'session analysis',
+    'generate-test-cases': 'test case generation',
+    'generate-bug-report': 'bug report drafting'
+  }[task] || task;
+  return [
+    {
+      role: 'system',
+      content: [
+        `You are TestPilot AI for ${taskLabel}.`,
+        'Return only valid JSON matching the requested schema.',
+        'Use only the sanitized session evidence.',
+        'Do not invent product features, credentials, headers, cookies, tokens, or screenshots.',
+        'Mark weak evidence as needs review.'
+      ].join(' ')
+    },
+    {
+      role: 'user',
+      content: JSON.stringify({
+        task,
+        schema: getAiAnalysisResponseSchema(task),
+        session
+      })
+    }
+  ];
+}
+
+function getAiAnalysisResponseSchema(task) {
+  return {
+    qaHealth: 'excellent|good|needs_review|risky|broken',
+    executiveSummary: 'short string',
+    actionableIssues: [{ title: 'string', severity: 'string', reason: 'string', recommendation: 'string' }],
+    likelyFalsePositives: [{ title: 'string', reason: 'string' }],
+    needsReview: [{ title: 'string', whatToVerify: 'string' }],
+    recommendedNextTests: ['string'],
+    testCases: task === 'generate-test-cases' ? [{
+      title: 'string',
+      objective: 'string',
+      priority: 'P0|P1|P2|P3',
+      type: 'functional|negative|edge|regression|smoke|accessibility|performance',
+      sourceFinding: 'string',
+      dataNeeded: 'string',
+      steps: ['string'],
+      expectedResult: 'string'
+    }] : [],
+    bugReportDrafts: task === 'generate-bug-report' ? [{
+      title: 'string',
+      severity: 'critical|high|medium|low|needs review',
+      stepsToReproduce: ['string'],
+      expectedResult: 'string',
+      actualResult: 'string',
+      evidenceSummary: 'string'
+    }] : [],
+    managerSummary: 'short string',
+    developerSummary: 'short string'
+  };
+}
+
+function buildCompactAiSessionSummary(task) {
+  const session = buildAiSessionSummary(task);
+  const mode = getAiContextMode(task);
+  const limits = {
+    fast: { actionable: 5, review: 5, tests: 4, evidence: 4 },
+    balanced: { actionable: 8, review: 8, tests: 6, evidence: 6 },
+    deep: { actionable: 12, review: 12, tests: 10, evidence: 8 }
+  }[mode];
+  const compact = {
+    ...session,
+    contextMode: mode,
+    actionableFindings: dedupeAiItems(session.actionableFindings).slice(0, limits.actionable),
+    needsReviewFindings: dedupeAiItems(session.needsReviewFindings).slice(0, limits.review),
+    recommendedLimits: {
+      historyMessages: mode === 'deep' ? 6 : 4,
+      rawDomIncluded: false,
+      rawHtmlIncluded: false,
+      rawHeadersIncluded: false
+    }
+  };
+  if (compact.latestAgentResult) {
+    compact.latestAgentResult.actionResults = (compact.latestAgentResult.actionResults || []).slice(0, limits.evidence);
+    compact.latestAgentResult.linkedEvidence = (compact.latestAgentResult.linkedEvidence || []).slice(0, limits.evidence);
+    compact.latestAgentResult.evidence = (compact.latestAgentResult.evidence || []).slice(0, limits.evidence);
+  }
+  if (compact.recommendedNextTests) compact.recommendedNextTests = compact.recommendedNextTests.slice(0, limits.tests);
+  return redactObject(compact);
+}
+
+function getAiContextMode(task) {
+  if (task === 'generate-test-cases' || task === 'generate-bug-report') return 'deep';
+  return ['fast', 'balanced', 'deep'].includes(state.settings.aiContextMode) ? state.settings.aiContextMode : 'fast';
+}
+
+function dedupeAiItems(items) {
+  const seen = new Set();
+  return (Array.isArray(items) ? items : []).filter((item) => {
+    const key = JSON.stringify([item.type, item.title, item.evidenceSummary]).slice(0, 500);
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+function getProviderMaxTokens(task) {
+  const base = Number(state.settings.aiProvider?.maxTokens || DEFAULT_AI_PROVIDER_SETTINGS.maxTokens);
+  if (task === 'chat') return Math.min(base, 900);
+  if (task === 'generate-test-cases' || task === 'generate-bug-report') return Math.max(base, 1800);
+  return base;
+}
+
+function parseJsonFromText(text) {
+  const value = String(text || '').trim();
+  if (!value) throw new Error('Parse failed: provider returned empty JSON.');
+  try {
+    return JSON.parse(value);
+  } catch {
+    const match = value.match(/\{[\s\S]*\}/);
+    if (match) return JSON.parse(match[0]);
+    throw new Error('Parse failed: provider did not return valid JSON.');
+  }
+}
+
+function recordAiUsage(usage) {
+  const normalized = normalizeProviderUsage(usage);
+  if (!normalized) return;
+  state.settings.aiProvider = {
+    ...normalizeAiProviderSettings(state.settings.aiProvider),
+    usage: normalized
+  };
+  const total = normalized.totalTokens || [normalized.inputTokens, normalized.outputTokens].filter(Boolean).join('/');
+  if (total) addAiLog(`Token usage: ${total}`);
+}
+
+async function completeWithAiProvider({ settings, messages, mode = 'chat', maxTokens, temperature, responseFormat = 'text' }) {
+  const providerSettings = normalizeAiProviderSettings(settings);
+  validateAiProviderSettings(providerSettings);
+  const defaults = AI_PROVIDER_DEFAULTS[providerSettings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  const request = {
+    messages: compactAiMessages(messages),
+    mode,
+    model: getAiProviderModel(providerSettings),
+    maxTokens: clampNumber(maxTokens || providerSettings.maxTokens, 32, 12000, providerSettings.maxTokens),
+    temperature: Number.isFinite(Number(temperature)) ? Number(temperature) : providerSettings.temperature,
+    responseFormat
+  };
+
+  if (providerSettings.provider === 'local-backend') {
+    throw new Error('Local Backend provider should use local backend endpoints.');
+  }
+  if (defaults.adapter === 'gemini') return completeWithGemini(providerSettings, request);
+  if (defaults.adapter === 'anthropic') return completeWithAnthropic(providerSettings, request);
+  if (defaults.adapter === 'custom-api') return completeWithCustomApi(providerSettings, request);
+  return completeWithOpenAiCompatible(providerSettings, request);
+}
+
+function getAiProviderModel(settings) {
+  const providerSettings = normalizeAiProviderSettings(settings);
+  if (providerSettings.modelMode === 'custom' && providerSettings.model) return providerSettings.model;
+  const defaults = AI_PROVIDER_DEFAULTS[providerSettings.provider] || AI_PROVIDER_DEFAULTS['local-backend'];
+  return defaults.recommendedModel || defaults.model || 'auto';
+}
+
+function compactAiMessages(messages) {
+  return (Array.isArray(messages) ? messages : [])
+    .slice(-6)
+    .map((message) => ({
+      role: ['system', 'user', 'assistant'].includes(message.role) ? message.role : 'user',
+      content: redactText(String(message.content || '')).slice(0, 12000)
+    }))
+    .filter((message) => message.content);
+}
+
+async function completeWithOpenAiCompatible(settings, request) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
+  const response = await fetchWithTimeout(getAiProviderBaseUrl(settings), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      model: request.model,
+      temperature: request.temperature,
+      max_tokens: request.maxTokens,
+      response_format: request.responseFormat === 'json' ? { type: 'json_object' } : undefined,
+      messages: request.messages
+    })
+  }, getProviderTimeoutMs(request.mode));
+  const payload = await readProviderJson(response, 'OpenAI-compatible provider');
+  const text = payload?.choices?.[0]?.message?.content || payload?.choices?.[0]?.text || '';
+  if (!text) throw new Error('Parse failed: provider returned an empty response.');
+  return { text, raw: payload, usage: normalizeProviderUsage(payload.usage) };
+}
+
+async function completeWithGemini(settings, request) {
+  const model = encodeURIComponent(request.model || 'gemini-1.5-flash');
+  const baseUrl = String(settings.baseUrl || AI_PROVIDER_DEFAULTS.gemini.baseUrl).replace(/\/+$/, '');
+  const url = `${baseUrl}/${model}:generateContent?key=${encodeURIComponent(settings.apiKey)}`;
+  const system = request.messages.find((message) => message.role === 'system')?.content || '';
+  const contents = request.messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => ({
+      role: message.role === 'assistant' ? 'model' : 'user',
+      parts: [{ text: message.content }]
+    }));
+  const response = await fetchWithTimeout(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      systemInstruction: system ? { parts: [{ text: system }] } : undefined,
+      contents,
+      generationConfig: {
+        temperature: request.temperature,
+        maxOutputTokens: request.maxTokens,
+        responseMimeType: request.responseFormat === 'json' ? 'application/json' : 'text/plain'
+      }
+    })
+  }, getProviderTimeoutMs(request.mode));
+  const payload = await readProviderJson(response, 'Gemini');
+  const text = (payload?.candidates?.[0]?.content?.parts || []).map((part) => part.text || '').join('').trim();
+  if (!text) throw new Error('Parse failed: Gemini returned an empty response.');
+  const usage = payload.usageMetadata ? {
+    inputTokens: payload.usageMetadata.promptTokenCount,
+    outputTokens: payload.usageMetadata.candidatesTokenCount,
+    totalTokens: payload.usageMetadata.totalTokenCount
+  } : null;
+  return { text, raw: payload, usage };
+}
+
+async function completeWithAnthropic(settings, request) {
+  const system = request.messages.find((message) => message.role === 'system')?.content || '';
+  const messages = request.messages
+    .filter((message) => message.role !== 'system')
+    .map((message) => ({
+      role: message.role === 'assistant' ? 'assistant' : 'user',
+      content: message.content
+    }));
+  const response = await fetchWithTimeout(getAiProviderBaseUrl(settings), {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'x-api-key': settings.apiKey,
+      'anthropic-version': '2023-06-01'
+    },
+    body: JSON.stringify({
+      model: request.model,
+      max_tokens: request.maxTokens,
+      temperature: request.temperature,
+      system,
+      messages
+    })
+  }, getProviderTimeoutMs(request.mode));
+  const payload = await readProviderJson(response, 'Anthropic');
+  const text = (payload?.content || []).map((part) => part.text || '').join('').trim();
+  if (!text) throw new Error('Parse failed: Anthropic returned an empty response.');
+  return { text, raw: payload, usage: normalizeProviderUsage(payload.usage) };
+}
+
+async function completeWithCustomApi(settings, request) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (settings.apiKey) headers.Authorization = `Bearer ${settings.apiKey}`;
+  const response = await fetchWithTimeout(getAiProviderBaseUrl(settings), {
+    method: 'POST',
+    headers,
+    body: JSON.stringify({
+      messages: request.messages,
+      mode: request.mode,
+      model: request.model,
+      temperature: request.temperature,
+      maxTokens: request.maxTokens,
+      responseFormat: request.responseFormat
+    })
+  }, getProviderTimeoutMs(request.mode));
+  const payload = await readProviderJson(response, 'Custom API');
+  const text = payload.text || payload.answer || payload.message || payload.content || payload?.choices?.[0]?.message?.content || '';
+  if (!text) throw new Error('Parse failed: Custom API returned no text field.');
+  return { text: String(text), raw: payload, usage: normalizeProviderUsage(payload.usage) };
+}
+
+async function readProviderJson(response, label) {
+  const text = await response.text().catch(() => '');
+  let payload = null;
+  try {
+    payload = text ? JSON.parse(text) : {};
+  } catch {
+    payload = { text };
+  }
+  if (!response.ok) {
+    const message = payload?.error?.message || payload?.error || payload?.message || text || `${label} returned ${response.status}`;
+    if (response.status === 401 || response.status === 403) throw new Error(`Invalid API key: ${String(message).slice(0, 220)}`);
+    if (response.status === 404) throw new Error(`Model unavailable: ${String(message).slice(0, 220)}`);
+    throw new Error(`Provider unreachable: ${String(message).slice(0, 220)}`);
+  }
+  return payload;
+}
+
+function normalizeProviderUsage(usage) {
+  if (!usage || typeof usage !== 'object') return null;
+  return {
+    inputTokens: usage.prompt_tokens || usage.input_tokens || usage.inputTokens,
+    outputTokens: usage.completion_tokens || usage.output_tokens || usage.outputTokens,
+    totalTokens: usage.total_tokens || usage.totalTokens
+  };
+}
+
+function getProviderTimeoutMs(mode) {
+  if (mode === 'chat') return 90000;
+  if (mode === 'test-cases' || mode === 'bug-report') return 180000;
+  return 60000;
+}
+
+async function runAiTask(task, options = {}) {
   if (!state.startedAt) {
     showToast('Start a session before using AI analysis.', 'error');
     return;
   }
   state.settings = readSettingsFromForm();
-  await chrome.storage.local.set({ buglensSettings: state.settings });
+  await chrome.storage.local.set({ testpilotSettings: state.settings });
+  if (task === 'generate-test-cases') {
+    setActiveView('test-cases');
+  } else if (task === 'generate-bug-report') {
+    setActiveView('bug-reports');
+  }
   state.ai.status = 'analyzing';
   state.ai.lastTask = task;
   state.ai.activeMode = aiModeForTask(task);
@@ -2107,14 +3877,34 @@ async function runAiTask(task) {
   }[task];
 
   try {
-    const response = await fetchWithTimeout(`${state.settings.aiBackendUrl}${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session: buildAiSessionSummary(task) })
-    }, 90000);
-    if (!response.ok) throw new Error(`AI backend returned ${response.status}`);
-    const payload = await response.json();
-    state.ai.analysis = validateAiAnalysis(payload.analysis || payload);
+    const providerReady = await checkAiHealth({ silent: true, reason: options.source || task });
+    if (!providerReady) {
+      showToast('AI provider is not ready. Check Settings > AI Provider.', 'error');
+      return;
+    }
+    state.ai.status = 'analyzing';
+    render();
+    const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+    let payload = null;
+    if (providerSettings.provider === 'local-backend') {
+      const session = buildCompactAiSessionSummary(task);
+      if (task === 'generate-test-cases') {
+        session.testCasePreferences = readTestCasePreferences();
+      }
+      const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}${endpoint}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session })
+      }, 90000);
+      if (!response.ok) throw new Error(`AI backend returned ${response.status}`);
+      payload = await response.json();
+      state.ai.analysis = applyTestCasePreferencesToAnalysis(validateAiAnalysis(payload.analysis || payload), task);
+    } else {
+      const providerResponse = await completeAiTaskWithSelectedProvider(task);
+      payload = providerResponse.raw || {};
+      state.ai.analysis = applyTestCasePreferencesToAnalysis(validateAiAnalysis(providerResponse.analysis), task);
+      if (providerResponse.usage) recordAiUsage(providerResponse.usage);
+    }
     state.ai.status = 'complete';
     state.ai.lastCheckedAt = Date.now();
     if (payload.fallback) {
@@ -2123,19 +3913,67 @@ async function runAiTask(task) {
     addAiLog(`${task} complete.`);
     showToast('AI analysis complete.', 'success');
   } catch (error) {
-    state.ai.analysis = buildLocalAiFallback(task, error);
-    state.ai.status = 'complete';
-    state.ai.error = '';
-    addAiLog(`${task} used local fallback: ${formatAiError(error)}`);
-    showToast('AI fallback generated from local findings.', 'success');
+    const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+    if (providerSettings.provider !== 'local-backend') {
+      state.ai.status = 'failed';
+      state.ai.error = formatAiError(error);
+      state.settings.aiProvider = {
+        ...providerSettings,
+        status: /model|parse/i.test(state.ai.error) ? 'model_error' : 'offline',
+        lastError: state.ai.error,
+        lastCheckedAt: Date.now()
+      };
+      addAiLog(`${task} failed: ${state.ai.error}`);
+      showToast('AI provider request failed. No fallback output was generated.', 'error');
+    } else {
+      state.ai.analysis = applyTestCasePreferencesToAnalysis(buildLocalAiFallback(task, error), task);
+      state.ai.status = 'complete';
+      state.ai.error = '';
+      addAiLog(`${task} used local fallback: ${formatAiError(error)}`);
+      showToast('AI fallback generated from local findings.', 'success');
+    }
   }
   schedulePersist();
   render();
 }
 
+async function completeAiTaskWithSelectedProvider(task) {
+  const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+  const messages = buildProviderTaskMessages(task);
+  const response = await completeWithAiProvider({
+    settings: providerSettings,
+    messages,
+    mode: task === 'generate-test-cases' ? 'test-cases' : (task === 'generate-bug-report' ? 'bug-report' : 'chat'),
+    maxTokens: getProviderMaxTokens(task),
+    temperature: providerSettings.temperature,
+    responseFormat: 'json'
+  });
+  const parsed = parseJsonFromText(response.text);
+  return {
+    ...response,
+    analysis: parsed
+  };
+}
+
+function applyTestCasePreferencesToAnalysis(analysis, task) {
+  if (task !== 'generate-test-cases' || !analysis || !Array.isArray(analysis.testCases)) return analysis;
+  const selected = getSelectedTestCaseType();
+  if (!selected || selected.toLowerCase() === 'all types') return analysis;
+  const normalizedType = selected.toLowerCase();
+  return {
+    ...analysis,
+    testCases: analysis.testCases.map((testCase) => ({
+      ...testCase,
+      type: String(testCase.type || '').toLowerCase().includes(normalizedType)
+        ? testCase.type
+        : normalizedType
+    }))
+  };
+}
+
 function formatAiError(error) {
   if (error && error.name === 'AbortError') {
-    return 'Request timed out. BugLens generated a local fallback; restart ai-backend to use the newest backend fallback.';
+    return 'Request timed out. TestPilot generated a local fallback; restart ai-backend to use the newest backend fallback.';
   }
   const message = error && error.message ? error.message : 'AI request failed.';
   if (/Failed to fetch/i.test(message)) {
@@ -2156,7 +3994,7 @@ function buildLocalAiFallback(task, error) {
   const hasReview = needsReview.length > 0;
   return validateAiAnalysis({
     qaHealth: hasActionable ? 'risky' : (hasReview ? 'needs_review' : 'good'),
-    executiveSummary: `BugLens generated this locally because AI did not finish: ${formatAiError(error)}`,
+    executiveSummary: `TestPilot generated this locally because AI did not finish: ${formatAiError(error)}`,
     actionableIssues: actionable.slice(0, 8).map((issue) => ({
       title: issue.title,
       severity: issue.severity,
@@ -2175,7 +4013,7 @@ function buildLocalAiFallback(task, error) {
     testCases,
     bugReportDrafts,
     managerSummary: hasActionable
-      ? 'Local fallback found actionable BugLens evidence that should be reviewed before release.'
+      ? 'Local fallback found actionable TestPilot evidence that should be reviewed before release.'
       : 'Local fallback did not find confirmed actionable defects. Run the generated checks for confidence.',
     developerSummary: `Local fallback generated ${testCases.length} test case(s) and ${bugReportDrafts.length} bug draft(s).`
   });
@@ -2183,6 +4021,9 @@ function buildLocalAiFallback(task, error) {
 
 function buildLocalRecommendedTests(session, findings) {
   const tests = [];
+  if (session.latestAgentResult) {
+    tests.push(`Re-run agent command "${session.latestAgentResult.command || session.latestAgentResult.taskType}" and confirm status remains ${session.latestAgentResult.status}.`);
+  }
   if (session.networkSummary && Number(session.networkSummary.businessApis || 0) > 0) {
     tests.push('Repeat the main user flow and verify business API calls return expected successful responses.');
   }
@@ -2200,24 +4041,32 @@ function buildLocalRecommendedTests(session, findings) {
 
 function buildLocalTestCases(session, findings, recommendedNextTests) {
   const pageUrl = session.pageUrl || 'the tested page';
-  const sources = findings.length ? findings : recommendedNextTests.map((item, index) => ({
+  const agentFinding = session.latestAgentResult ? [{
+    title: `Agent ${session.latestAgentResult.taskType} result: ${session.latestAgentResult.status}`,
+    type: 'agent',
+    severity: session.latestAgentResult.status === 'failed' ? 'high' : 'medium',
+    category: session.latestAgentResult.status === 'passed' ? 'passed' : 'needs-review',
+    evidenceSummary: session.latestAgentResult.summary,
+    recommendation: (session.latestAgentResult.recommendedNextSteps || [])[0] || 'Review the agent evidence and repeat the workflow.'
+  }] : [];
+  const sources = findings.length ? findings : (agentFinding.length ? agentFinding : recommendedNextTests.map((item, index) => ({
     title: `Follow-up QA check ${index + 1}`,
     type: index === 0 ? 'api' : 'ui',
     severity: 'medium',
     category: 'needs-review',
     evidenceSummary: item,
     recommendation: item
-  }));
+  })));
   return sources.slice(0, 8).map((finding, index) => ({
     title: `${priorityFromFinding(finding)} ${testTypeFromFinding(finding)} check: ${finding.title || `QA follow-up ${index + 1}`}`,
-    objective: finding.description || finding.evidenceSummary || finding.recommendation || 'Verify the captured BugLens observation.',
+    objective: finding.description || finding.evidenceSummary || finding.recommendation || 'Verify the captured TestPilot observation.',
     priority: priorityFromFinding(finding),
     type: testTypeFromFinding(finding),
-    sourceFinding: finding.title || 'BugLens session',
+    sourceFinding: finding.title || 'TestPilot session',
     dataNeeded: 'Use a normal QA account and existing test data for this page.',
     steps: [
       `Open ${pageUrl}.`,
-      'Start BugLens, reload the page, and perform the user flow under test.',
+      'Start TestPilot, reload the page, and perform the user flow under test.',
       finding.recommendation || finding.evidenceSummary || 'Observe the behavior related to the captured finding.',
       'Confirm whether network, console, and visible UI evidence matches the expected result.'
     ],
@@ -2227,20 +4076,38 @@ function buildLocalTestCases(session, findings, recommendedNextTests) {
 
 function buildLocalBugDrafts(session, actionable, needsReview) {
   const pageUrl = session.pageUrl || 'the tested page';
-  const candidates = actionable.length ? actionable : needsReview.slice(0, 3);
+  const agentCandidate = session.latestAgentResult && ['failed', 'needs_review'].includes(session.latestAgentResult.status) ? [{
+    title: `Agent found ${session.latestAgentResult.status.replace('_', ' ')} in ${session.latestAgentResult.taskType}`,
+    severity: session.latestAgentResult.status === 'failed' ? 'high' : 'needs review',
+    description: session.latestAgentResult.summary,
+    evidenceSummary: [
+      ...(session.latestAgentResult.evidence || []),
+      ...formatLinkedAgentEvidenceForSummary(session.latestAgentResult)
+    ].join(' | '),
+    recommendation: (session.latestAgentResult.recommendedNextSteps || [])[0]
+  }] : [];
+  const candidates = actionable.length ? actionable : (needsReview.length ? needsReview.slice(0, 3) : agentCandidate);
   return candidates.slice(0, 8).map((finding) => ({
-    title: finding.title || 'BugLens captured issue',
+    title: finding.title || 'TestPilot captured issue',
     severity: finding.severity || (finding.category === 'needs-review' ? 'needs review' : 'medium'),
     stepsToReproduce: [
       `Open ${pageUrl}.`,
-      'Start BugLens and reload the page.',
+      'Start TestPilot and reload the page.',
       'Repeat the tested flow that produced this evidence.',
-      'Review the matching BugLens finding and confirm the behavior.'
+      'Review the matching TestPilot finding and confirm the behavior.'
     ],
     expectedResult: expectedResultFromFinding(finding),
-    actualResult: finding.description || finding.evidenceSummary || 'BugLens captured evidence that requires review.',
-    evidenceSummary: finding.evidenceSummary || finding.recommendation || 'Sanitized BugLens finding evidence.'
+    actualResult: finding.description || finding.evidenceSummary || 'TestPilot captured evidence that requires review.',
+    evidenceSummary: finding.evidenceSummary || finding.recommendation || 'Sanitized TestPilot finding evidence.'
   }));
+}
+
+function formatLinkedAgentEvidenceForSummary(agentResult) {
+  return (agentResult.linkedEvidence || []).flatMap((group) => (
+    (group.evidence || []).slice(0, 3).map((event) => (
+      `Step ${Number(group.stepIndex || 0) + 1} ${group.action}: ${event.summary || event.title}`
+    ))
+  )).slice(0, 8);
 }
 
 function priorityFromFinding(finding) {
@@ -2319,6 +4186,7 @@ function buildAiSessionSummary(task) {
       ignoredDecorativeElements: state.uiStats.ignoredDecorativeElements,
       hitNodeLimit: state.uiStats.hitNodeLimit
     },
+    latestAgentResult: summarizeAgentResultForAi(state.ai.lastAgentResult),
     networkSummary: {
       businessApis: state.networkStats.api,
       frameworkInternal: state.networkStats.framework,
@@ -2336,6 +4204,50 @@ function buildAiSessionSummary(task) {
       sanitized: true,
       excluded: ['cookies', 'authorization headers', 'tokens', 'passwords', 'raw headers', 'request bodies', 'response bodies', 'screenshots']
     }
+  };
+}
+
+function summarizeAgentResultForAi(agentResult) {
+  if (!agentResult || typeof agentResult !== 'object') return null;
+  const result = agentResult.result || {};
+  const plan = agentResult.plan || {};
+  return {
+    command: String(agentResult.command || '').slice(0, 500),
+    taskType: agentResult.taskType || plan.taskType || 'general_page_validation',
+    dataStrategy: agentResult.dataStrategy || plan.dataStrategy || 'unknown',
+    requestKey: agentResult.requestKey || null,
+    status: result.status || 'needs_review',
+    summary: String(result.summary || plan.summary || '').slice(0, 1000),
+    planSummary: String(plan.summary || '').slice(0, 500),
+    riskLevel: plan.riskLevel || 'safe',
+    actionResults: (agentResult.actionResults || []).slice(0, 12).map((item) => ({
+      action: item.action,
+      targetIndex: item.targetIndex,
+      targetLabel: item.targetLabel,
+      success: Boolean(item.success),
+      message: String(item.message || '').slice(0, 300),
+      startedAt: item.startedAt || item.timestamp || null,
+      completedAt: item.completedAt || null,
+      linkedEvidence: (item.linkedEvidence || []).slice(0, 4).map((event) => ({
+        type: event.type,
+        severity: event.severity,
+        summary: String(event.summary || event.title || '').slice(0, 300),
+        url: event.url
+      }))
+    })),
+    linkedEvidence: (agentResult.linkedEvidence || []).slice(0, 8).map((group) => ({
+      stepIndex: group.stepIndex,
+      action: group.action,
+      targetIndex: group.targetIndex,
+      evidence: (group.evidence || []).slice(0, 4).map((event) => ({
+        type: event.type,
+        severity: event.severity,
+        summary: String(event.summary || event.title || '').slice(0, 300),
+        url: event.url
+      }))
+    })),
+    evidence: (result.evidence || []).slice(0, 8).map((item) => String(item).slice(0, 500)),
+    recommendedNextSteps: (result.recommendedNextSteps || []).slice(0, 6).map((item) => String(item).slice(0, 300))
   };
 }
 
@@ -2398,10 +4310,10 @@ function validateAiAnalysis(value) {
   const recommendedNextTests = safeArray(value.recommendedNextTests, (item) => text(item));
   const testCases = safeArray(value.testCases, (item) => ({
     title: text(item && item.title, 'Untitled test case'),
-    objective: text(item && item.objective, 'Verify the behavior described by BugLens evidence.'),
+    objective: text(item && item.objective, 'Verify the behavior described by TestPilot evidence.'),
     priority: text(item && item.priority, 'P2'),
     type: text(item && item.type, 'functional'),
-    sourceFinding: text(item && item.sourceFinding, 'BugLens session'),
+    sourceFinding: text(item && item.sourceFinding, 'TestPilot session'),
     dataNeeded: text(item && item.dataNeeded, 'Standard QA account or existing test data.'),
     steps: Array.isArray(item && item.steps) ? item.steps.slice(0, 10).map((step) => text(step)).filter(Boolean) : [],
     expectedResult: text(item && item.expectedResult, 'The flow completes without confirmed API, console, or UI defects.')
@@ -2414,11 +4326,11 @@ function validateAiAnalysis(value) {
     sourceFinding: 'AI recommended next test',
     dataNeeded: 'Standard QA test data.',
     steps: [
-      'Open the page or flow captured in the BugLens session.',
+      'Open the page or flow captured in the TestPilot session.',
       item,
       'Observe network, console, and visible UI behavior while completing the flow.'
     ],
-    expectedResult: 'The flow completes without confirmed BugLens defects or user-facing regressions.'
+    expectedResult: 'The flow completes without confirmed TestPilot defects or user-facing regressions.'
   }));
   const actionableIssues = safeArray(value.actionableIssues, (item) => ({
     title: text(item && item.title),
@@ -2435,16 +4347,16 @@ function validateAiAnalysis(value) {
     evidenceSummary: text(item && item.evidenceSummary)
   })).filter((item) => item.title || item.evidenceSummary);
   const fallbackBugDrafts = actionableIssues.map((item) => ({
-    title: item.title || 'BugLens actionable issue',
+    title: item.title || 'TestPilot actionable issue',
     severity: item.severity || 'needs review',
     stepsToReproduce: [
-      'Open the page captured in the BugLens session.',
-      'Start BugLens, reload the page, and repeat the tested user flow.',
-      'Observe the evidence described in the BugLens finding.'
+      'Open the page captured in the TestPilot session.',
+      'Start TestPilot, reload the page, and repeat the tested user flow.',
+      'Observe the evidence described in the TestPilot finding.'
     ],
     expectedResult: item.recommendation || 'The tested flow completes without user-facing defects.',
-    actualResult: item.reason || 'BugLens captured evidence that requires developer review.',
-    evidenceSummary: item.reason || 'Actionable BugLens finding.'
+    actualResult: item.reason || 'TestPilot captured evidence that requires developer review.',
+    evidenceSummary: item.reason || 'Actionable TestPilot finding.'
   }));
 
   return {
@@ -2497,7 +4409,7 @@ function downloadAiMarkdown() {
   }
   const mode = normalizeAiMode(state.ai.activeMode);
   const markdown = buildAiMarkdown(state.ai.analysis, mode);
-  downloadBlob(markdown, `buglens-ai-${mode}-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
+  downloadBlob(markdown, `testpilot-ai-${mode}-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
   showToast('AI Markdown downloaded.', 'success');
 }
 
@@ -2508,20 +4420,20 @@ function downloadAiJson() {
   }
   const mode = normalizeAiMode(state.ai.activeMode);
   const payload = {
-    tool: 'BugLens',
+    tool: 'TestPilot',
     version: VERSION,
     generatedAt: new Date().toISOString(),
     mode,
     pageUrl: state.pageUrl,
     aiAnalysis: state.ai.analysis
   };
-  downloadBlob(JSON.stringify(payload, null, 2), `buglens-ai-${mode}-${dateFilePart()}.json`, 'application/json');
+  downloadBlob(JSON.stringify(payload, null, 2), `testpilot-ai-${mode}-${dateFilePart()}.json`, 'application/json');
   showToast('AI JSON downloaded.', 'success');
 }
 
 function buildAiMarkdown(analysis, mode) {
   const lines = [
-    `# BugLens AI ${modeLabel(mode)}`,
+    `# TestPilot AI ${modeLabel(mode)}`,
     '',
     `Generated: ${new Date().toISOString()}`,
     `Page: ${state.pageUrl || 'N/A'}`,
@@ -2535,9 +4447,9 @@ function buildAiMarkdown(analysis, mode) {
       lines.push(`### ${testCase.title}`);
       lines.push(`- Priority: ${testCase.priority || 'P2'}`);
       lines.push(`- Type: ${testCase.type || 'functional'}`);
-      lines.push(`- Source: ${testCase.sourceFinding || 'BugLens session'}`);
+      lines.push(`- Source: ${testCase.sourceFinding || 'TestPilot session'}`);
       lines.push(`- Data Needed: ${testCase.dataNeeded || 'Standard QA test data.'}`);
-      lines.push('', testCase.objective || 'Verify the behavior described by BugLens evidence.', '');
+      lines.push('', testCase.objective || 'Verify the behavior described by TestPilot evidence.', '');
       lines.push('Steps:');
       (testCase.steps || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
       lines.push('', `Expected Result: ${testCase.expectedResult || 'The flow completes without confirmed defects.'}`, '');
@@ -2607,7 +4519,7 @@ function getSessionHint() {
   if (state.startedAt) {
     return 'Session stopped. Review or export the temporary results, or start a new session for another page.';
   }
-  return 'BugLens captures one active inspected page at a time. Start a session, reload the page, then test.';
+  return 'TestPilot captures one active inspected page at a time. Start a session, reload the page, then test.';
 }
 
 function renderSessionDuration() {
@@ -2650,7 +4562,7 @@ function renderIssues() {
       emptyCopy.textContent = 'Start the session and reload the page for complete API and console coverage.';
     } else if (els.typeFilter.value === 'console' && !state.issues.some((issue) => issue.type === 'console')) {
       emptyTitle.textContent = 'No console errors detected';
-      emptyCopy.textContent = 'BugLens captured console errors, warnings, runtime failures, and unhandled promise rejections during this session.';
+      emptyCopy.textContent = 'TestPilot captured console errors, warnings, runtime failures, and unhandled promise rejections during this session.';
     } else if (els.typeFilter.value === 'ui' && state.uiStats.scans === 0) {
       els.emptyIcon.textContent = 'i';
       els.emptyIcon.classList.toggle('neutral', true);
@@ -2669,7 +4581,7 @@ function renderIssues() {
       emptyCopy.textContent = 'Reset the filters or choose another category to see the captured evidence.';
     } else {
       emptyTitle.textContent = 'No actionable issues found';
-      emptyCopy.textContent = 'BugLens did not detect a confirmed API, console, or UI problem in this session.';
+      emptyCopy.textContent = 'TestPilot did not detect a confirmed API, console, or UI problem in this session.';
     }
   }
   els.issuesList.innerHTML = '';
@@ -2942,7 +4854,7 @@ function normalizeNextRoute(value) {
   const raw = String(value || '/');
   let path = raw;
   try {
-    path = new URL(raw, state.pageUrl || 'https://buglens.invalid').pathname;
+    path = new URL(raw, state.pageUrl || 'https://testpilot.invalid').pathname;
   } catch {
     path = raw.split('?')[0];
   }
@@ -3089,7 +5001,7 @@ function buildSuggestedBugText(issue) {
     `URL: ${issue.url || evidence.url || 'N/A'}`,
     '',
     'Description:',
-    issue.description || 'BugLens detected this issue during a QA session.',
+    issue.description || 'TestPilot detected this issue during a QA session.',
     '',
     'User Impact:',
     issue.userImpact || 'Potential impact requires confirmation.',
@@ -3149,7 +5061,7 @@ function buildReport() {
   const ignoredFindings = buildIgnoredFindings();
 
   return {
-    tool: 'BugLens',
+    tool: 'TestPilot',
     version: VERSION,
     generatedAt: new Date().toISOString(),
     session: {
@@ -3199,9 +5111,22 @@ function buildReport() {
     ignoredFindings,
     findings: reportable.map(serializeFinding),
     aiAnalysis: state.settings.includeAiSummaryInReport && state.ai.analysis ? state.ai.analysis : null,
+    latestAgentResult: summarizeAgentResultForAi(state.ai.lastAgentResult),
     redactionNotice: 'Common credentials, tokens, cookies, secrets, and sensitive query values are replaced with [REDACTED].',
     limitations: REPORT_LIMITATIONS,
-    settings: state.settings
+    settings: serializeSettingsForReport()
+  };
+}
+
+function serializeSettingsForReport() {
+  const settings = normalizeSettings(state.settings);
+  return {
+    ...settings,
+    aiProvider: {
+      ...settings.aiProvider,
+      apiKey: settings.aiProvider.apiKey ? maskApiKey(settings.aiProvider.apiKey) : '',
+      hasApiKey: Boolean(settings.aiProvider.apiKey)
+    }
   };
 }
 
@@ -3229,7 +5154,7 @@ function serializeFinding(issue) {
     suggestedBugDescription: issue.includeInIssueCount ? issue.suggestedBugText : undefined,
     suggestedStepsToReproduce: issue.includeInIssueCount ? [
       `Open ${issue.url || state.pageUrl || 'the tested page'}.`,
-      'Start BugLens and reload the page.',
+      'Start TestPilot and reload the page.',
       'Repeat the tested action that produced this evidence.'
     ] : undefined
   };
@@ -3277,10 +5202,10 @@ function exportJson() {
   try {
     state.settings = readSettingsFromForm();
     const report = buildReport();
-    downloadBlob(JSON.stringify(report, null, 2), `buglens-report-${dateFilePart()}.json`, 'application/json');
+    downloadBlob(JSON.stringify(report, null, 2), `testpilot-report-${dateFilePart()}.json`, 'application/json');
     showToast('JSON report exported.', 'success');
   } catch (error) {
-    console.error('[BugLens] JSON export failed', error);
+    console.error('[TestPilot] JSON export failed', error);
     setTemporaryText(els.exportJsonBtn, 'Export Failed');
     showToast('JSON report export failed.', 'error');
   }
@@ -3291,10 +5216,10 @@ function exportHtml() {
     state.settings = readSettingsFromForm();
     const report = buildReport();
     const html = renderHtmlReport(report);
-    downloadBlob(html, `buglens-report-${dateFilePart()}.html`, 'text/html');
+    downloadBlob(html, `testpilot-report-${dateFilePart()}.html`, 'text/html');
     showToast('HTML report exported.', 'success');
   } catch (error) {
-    console.error('[BugLens] HTML export failed', error);
+    console.error('[TestPilot] HTML export failed', error);
     setTemporaryText(els.exportHtmlBtn, 'Export Failed');
     showToast('HTML report export failed.', 'error');
   }
@@ -3371,7 +5296,7 @@ function renderHtmlReport(report) {
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>BugLens QA Report ${escapeHtml(report.version)}</title>
+  <title>TestPilot QA Report ${escapeHtml(report.version)}</title>
   <style>
     * { box-sizing: border-box; }
     body { max-width: 1180px; margin: 0 auto; padding: 32px; font: 14px/1.6 Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: #0f172a; background: #f8fafc; }
@@ -3404,8 +5329,8 @@ function renderHtmlReport(report) {
 <body>
   <header>
     <p class="report-kicker">Local QA evidence</p>
-    <h1>BugLens QA Report</h1>
-    <p class="muted">Professional, redacted QA findings generated locally by BugLens.</p>
+    <h1>TestPilot QA Report</h1>
+    <p class="muted">Professional, redacted QA findings generated locally by TestPilot.</p>
     <div class="report-meta">
       <div><strong>Version:</strong> ${escapeHtml(report.version)}</div>
       <div><strong>Generated:</strong> ${escapeHtml(report.generatedAt)}</div>
@@ -3484,10 +5409,10 @@ function exportCsv() {
   try {
     const report = buildReport();
     const csv = buildCsvReport(report);
-    downloadBlob(`\uFEFF${csv}`, `buglens-report-${dateFilePart()}.csv`, 'text/csv;charset=utf-8');
+    downloadBlob(`\uFEFF${csv}`, `testpilot-report-${dateFilePart()}.csv`, 'text/csv;charset=utf-8');
     showToast('CSV report exported.', 'success');
   } catch (error) {
-    console.error('[BugLens] CSV export failed', error);
+    console.error('[TestPilot] CSV export failed', error);
     setTemporaryText(els.exportCsvBtn, 'Export Failed');
     showToast('CSV report export failed.', 'error');
   }

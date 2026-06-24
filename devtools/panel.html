@@ -3,49 +3,24 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>BugLens QA Inspector</title>
+    <title>TestPilot</title>
     <link rel="stylesheet" href="panel.css" />
   </head>
-  <body data-active-view="dashboard">
+  <body data-active-view="ai">
     <div class="app-layout">
       <aside class="sidebar">
         <div class="sidebar-brand">
           <img src="../assets/icons/icon48.png" alt="" />
           <div>
             <div class="brand-name">
-              <strong>BugLens</strong>
-              <span>v0.4.0</span>
+              <strong>TestPilot</strong>
+              <span>v0.4.1</span>
             </div>
-            <p>QA Inspector</p>
+            <p>AI QA Agent</p>
           </div>
         </div>
 
-        <nav class="view-tabs" role="tablist" aria-label="BugLens sections">
-          <button class="tab-button active" role="tab" aria-selected="true" tabindex="0" data-tab="dashboard">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 4h6v6H4zM14 4h6v6h-6zM4 14h6v6H4zM14 14h6v6h-6z"/></svg>
-            <span>Dashboard</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="findings">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 9 4 12l4 3M16 9l4 3-4 3M14 5l-4 14"/></svg>
-            <span>Findings</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="ui">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16v10H4zM8 19h8M12 15v4M8 9h8M8 12h5"/></svg>
-            <span>UI Bugs</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="ai">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M4.6 6.6l2.1 2.1M17.3 17.3l2.1 2.1M3 12h3M18 12h3M4.6 17.4l2.1-2.1M17.3 6.7l2.1-2.1"/><circle cx="12" cy="12" r="4"/></svg>
-            <span>AI Assistant</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="reports">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7"/></svg>
-            <span>Reports</span>
-          </button>
-          <button class="tab-button" role="tab" aria-selected="false" tabindex="-1" data-tab="settings">
-            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 13.5v-3l-2-.7-.5-1.2.9-1.9-2.1-2.1-1.9.9-1.2-.5-.7-2h-3l-.7 2-1.2.5-1.9-.9-2.1 2.1.9 1.9-.5 1.2-2 .7v3l2 .7.5 1.2-.9 1.9 2.1 2.1 1.9-.9 1.2.5.7 2h3l.7-2 1.2-.5 1.9.9 2.1-2.1-.9-1.9.5-1.2z"/></svg>
-            <span>Settings</span>
-          </button>
-        </nav>
+        <!-- Sidebar is intentionally hidden to keep QA controls in the top menu only -->
 
         <div class="sidebar-footer">
           <span class="privacy-dot" aria-hidden="true"></span>
@@ -60,6 +35,21 @@
         <header id="sessionBanner" class="topbar banner idle">
           <div class="topbar-main">
             <div class="session-context">
+              <div class="testpilot-header-brand">
+                <span class="testpilot-brandmark" aria-hidden="true">↗</span>
+                <strong>TestPilot</strong>
+                <span id="testPilotCurrentView" class="testpilot-current-view" aria-label="Main Chat">
+                  <span data-view-title="ai">Main Chat</span>
+                  <span data-view-title="dashboard">Dashboard</span>
+                  <span data-view-title="findings">Network / Findings</span>
+                  <span data-view-title="console">Console</span>
+                  <span data-view-title="ui">UI Bugs</span>
+                  <span data-view-title="test-cases">Test Cases</span>
+                  <span data-view-title="bug-reports">Bug Reports</span>
+                  <span data-view-title="reports">Reports</span>
+                  <span data-view-title="settings">Settings</span>
+                </span>
+              </div>
               <div class="session-title-row">
                 <span id="sessionDot" class="status-dot" aria-hidden="true"></span>
                 <strong id="sessionStatus">Not Started</strong>
@@ -72,19 +62,60 @@
               </div>
               <p id="sessionHint">Start a session, then reload the page for complete network coverage.</p>
             </div>
+            <div class="qa-menu-bar">
+              <button id="menuToggleBtn" class="menu-toggle" aria-expanded="false" aria-controls="workspaceNav" type="button">
+                <svg class="menu-toggle-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h14"/></svg>
+                <span class="menu-toggle-label">Menu</span>
+              </button>
+              <nav id="workspaceNav" class="qa-menu" role="menu" aria-label="QA tool sections">
+                <div class="qa-menu-head">
+                  <div>
+                    <strong>TestPilot Menu</strong>
+                    <small>Open manual QA panels or run focused tools.</small>
+                  </div>
+                  <button id="menuCloseBtn" class="qa-menu-close" type="button" aria-label="Close menu">×</button>
+                </div>
+                <button role="menuitem" data-tab="ai">Main Chat</button>
+                <details class="qa-menu-group">
+                  <summary>QA Tools</summary>
+                  <button type="button" data-qa-action="generate-test-cases">
+                    <svg class="qa-menu-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h1M3 12h1M3 18h1"/></svg>
+                    <span>Generate Test Cases</span>
+                  </button>
+                  <button type="button" data-qa-action="generate-bug-report">
+                    <svg class="qa-menu-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 3h9l4 4v14H6zM14 3v5h5M9 13h7M9 17h7"/></svg>
+                    <span>Generate Bug Report</span>
+                  </button>
+                  <button type="button" data-qa-action="accessibility">
+                    <svg class="qa-menu-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="5" r="2"/><path d="M5 10h14M12 7v7M8 22l4-8 4 8"/></svg>
+                    <span>Accessibility / UI Scan</span>
+                  </button>
+                </details>
+                <button role="menuitem" data-tab="dashboard">Dashboard</button>
+                <button role="menuitem" data-tab="findings">Network / Findings</button>
+                <button role="menuitem" data-tab="console">Console</button>
+                <button role="menuitem" data-tab="ui">UI Bugs</button>
+                <button role="menuitem" data-tab="test-cases">Test Cases</button>
+                <button role="menuitem" data-tab="bug-reports">Bug Reports</button>
+                <button role="menuitem" data-tab="reports">Reports</button>
+                <button role="menuitem" data-tab="settings">Settings</button>
+              </nav>
+            </div>
             <nav class="top-workflow-tabs" aria-label="Quick sections">
               <button type="button" data-shortcut-tab="dashboard">Dashboard</button>
               <button type="button" data-shortcut-tab="findings">Findings</button>
               <button type="button" data-shortcut-tab="ui">UI Bugs</button>
-              <button type="button" data-shortcut-tab="ai">AI Analysis</button>
+              <button type="button" data-shortcut-tab="ai">Main Chat</button>
+              <button type="button" data-shortcut-tab="test-cases">Test Cases</button>
+              <button type="button" data-shortcut-tab="bug-reports">Bug Reports</button>
               <button type="button" data-shortcut-tab="reports">Reports</button>
             </nav>
           </div>
           <div class="actions" aria-label="Session actions">
-            <button id="startBtn" class="primary">Start Session</button>
+            <button id="startBtn" class="primary">Start</button>
             <button id="stopBtn" disabled>Stop</button>
             <button id="clearBtn" class="danger-quiet">Clear</button>
-            <button id="quickExportBtn">Export Report</button>
+            <button id="quickExportBtn">Export</button>
           </div>
         </header>
 
@@ -269,66 +300,105 @@
             <div id="issuesList" class="issues-list"></div>
           </section>
 
-          <header class="page-heading ai-only">
+          <section class="ai-panel ai-only testpilot-chat-panel">
+            <article class="testpilot-chat-card">
+              <header class="testpilot-chat-head">
+                <div class="testpilot-chat-copy">
+                  <div class="testpilot-chat-title-row">
+                    <h1>AI QA Agent</h1>
+                    <div class="testpilot-mode-toggle" aria-label="Chat mode">
+                      <button id="testPilotChatModeBtn" class="active" type="button">Chat</button>
+                      <button id="testPilotAgentModeBtn" type="button">Agent</button>
+                    </div>
+                    <div class="testpilot-live-status" aria-live="polite">
+                      <span id="aiStatusPill" class="status-pill">Checking</span>
+                      <button id="checkAiBtn" class="testpilot-retry-ai hidden" type="button" aria-label="Retry local AI connection">↻</button>
+                    </div>
+                  </div>
+                </div>
+              </header>
+
+              <div id="aiChatMessages" class="testpilot-chat-messages" aria-live="polite">
+                <div class="testpilot-empty-chat">Tell TestPilot what to test on this page.</div>
+              </div>
+
+              <form id="aiChatForm" class="testpilot-composer">
+                <textarea id="aiChatInput" rows="2" placeholder="Ask about this QA session..."></textarea>
+                <button id="sendAiChatBtn" class="primary testpilot-send" type="submit" aria-label="Send">➤</button>
+              </form>
+            </article>
+          </section>
+
+          <header class="page-heading test-cases-only">
             <div>
-              <p class="eyebrow">Optional local analysis</p>
-              <h1>AI Assistant</h1>
-              <p>AI reviews the current BugLens session and helps separate real issues from noise.</p>
+              <p class="eyebrow">Generated QA coverage</p>
+              <h1>Test Cases</h1>
+              <p>Generate, copy, and export scenarios from current page context, findings, and latest Agent evidence.</p>
             </div>
-            <span id="aiStatusPill" class="status-pill">Not configured</span>
           </header>
 
-          <section class="ai-panel ai-only">
-            <article class="ai-status-card">
-              <div>
-                <span class="eyebrow">Local backend</span>
-                <h2 id="aiStatusTitle">AI not configured</h2>
-                <p id="aiStatusText">Start the local BugLens AI backend, then check the connection.</p>
+          <section class="test-cases-panel test-cases-only">
+            <article class="test-cases-controls">
+              <label>
+                Test type
+                <select id="testCaseTypeSelect">
+                  <option>All Types</option>
+                  <option>Functional</option>
+                  <option>Negative</option>
+                  <option>Edge Cases</option>
+                  <option>Regression</option>
+                  <option>Smoke</option>
+                </select>
+              </label>
+              <label>
+                Format
+                <select id="testCaseFormatSelect">
+                  <option>Step-by-step</option>
+                  <option>Gherkin</option>
+                  <option>Markdown table</option>
+                </select>
+              </label>
+              <div class="test-cases-actions">
+                <button id="generateTestCasesTabBtn" class="primary" type="button">Generate</button>
+                <button id="copyTestCasesBtn" type="button">Copy</button>
+                <button id="exportTestCasesMarkdownBtn" type="button">Export Markdown</button>
+                <button id="clearTestCasesBtn" type="button">Clear</button>
               </div>
-              <button id="checkAiBtn">Check AI</button>
             </article>
+            <div id="testCasesStatus" class="test-cases-status">No generated test cases yet.</div>
+            <div id="testCasesOutput" class="test-cases-output empty">
+              <strong>Ready to generate</strong>
+              <p>Start a session and run Agent or manual QA first for richer, page-specific test cases.</p>
+            </div>
+          </section>
 
-            <label class="ai-url-field">
-              Backend URL
-              <input id="aiBackendUrl" type="url" value="http://localhost:8787" />
-              <small>Development backend that forwards sanitized summaries to local Ollama.</small>
-            </label>
+          <header class="page-heading bug-reports-only">
+            <div>
+              <p class="eyebrow">Generated defect drafts</p>
+              <h1>Bug Reports</h1>
+              <p>Generate clean, evidence-based bug drafts from confirmed findings and latest Agent results.</p>
+            </div>
+          </header>
 
-            <section class="ai-console" aria-live="polite">
+          <section class="bug-reports-panel bug-reports-only">
+            <article class="bug-reports-controls">
               <div>
-                <span class="eyebrow">Backend console</span>
-                <strong>Connection log</strong>
+                <span class="eyebrow">Draft controls</span>
+                <h2>Bug report generator</h2>
+                <p>Use this panel for AI-assisted bug drafts. Use Reports for full session exports.</p>
               </div>
-              <pre id="aiConnectionLog">Backend not checked yet. Start ai-backend with npm start, then click Check AI.</pre>
-            </section>
-
-            <div class="ai-actions">
-              <button id="analyzeAiBtn" class="primary">Analyze Session</button>
-              <button id="generateTestsBtn">Generate Test Cases</button>
-              <button id="generateBugsBtn">Generate Bug Reports</button>
-              <button id="copyAiSummaryBtn">Copy AI Summary</button>
-            </div>
-
-            <div class="ai-result-toolbar">
-              <div class="ai-result-tabs" role="tablist" aria-label="AI result type">
-                <button type="button" class="active" data-ai-mode="analysis">Analysis</button>
-                <button type="button" data-ai-mode="test-cases">Test Cases</button>
-                <button type="button" data-ai-mode="bug-reports">Bug Reports</button>
+              <div class="bug-reports-actions">
+                <button id="generateBugReportTabBtn" class="primary" type="button">Generate</button>
+                <button id="copyBugReportDraftsBtn" type="button">Copy</button>
+                <button id="exportBugReportMarkdownBtn" type="button">Export Markdown</button>
+                <button id="exportBugReportJsonBtn" type="button">Export JSON</button>
+                <button id="clearBugReportsBtn" type="button">Clear</button>
               </div>
-              <div class="ai-download-actions">
-                <button id="downloadAiMarkdownBtn">Download Markdown</button>
-                <button id="downloadAiJsonBtn">Download JSON</button>
-              </div>
-            </div>
-
-            <label class="setting-row ai-report-toggle">
-              <span><strong>Add AI summary to reports</strong><small>Include validated AI executive summary, next tests, and bug drafts in exported HTML/JSON.</small></span>
-              <input id="includeAiSummaryInReport" type="checkbox" />
-            </label>
-
-            <div id="aiOutput" class="ai-output empty">
-              <strong>No AI analysis yet</strong>
-              <p>AI runs only when you click a button. BugLens still works without AI.</p>
+            </article>
+            <div id="bugReportsStatus" class="bug-reports-status">No generated bug reports yet.</div>
+            <div id="bugReportsOutput" class="bug-reports-output empty">
+              <strong>Ready to draft</strong>
+              <p>Capture findings or run Agent first, then generate bug reports from real evidence.</p>
             </div>
           </section>
 
@@ -424,18 +494,56 @@
             </fieldset>
 
             <fieldset>
-              <legend>AI</legend>
-              <p class="group-description">AI is optional, local-first, and only runs when you click an AI action.</p>
-              <div class="settings-grid">
+              <legend>AI Provider</legend>
+              <p class="group-description">Choose a local model or your own provider key. API keys stay in Chrome local storage and are never sent to inspected pages.</p>
+              <div class="settings-grid ai-provider-grid">
+                <label class="setting-row ai-provider-field">
+                  <span><strong>Provider</strong><small>Most hosted providers only need an API key. Model stays on Auto by default.</small></span>
+                  <select id="aiProviderSelect">
+                    <option value="local-backend">Local Backend</option>
+                    <option value="ollama-direct">Ollama Direct</option>
+                    <option value="openai">OpenAI</option>
+                    <option value="grok">Grok / xAI</option>
+                    <option value="gemini">Gemini</option>
+                    <option value="anthropic">Anthropic Claude</option>
+                    <option value="openrouter">OpenRouter</option>
+                    <option value="together">Together AI</option>
+                    <option value="mistral">Mistral</option>
+                    <option value="custom-openai-compatible">Custom OpenAI-Compatible API</option>
+                    <option value="custom-api">Custom API</option>
+                  </select>
+                </label>
+                <label class="setting-row ai-provider-field">
+                  <span><strong>API Key</strong><small id="aiApiKeyHelp">Not required for Local Backend.</small></span>
+                  <input id="aiApiKeyInput" type="password" autocomplete="off" placeholder="No API key required" />
+                </label>
                 <div class="setting-row readonly-setting">
-                  <span><strong>Provider</strong><small>Development mode uses the local BugLens backend and Ollama llama3.2:3b.</small></span>
-                  <span class="status-pill">Local</span>
+                  <span><strong>Connection Status</strong><small id="aiProviderStatusText">Provider has not been checked yet.</small></span>
+                  <span id="aiProviderStatusPill" class="status-pill">Not Configured</span>
+                </div>
+                <div class="setting-row ai-provider-actions">
+                  <span><strong>Provider Actions</strong><small>Use a tiny test prompt. No page context is sent.</small></span>
+                  <div>
+                    <button id="testAiProviderBtn" type="button">Test Connection</button>
+                    <button id="clearAiApiKeyBtn" type="button">Clear API Key</button>
+                  </div>
                 </div>
                 <div class="setting-row readonly-setting">
                   <span><strong>Payload safety</strong><small>Only sanitized summaries are sent. Raw headers, bodies, cookies, and tokens are excluded.</small></span>
                   <span class="status-pill success">Enabled</span>
                 </div>
               </div>
+              <details class="advanced-settings">
+                <summary>Advanced Settings</summary>
+                <div class="settings-grid numeric-grid settings-subgrid">
+                  <label class="wide-field">Base URL<input id="aiBaseUrlInput" type="url" placeholder="Auto / provider default" /><small>Required for Custom API providers. Leave blank for provider defaults.</small></label>
+                  <label>Model mode<select id="aiModelModeSelect"><option value="auto">Auto / Recommended</option><option value="custom">Custom</option></select></label>
+                  <label>Model override<input id="aiModelInput" type="text" placeholder="Auto / Recommended" /></label>
+                  <label>Context mode<select id="aiContextModeSelect"><option value="fast">Fast</option><option value="balanced">Balanced</option><option value="deep">Deep</option></select></label>
+                  <label>Temperature<input id="aiTemperatureInput" type="number" min="0" max="2" step="0.1" value="0.2" /></label>
+                  <label>Max tokens<input id="aiMaxTokensInput" type="number" min="32" max="12000" step="32" value="900" /></label>
+                </div>
+              </details>
             </fieldset>
 
             <fieldset>
