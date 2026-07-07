@@ -15,8 +15,21 @@ npm start
 Expected:
 
 - Terminal prints that the TestPilot AI backend is running.
+- `http://localhost:8787` returns backend status JSON.
 - Health endpoint is available at `http://localhost:8787/api/health`.
 - If Ollama/model is not available, the UI should show a clean backend/model error instead of breaking.
+
+In another terminal, run:
+
+```bash
+cd ai-backend
+npm run health
+```
+
+Expected:
+
+- The command says whether the backend root, health route, and Ollama/model are ready.
+- If Ollama is not ready, the backend can still be running while `ai.ok` is false.
 
 ### Load the extension
 
@@ -24,9 +37,11 @@ Expected:
 2. Go to `chrome://extensions`.
 3. Enable Developer mode.
 4. Click `Load unpacked`.
-5. Select the project root: `buglens-extension`.
-6. Open a normal web page, not `chrome://`, Chrome Web Store, or browser internal pages.
-7. Open DevTools and select `TestPilot`.
+5. Select the project root folder that contains `manifest.json`: `buglens-extension`.
+6. Do not select `ai-backend`, `devtools`, `popup`, or any subfolder.
+7. Open a normal web page, not `chrome://`, Chrome Web Store, or browser internal pages.
+8. Reload the page if it was already open before installing the extension.
+9. Open DevTools and select `TestPilot`; it may be under the DevTools `»` overflow menu.
 
 Expected:
 

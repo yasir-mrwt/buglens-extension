@@ -2,6 +2,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 
 loadEnvFile();
+assertRuntime();
 
 const CONFIG = {
   provider: 'ollama',
@@ -195,6 +196,19 @@ const server = http.createServer(async (req, res) => {
   }
 
   try {
+    if (req.method === 'GET' && isRootRoute(req.url)) {
+      sendJson(res, 200, {
+        ok: true,
+        service: 'testpilot-ai-backend',
+        message: 'TestPilot AI backend is running.',
+        backendUrl: `http://localhost:${CONFIG.port}`,
+        healthCheck: `http://localhost:${CONFIG.port}/api/health`,
+        provider: CONFIG.provider,
+        model: getConfiguredModelName()
+      });
+      return;
+    }
+
     if (req.method === 'GET' && req.url === '/api/health') {
       const health = await getProviderHealth();
       sendJson(res, 200, {
@@ -243,10 +257,35 @@ server.listen(CONFIG.port, () => {
   console.log(`Backend URL: http://localhost:${CONFIG.port}`);
   console.log(`Health check: http://localhost:${CONFIG.port}/api/health`);
   console.log(`Provider: ${CONFIG.provider}; model: ${getConfiguredModelName()}`);
+  console.log('Tip: open the Health check URL above. The root URL now returns a backend status JSON.');
   if (CONFIG.requestedProvider !== CONFIG.provider) {
     console.log(`Remote provider "${CONFIG.requestedProvider}" is disabled; TestPilot is using local Ollama only.`);
   }
 });
+
+server.on('error', (error) => {
+  if (error && error.code === 'EADDRINUSE') {
+    console.error(`TestPilot AI backend could not start because port ${CONFIG.port} is already in use.`);
+    console.error(`Stop the other process or start this backend with another port, for example: PORT=8788 npm start`);
+  } else {
+    console.error('TestPilot AI backend failed to start:', error && error.message ? error.message : error);
+  }
+  process.exit(1);
+});
+
+function assertRuntime() {
+  const major = Number(String(process.versions.node || '0').split('.')[0]);
+  if (!Number.isFinite(major) || major < 18) {
+    console.error(`TestPilot AI backend requires Node.js 18 or newer. Current Node.js: ${process.version}`);
+    console.error('Install a newer Node.js version, then run: cd ai-backend && npm start');
+    process.exit(1);
+  }
+}
+
+function isRootRoute(url) {
+  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '') || '/';
+  return pathname === '/';
+}
 
 function isChatRoute(url) {
   const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');

@@ -12,19 +12,35 @@ AI_PROVIDER=ollama
 
 ## Setup
 
-1. Start Ollama locally and make sure the configured model is available.
-2. Start this backend:
+1. Install Node.js 18 or newer.
+2. Start Ollama locally and make sure the configured model is available:
+
+   ```bash
+   ollama pull llama3.2:3b
+   ```
+
+3. Start this backend:
 
    ```bash
    cd ai-backend
+   npm install
    npm start
    ```
 
-3. Check health:
+4. Check health from another terminal:
 
    ```bash
+   curl http://localhost:8787
    curl http://localhost:8787/api/health
+   npm run health
    ```
+
+Expected:
+
+- `http://localhost:8787` returns a JSON status page.
+- `/api/health` returns `{ "ok": true, ... }` for the backend.
+- `ai.ok` is `true` only when Ollama is running and the configured model is available.
+- If `ai.ok` is `false`, the backend is still running, but AI chat/test/report generation will use errors or fallbacks until Ollama is fixed.
 
 ## Environment
 
@@ -44,9 +60,11 @@ Ollama is the active provider, so normal chat and analysis do not call external 
 ## Endpoints
 
 ```text
+GET  /
 GET  /api/health
 POST /api/ai/analyze-session
 POST /api/ai/chat
+POST /api/ai/chat-stream
 POST /api/ai/generate-bug-report
 POST /api/ai/generate-test-cases
 ```
@@ -54,6 +72,39 @@ POST /api/ai/generate-test-cases
 `/api/ai/chat` powers the default AI Chat screen. It accepts a tester question plus a sanitized QA context and returns an evidence-aware answer. If the configured provider is slow or unavailable, the backend returns a deterministic fallback so the extension can still guide the tester.
 
 The chat context may include explicit page attachments such as selected text, visible page summary, or a priority TestPilot finding. Jira ticket requests should return copy-ready text with title, severity, priority, environment, affected URL, reproduction steps, expected/actual results, evidence, user impact, developer notes, and QA notes.
+
+## Troubleshooting
+
+### `http://localhost:8787` does not open
+
+The backend is not running, crashed, or started on another port. Run:
+
+```bash
+cd ai-backend
+npm start
+```
+
+If the port is busy, stop the other process or run:
+
+```bash
+PORT=8788 npm start
+```
+
+Then update the extension Settings -> AI Provider -> Base URL to `http://localhost:8788`.
+
+### `/api/health` opens but `ai.ok` is false
+
+The backend is reachable, but Ollama/model is not ready. Run:
+
+```bash
+ollama serve
+ollama pull llama3.2:3b
+npm run health
+```
+
+### Chrome extension does not show in DevTools
+
+That is separate from the backend. Load the project root folder containing `manifest.json` in `chrome://extensions`, reload the extension, reload the inspected page, then close and reopen DevTools. The TestPilot panel may be inside the DevTools `»` overflow menu.
 
 ## Privacy
 

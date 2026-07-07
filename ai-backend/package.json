@@ -6,7 +6,8 @@
   "description": "Local TestPilot AI backend for Ollama-powered QA analysis.",
   "scripts": {
     "start": "node server.js",
-    "dev": "node server.js"
+    "dev": "node server.js",
+    "health": "node scripts/health-check.js"
   },
   "engines": {
     "node": ">=18"

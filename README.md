@@ -57,17 +57,20 @@ Stopping a session pauses capture but keeps results available for review and exp
 
 - Google Chrome 116 or newer
 - A normal `http://` or `https://` page that extensions are allowed to inspect
-- No Node.js, package installation, server, or build command is required
+- No build step is required for the Chrome extension UI
+- Optional AI Chat/Agent answers require Node.js 18 or newer, Ollama, and the local backend in `ai-backend`
 
 ## Install
 
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
-4. Select the cloned or downloaded `testpilot-extension` project folder.
-
+4. Select the project root folder that contains `manifest.json`.
+   - In this workspace, select `buglens-extension`.
+   - Do **not** select `ai-backend`, `devtools`, `popup`, or any subfolder.
 5. Confirm **TestPilot QA Agent** appears without manifest errors.
 6. Reload any page that was already open before the extension was installed.
+7. Open or reopen Chrome DevTools on a normal web page and select the **TestPilot** panel. It may be under the DevTools `»` overflow menu.
 
 After editing extension files, click the extension's **Reload** button on `chrome://extensions`, then reload the inspected page and reopen DevTools.
 
@@ -290,6 +293,7 @@ Start Ollama and the backend:
 ```bash
 ollama pull llama3.2:3b
 cd ai-backend
+npm install
 npm start
 ```
 
@@ -297,7 +301,14 @@ Health check:
 
 ```bash
 curl http://localhost:8787/api/health
+npm run health
 ```
+
+Expected:
+
+- `http://localhost:8787` returns JSON saying the TestPilot backend is running.
+- `http://localhost:8787/api/health` returns backend health plus Ollama/model status.
+- If the backend is running but Ollama is not ready, the extension can still load, but AI answers will show a model/backend error until Ollama is fixed.
 
 AI endpoints:
 
@@ -336,7 +347,45 @@ Attached context is sanitized, truncated, shown in the AI tab, and included in J
 
 ### TestPilot panel is missing
 
-Reload the extension on `chrome://extensions`, close and reopen DevTools, then check the DevTools `»` menu.
+Use this exact checklist:
+
+1. Confirm the loaded folder is the project root that contains `manifest.json`.
+2. On `chrome://extensions`, confirm **TestPilot QA Agent** has no red manifest/runtime errors.
+3. Click the extension **Reload** button.
+4. Reload the inspected web page.
+5. Close DevTools completely and reopen it.
+6. Check the DevTools `»` overflow menu for **TestPilot**.
+7. Do not test on `chrome://`, Chrome Web Store, browser settings, or DevTools pages.
+
+If the panel is still missing, open `chrome://extensions`, click **Errors** for TestPilot, and check for a DevTools registration error.
+
+### Backend URL or health check fails
+
+Run these commands from the project root:
+
+```bash
+cd ai-backend
+npm install
+npm start
+```
+
+In another terminal:
+
+```bash
+curl http://localhost:8787
+curl http://localhost:8787/api/health
+npm run health
+```
+
+Common causes:
+
+- Node.js is older than 18.
+- The backend terminal was closed.
+- Port `8787` is already in use.
+- Ollama is not running.
+- The model is missing. Run `ollama pull llama3.2:3b`.
+
+The extension can still appear in DevTools without the backend. The backend only powers AI responses.
 
 ### Console or UI status says unavailable
 

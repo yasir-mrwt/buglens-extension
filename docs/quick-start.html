@@ -28,5 +28,13 @@
     <p>Response body snippets are disabled by default, large or binary bodies are skipped, and sensitive headers and fields are redacted in reports.</p>
     <p>Framework noise does not increase the main issue count by default. CSV exports are formatted for Google Sheets without requiring Google OAuth.</p>
     <p>AI is optional. When used, TestPilot sends only a small sanitized session summary to the local backend at <code>http://localhost:8787</code>; raw headers, bodies, cookies, tokens, and screenshots are excluded.</p>
+    <h2>Install Reminder</h2>
+    <p>In <code>chrome://extensions</code>, load the project root folder that contains <code>manifest.json</code>. Do not load <code>ai-backend</code>, <code>devtools</code>, <code>popup</code>, or any subfolder.</p>
+    <p>If the TestPilot panel is not visible, reload the extension, reload the inspected page, close and reopen DevTools, then check the DevTools <strong>»</strong> overflow menu.</p>
+    <h2>Local AI Backend Check</h2>
+    <pre>cd ai-backend
+npm install
+npm start</pre>
+    <p>Then open <code>http://localhost:8787</code> or <code>http://localhost:8787/api/health</code>. You can also run <code>npm run health</code> from <code>ai-backend</code>.</p>
   </body>
 </html>
