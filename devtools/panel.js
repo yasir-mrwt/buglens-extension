@@ -2,6 +2,7 @@ const inspectedTabId = chrome.devtools.inspectedWindow.tabId;
 const port = chrome.runtime.connect({ name: 'testpilot-devtools' });
 const VERSION = '0.4.1';
 const SESSION_STORAGE_KEY = `testpilotSession:v4:${inspectedTabId}`;
+const LOCAL_SESSION_STORAGE_KEY = `testpilotSessionBackup:v4:${inspectedTabId}`;
 
 const AI_PROVIDER_DEFAULTS = {
   'local-backend': {
@@ -243,6 +244,9 @@ let autoUiScanTimer = null;
 let lastAutoUiScanAt = 0;
 let aiApiKeyTouched = false;
 let reportBuilderDirty = false;
+let forceNextAiChatScroll = false;
+const pendingAgentApprovals = new Map();
+const agentApprovalPreferences = new Map();
 
 const els = {
   startBtn: document.getElementById('startBtn'),
@@ -922,6 +926,7 @@ function toggleMenu() {
   if (!workspaceNav || !menuToggleBtn) return;
   const shouldOpen = arguments.length ? Boolean(arguments[0]) : !workspaceNav.classList.contains('open');
   workspaceNav.classList.toggle('open', shouldOpen);
+  if (document.body?.classList) document.body.classList.toggle('menu-open', shouldOpen);
   if (typeof menuToggleBtn.setAttribute === 'function') {
     menuToggleBtn.setAttribute('aria-expanded', String(shouldOpen));
   }
@@ -957,6 +962,7 @@ function addChatModeSeparator(mode) {
   });
   state.ai.chatMessages = state.ai.chatMessages.slice(-24);
   schedulePersist();
+  forceNextAiChatScroll = true;
   renderAiChatMessages();
 }
 
@@ -1031,7 +1037,11 @@ function createEmptyNetworkStats() {
 async function restoreSession() {
   try {
     const stored = await chrome.storage.session.get(SESSION_STORAGE_KEY);
-    const saved = stored[SESSION_STORAGE_KEY];
+    let saved = stored[SESSION_STORAGE_KEY];
+    if (!saved || typeof saved !== 'object') {
+      const backup = await chrome.storage.local.get(LOCAL_SESSION_STORAGE_KEY);
+      saved = backup[LOCAL_SESSION_STORAGE_KEY];
+    }
     if (!saved || typeof saved !== 'object') return;
 
     Object.assign(state, {
@@ -1259,7 +1269,7 @@ async function clearSession() {
   state.duplicateCache = new Map();
   recentEvidenceEvents = [];
   await setContentSession(null);
-  await chrome.storage.session.remove(SESSION_STORAGE_KEY);
+  await removeStoredSessionSnapshot();
   render();
   showToast('Temporary session cleared.', 'success');
 }
@@ -1308,9 +1318,32 @@ async function persistSession() {
 
   try {
     const serializable = buildSessionSnapshot();
-    await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: serializable });
+    await setStoredSessionSnapshot(serializable);
   } catch (error) {
     console.warn('[TestPilot] Session persistence failed:', error && error.message ? error.message : error);
+  }
+}
+
+async function setStoredSessionSnapshot(serializable) {
+  try {
+    await chrome.storage.session.set({ [SESSION_STORAGE_KEY]: serializable });
+    return;
+  } catch (error) {
+    console.warn('[TestPilot] Session storage failed, using local backup:', error && error.message ? error.message : error);
+  }
+  await chrome.storage.local.set({ [LOCAL_SESSION_STORAGE_KEY]: serializable });
+}
+
+async function removeStoredSessionSnapshot() {
+  try {
+    await chrome.storage.session.remove(SESSION_STORAGE_KEY);
+  } catch (error) {
+    console.warn('[TestPilot] Session storage clear failed:', error && error.message ? error.message : error);
+  }
+  try {
+    await chrome.storage.local.remove(LOCAL_SESSION_STORAGE_KEY);
+  } catch (error) {
+    console.warn('[TestPilot] Local session backup clear failed:', error && error.message ? error.message : error);
   }
 }
 
@@ -1366,7 +1399,7 @@ function compactAiStateForStorage(ai) {
   return {
     status: safeAi.status || 'not-configured',
     lastCheckedAt: safeAi.lastCheckedAt || null,
-    analysis: compactStorageValue(safeAi.analysis, 0),
+    analysis: compactAiAnalysisForStorage(safeAi.analysis),
     lastTask: safeAi.lastTask || '',
     activeMode: normalizeAiMode(safeAi.activeMode),
     chatMessages: boundedArray(safeAi.chatMessages, 20).map((message) => ({
@@ -1376,9 +1409,25 @@ function compactAiStateForStorage(ai) {
       timestamp: message && message.timestamp ? message.timestamp : Date.now(),
       streaming: false
     })),
-    lastAgentResult: compactStorageValue(safeAi.lastAgentResult, 0),
+    lastAgentResult: summarizeAgentResultForAi(safeAi.lastAgentResult),
     error: safeAi.error || '',
     log: boundedArray(safeAi.log, MAX_PERSISTED_AI_LOGS)
+  };
+}
+
+function compactAiAnalysisForStorage(analysis) {
+  if (!analysis || typeof analysis !== 'object') return null;
+  return {
+    qaHealth: analysis.qaHealth || 'needs_review',
+    executiveSummary: String(analysis.executiveSummary || '').slice(0, 1200),
+    actionableIssues: boundedArray(analysis.actionableIssues, 8).map((item) => compactStorageValue(item, 0)),
+    likelyFalsePositives: boundedArray(analysis.likelyFalsePositives, 8).map((item) => compactStorageValue(item, 0)),
+    needsReview: boundedArray(analysis.needsReview, 8).map((item) => compactStorageValue(item, 0)),
+    recommendedNextTests: boundedArray(analysis.recommendedNextTests, 10).map((item) => String(item || '').slice(0, 400)),
+    testCases: boundedArray(analysis.testCases, 8).map((item) => compactStorageValue(item, 0)),
+    bugReportDrafts: boundedArray(analysis.bugReportDrafts, 8).map((item) => compactStorageValue(item, 0)),
+    managerSummary: String(analysis.managerSummary || '').slice(0, 1200),
+    developerSummary: String(analysis.developerSummary || '').slice(0, 1200)
   };
 }
 
@@ -1888,8 +1937,13 @@ function checkDuplicateCall(method, url, body, evidence) {
 }
 
 function handleContentEvent(message) {
+  if (!message || typeof message !== 'object') return;
+  if (message.kind === 'agent-event') {
+    handleAgentEvent(message.payload || {}, message.sessionId);
+    return;
+  }
   if (!state.active) return;
-  if (!message || message.kind !== 'console') return;
+  if (message.kind !== 'console') return;
   if (!state.sessionId || message.sessionId !== state.sessionId) return;
   const payload = message.payload || {};
   if (payload.timestamp && state.startedAt && payload.timestamp < state.startedAt) return;
@@ -1936,6 +1990,97 @@ function analyzeConsolePayload(payload) {
     url: payload.url || state.pageUrl,
     timestamp: payload.timestamp || Date.now()
   };
+}
+
+function handleAgentEvent(payload, sessionId) {
+  if (!payload || typeof payload !== 'object') return;
+  if (state.sessionId && sessionId && sessionId !== state.sessionId) return;
+  const requestKey = String(payload.requestKey || '');
+  if (!requestKey) return;
+  const event = String(payload.event || 'progress');
+  const live = getOrCreateAgentLiveMessage(requestKey);
+  live.timestamp = Date.now();
+  live.status = event;
+  live.taskType = payload.taskType || live.taskType || '';
+  live.summary = payload.summary || live.summary || '';
+  live.lines = Array.isArray(live.lines) ? live.lines : [];
+
+  const line = formatAgentEventLine(event, payload);
+  if (line) {
+    live.lines.push(line);
+    live.lines = live.lines.slice(-10);
+  }
+
+  if (event === 'permission-required') {
+    const approval = payload.approval || {};
+    pendingAgentApprovals.set(requestKey, {
+      requestKey,
+      stepFingerprint: approval.stepFingerprint || '',
+      resumeFromStepIndex: Number(approval.resumeFromStepIndex || 0),
+      command: approval.command || payload.command || '',
+      taskType: approval.taskType || payload.taskType || '',
+      reasons: approval.reasons || payload.needsConfirmation || [],
+      warning: approval.warning || 'This action needs tester approval before TestPilot continues.',
+      inputSummary: approval.inputSummary || [],
+      pendingAction: approval.pendingAction || null,
+      previousActionResults: approval.previousActionResults || [],
+      rememberable: Boolean(approval.rememberable),
+      preferenceScope: approval.preferenceScope || null
+    });
+    addAgentPermissionMessage(requestKey);
+  }
+
+  if (event === 'completed' || event === 'blocked') {
+    live.done = true;
+  }
+
+  state.ai.chatMessages = boundedArray(state.ai.chatMessages, 24);
+  renderAiChatMessages();
+}
+
+function getOrCreateAgentLiveMessage(requestKey) {
+  state.ai.chatMessages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  let message = state.ai.chatMessages.find((item) => item.type === 'agent-live' && item.requestKey === requestKey);
+  if (!message) {
+    message = {
+      role: 'assistant',
+      type: 'agent-live',
+      requestKey,
+      text: 'Preparing Agent workflow...',
+      lines: [],
+      timestamp: Date.now()
+    };
+    state.ai.chatMessages.push(message);
+  }
+  return message;
+}
+
+function formatAgentEventLine(event, payload) {
+  const step = Number(payload.stepNumber || Number(payload.stepIndex || 0) + 1);
+  const target = payload.targetLabel ? ` on ${payload.targetLabel}` : (payload.targetIndex ? ` on #${payload.targetIndex}` : '');
+  if (event === 'started') return `Started ${String(payload.taskType || 'agent task').replace(/_/g, ' ')}.`;
+  if (event === 'plan-ready') return `Created a safe plan with ${Number(payload.totalSteps || (payload.steps || []).length || 0)} step(s).`;
+  if (event === 'step-started') return `Step ${step}: ${payload.action}${target}. ${payload.reason || ''}`.trim();
+  if (event === 'field-updated') return `${capitalize(payload.action || 'update')}${target}: ${payload.valuePreview || payload.message || 'updated'}.`;
+  if (event === 'step-completed') return `${payload.success ? 'Done' : 'Needs review'} step ${step}: ${payload.message || payload.action || 'step completed'}`;
+  if (event === 'permission-required') return 'Paused for tester approval before a serious action.';
+  if (event === 'approval-granted') return 'Tester approved once. Continuing the preflighted task.';
+  if (event === 'blocked') return `Blocked: ${payload.summary || 'The planned action was not safe to run.'}`;
+  if (event === 'completed') return `Completed with ${payload.passed || 0} passed and ${payload.failed || 0} needs-review/failed step(s).`;
+  return payload.message || '';
+}
+
+function addAgentPermissionMessage(requestKey) {
+  if (state.ai.chatMessages.some((item) => item.type === 'agent-permission' && item.requestKey === requestKey)) return;
+  const approval = pendingAgentApprovals.get(requestKey);
+  state.ai.chatMessages.push({
+    role: 'assistant',
+    type: 'agent-permission',
+    requestKey,
+    text: 'Permission required',
+    timestamp: Date.now(),
+    approval
+  });
 }
 
 async function runUiScan(options = {}) {
@@ -2601,6 +2746,13 @@ function renderAiState() {
 function renderAiChatMessages() {
   if (!els.aiChatMessages) return;
   const messages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+  const previousScrollHeight = Number(els.aiChatMessages.scrollHeight || 0);
+  const previousScrollTop = Number(els.aiChatMessages.scrollTop || 0);
+  const previousClientHeight = Number(els.aiChatMessages.clientHeight || 0);
+  const distanceFromBottom = Math.max(0, previousScrollHeight - previousScrollTop - previousClientHeight);
+  const wasNearBottom = distanceFromBottom < 48;
+  const shouldStickToBottom = wasNearBottom;
+  forceNextAiChatScroll = false;
   if (typeof els.aiChatMessages.replaceChildren === 'function') {
     els.aiChatMessages.replaceChildren();
   } else {
@@ -2612,6 +2764,7 @@ function renderAiChatMessages() {
     empty.className = 'testpilot-empty-chat';
     empty.textContent = 'Tell TestPilot what to test on this page.';
     els.aiChatMessages.appendChild(empty);
+    if (shouldStickToBottom) els.aiChatMessages.scrollTop = els.aiChatMessages.scrollHeight;
     return;
   }
 
@@ -2621,6 +2774,14 @@ function renderAiChatMessages() {
       separator.className = 'ai-chat-separator';
       separator.textContent = message.text || 'Mode changed';
       els.aiChatMessages.appendChild(separator);
+      continue;
+    }
+    if (message.type === 'agent-live') {
+      els.aiChatMessages.appendChild(renderAgentLiveMessage(message));
+      continue;
+    }
+    if (message.type === 'agent-permission') {
+      els.aiChatMessages.appendChild(renderAgentPermissionMessage(message));
       continue;
     }
     const article = document.createElement('article');
@@ -2647,7 +2808,100 @@ function renderAiChatMessages() {
     els.aiChatMessages.appendChild(thinking);
   }
 
-  els.aiChatMessages.scrollTop = els.aiChatMessages.scrollHeight;
+  if (shouldStickToBottom) {
+    els.aiChatMessages.scrollTop = els.aiChatMessages.scrollHeight;
+  } else {
+    els.aiChatMessages.scrollTop = Math.max(0, Number(els.aiChatMessages.scrollHeight || 0) - previousClientHeight - distanceFromBottom);
+  }
+}
+
+function renderAgentLiveMessage(message) {
+  const article = document.createElement('article');
+  article.className = `ai-chat-message assistant agent-live${message.done ? ' done' : ''}`;
+  const label = document.createElement('span');
+  label.textContent = 'TestPilot Agent';
+  const body = document.createElement('div');
+  body.className = 'ai-chat-message-body';
+  const title = document.createElement('strong');
+  title.textContent = message.done ? 'Agent workflow complete' : 'Agent is working';
+  const summary = document.createElement('p');
+  summary.textContent = message.summary || 'Running safe browser actions on the inspected page.';
+  const list = document.createElement('ul');
+  for (const line of (message.lines || []).slice(-8)) {
+    const item = document.createElement('li');
+    item.textContent = line;
+    list.appendChild(item);
+  }
+  body.append(title, summary, list);
+  article.append(label, body);
+  return article;
+}
+
+function renderAgentPermissionMessage(message) {
+  const approval = pendingAgentApprovals.get(message.requestKey) || message.approval || {};
+  const article = document.createElement('article');
+  article.className = 'ai-chat-message assistant agent-permission';
+  const label = document.createElement('span');
+  label.textContent = 'TestPilot Agent';
+  const body = document.createElement('div');
+  body.className = 'ai-chat-message-body';
+  const title = document.createElement('strong');
+  title.textContent = 'Permission required';
+  const copy = document.createElement('p');
+  copy.textContent = approval.warning || 'This action needs tester approval before TestPilot continues.';
+  const inputSummary = Array.isArray(approval.inputSummary) ? approval.inputSummary : [];
+  if (inputSummary.length) {
+    const inputTitle = document.createElement('p');
+    inputTitle.className = 'agent-permission-subtitle';
+    inputTitle.textContent = 'Prepared inputs';
+    const inputList = document.createElement('ul');
+    inputList.className = 'agent-permission-inputs';
+    for (const input of inputSummary.slice(0, 8)) {
+      const item = document.createElement('li');
+      const label = input.targetLabel || (input.targetIndex ? `Target #${input.targetIndex}` : 'Target field');
+      item.textContent = `${label}: ${input.valuePreview || '(updated)'}`;
+      inputList.appendChild(item);
+    }
+    body.append(title, copy, inputTitle, inputList);
+  } else {
+    body.append(title, copy);
+  }
+  if (approval.pendingAction) {
+    const pending = document.createElement('p');
+    pending.className = 'agent-permission-next';
+    const label = approval.pendingAction.targetLabel || (approval.pendingAction.targetIndex ? `#${approval.pendingAction.targetIndex}` : 'target');
+    pending.textContent = `Next action: ${approval.pendingAction.action || 'continue'} ${label ? `on ${label}` : ''}. TestPilot will continue automatically from here after approval.`;
+    body.appendChild(pending);
+  }
+  const list = document.createElement('ul');
+  for (const reason of (approval.reasons || []).slice(0, 5)) {
+    const item = document.createElement('li');
+    item.textContent = reason;
+    list.appendChild(item);
+  }
+  const actions = document.createElement('div');
+  actions.className = 'agent-permission-actions';
+  const allow = document.createElement('button');
+  allow.className = 'primary';
+  allow.type = 'button';
+  allow.textContent = 'Continue Once';
+  allow.addEventListener('click', () => approveAgentPermission(message.requestKey));
+  if (approval.rememberable) {
+    const remember = document.createElement('button');
+    remember.type = 'button';
+    remember.textContent = 'Allow Similar This Session';
+    remember.addEventListener('click', () => approveAgentPermission(message.requestKey, { remember: true }));
+    actions.appendChild(remember);
+  }
+  const cancel = document.createElement('button');
+  cancel.type = 'button';
+  cancel.textContent = 'Cancel';
+  cancel.addEventListener('click', () => denyAgentPermission(message.requestKey));
+  actions.prepend(allow);
+  actions.appendChild(cancel);
+  body.append(list, actions);
+  article.append(label, body);
+  return article;
 }
 
 async function submitAiChat(value) {
@@ -2658,6 +2912,7 @@ async function submitAiChat(value) {
   state.ai.chatMessages.push({ role: 'user', text: question, timestamp: Date.now() });
   state.ai.chatMessages = state.ai.chatMessages.slice(-20);
   aiChatBusy = true;
+  forceNextAiChatScroll = true;
   render();
 
   if (isTestCaseGenerationPrompt(question)) {
@@ -2708,10 +2963,12 @@ async function submitAiChat(value) {
     const providerResponse = await completeChatWithSelectedProvider(question, {
       onToken(token) {
         streamingMessage.text += token;
+        forceNextAiChatScroll = false;
         renderAiChatMessages();
       },
       onReplace(text) {
         streamingMessage.text = text;
+        forceNextAiChatScroll = false;
         renderAiChatMessages();
       }
     });
@@ -2902,8 +3159,9 @@ function isBugReportGenerationPrompt(value) {
     && /\b(bug reports?|defect reports?|issue reports?|jira ticket|bug draft|defect draft)\b/.test(text);
 }
 
-async function runAgentCommand(command) {
+async function runAgentCommand(command, options = {}) {
   try {
+    const approval = options.approval || null;
     const result = await sendTabMessage({
       type: 'TESTPILOT_RUN_AGENT',
       command,
@@ -2912,20 +3170,55 @@ async function runAgentCommand(command) {
         sessionId: state.sessionId,
         pageUrl: state.pageUrl,
         contextMode: state.settings.aiContextMode || 'fast',
-        history: (state.ai.chatMessages || []).slice(-6)
+        history: (state.ai.chatMessages || []).slice(-6),
+        approval
       }
     });
     if (!result.ok || !result.response || !result.response.ok) {
       throw new Error((result.response && result.response.error) || result.error || 'Agent could not connect to the inspected page.');
     }
+    const rawAgentResult = result.response.result;
+    if (rawAgentResult?.safety?.requiresConfirmation) {
+      const requestKey = rawAgentResult.requestKey || rawAgentResult.safety?.requestKey || '';
+      const approvalPayload = rawAgentResult.safety.approval || rawAgentResult.approval || null;
+      if (requestKey && !pendingAgentApprovals.has(requestKey)) {
+        pendingAgentApprovals.set(requestKey, {
+          requestKey,
+          stepFingerprint: approvalPayload?.stepFingerprint || '',
+          resumeFromStepIndex: Number(approvalPayload?.resumeFromStepIndex || 0),
+          command: approvalPayload?.command || command,
+          taskType: approvalPayload?.taskType || rawAgentResult.taskType || '',
+          reasons: approvalPayload?.reasons || rawAgentResult.safety.needsConfirmation || [],
+          warning: approvalPayload?.warning || 'Review the filled inputs below. TestPilot will continue only after tester approval.',
+          inputSummary: approvalPayload?.inputSummary || [],
+          pendingAction: approvalPayload?.pendingAction || null,
+          previousActionResults: approvalPayload?.previousActionResults || [],
+          rememberable: Boolean(approvalPayload?.rememberable),
+          preferenceScope: approvalPayload?.preferenceScope || null
+        });
+        addAgentPermissionMessage(requestKey);
+      }
+      const pendingApproval = pendingAgentApprovals.get(requestKey) || approvalPayload;
+      if (pendingApproval && shouldAutoApproveAgent(pendingApproval)) {
+        markAgentPermissionMessage(requestKey, 'Auto-approved for this session preference. Continuing the prepared Agent task.');
+        addAiLog(`agent auto-approved by session preference: ${rawAgentResult.taskType || 'task'}`);
+        await runAgentCommand(command, {
+          approval: buildAgentApprovalPayload(requestKey, 'Session preference allowed a similar safe action.', pendingApproval)
+        });
+        return;
+      }
+      addAiLog(`agent paused for approval: ${rawAgentResult.taskType || 'task'}`);
+      return;
+    }
     await waitForPanel(650);
-    const agentResult = linkEvidenceToAgentResult(result.response.result);
+    const agentResult = linkEvidenceToAgentResult(rawAgentResult);
     state.ai.lastAgentResult = agentResult;
     state.ai.chatMessages.push({
       role: 'assistant',
       text: formatAgentResultForChat(agentResult),
       timestamp: Date.now()
     });
+    forceNextAiChatScroll = true;
     addAiLog(`agent ${agentResult.taskType || 'task'} completed: ${agentResult.result?.status || 'needs_review'}`);
   } catch (error) {
     state.ai.chatMessages.push({
@@ -2939,6 +3232,89 @@ async function runAgentCommand(command) {
     state.ai.chatMessages = state.ai.chatMessages.slice(-20);
     schedulePersist();
     render();
+  }
+}
+
+function approveAgentPermission(requestKey, options = {}) {
+  const approval = pendingAgentApprovals.get(requestKey);
+  if (!approval || aiChatBusy) return;
+  if (options.remember && approval.rememberable) {
+    const preferenceKey = buildAgentApprovalPreferenceKey(approval);
+    if (preferenceKey) {
+      agentApprovalPreferences.set(preferenceKey, {
+        createdAt: Date.now(),
+        taskType: approval.taskType || '',
+        warning: approval.warning || ''
+      });
+    }
+  }
+  pendingAgentApprovals.delete(requestKey);
+  markAgentPermissionMessage(
+    requestKey,
+    options.remember
+      ? 'Approved. Similar safe actions on this page will continue automatically for this session.'
+      : 'Approved once. Continuing the exact preflighted Agent task.'
+  );
+  aiChatBusy = true;
+  forceNextAiChatScroll = true;
+  renderAiChatMessages();
+  void runAgentCommand(approval.command, {
+    approval: buildAgentApprovalPayload(requestKey, options.remember ? 'Tester allowed similar safe actions for this session.' : 'Tester approved once from TestPilot panel.', approval)
+  });
+}
+
+function buildAgentApprovalPayload(requestKey, reason, approval = {}) {
+  return {
+    approved: true,
+    requestKey,
+    stepFingerprint: approval.stepFingerprint || '',
+    resumeFromStepIndex: Number(approval.resumeFromStepIndex || 0),
+    previousActionResults: Array.isArray(approval.previousActionResults) ? approval.previousActionResults : [],
+    approvedAt: Date.now(),
+    reason
+  };
+}
+
+function shouldAutoApproveAgent(approval) {
+  const preferenceKey = buildAgentApprovalPreferenceKey(approval);
+  return Boolean(preferenceKey && agentApprovalPreferences.has(preferenceKey));
+}
+
+function buildAgentApprovalPreferenceKey(approval) {
+  if (!approval || !approval.rememberable || !approval.preferenceScope) return '';
+  const scope = approval.preferenceScope;
+  return [
+    scope.pageOrigin || '',
+    scope.pagePath || '',
+    scope.taskType || approval.taskType || '',
+    scope.category || '',
+    scope.targetLabel || ''
+  ].map((part) => String(part || '').toLowerCase().trim()).join('|');
+}
+
+function denyAgentPermission(requestKey) {
+  const approval = pendingAgentApprovals.get(requestKey);
+  pendingAgentApprovals.delete(requestKey);
+  markAgentPermissionMessage(requestKey, 'Cancelled by tester. No serious action was performed.');
+  state.ai.chatMessages.push({
+    role: 'assistant',
+    type: 'separator',
+    text: `Agent permission cancelled${approval?.taskType ? ` for ${String(approval.taskType).replace(/_/g, ' ')}` : ''}.`,
+    timestamp: Date.now()
+  });
+  aiChatBusy = false;
+  schedulePersist();
+  forceNextAiChatScroll = true;
+  renderAiChatMessages();
+}
+
+function markAgentPermissionMessage(requestKey, text) {
+  for (const message of state.ai.chatMessages || []) {
+    if (message.type === 'agent-permission' && message.requestKey === requestKey) {
+      message.type = 'separator';
+      message.text = text;
+      message.approval = null;
+    }
   }
 }
 
@@ -2988,11 +3364,26 @@ function linkEvidenceToAgentResult(agentResult) {
     actionResults: enrichedActions,
     linkedEvidence: linkedGroups,
     evidenceQuality: buildAgentEvidenceQuality(enrichedActions, linkedGroups, existingResult),
+    usedInputs: buildAgentUsedInputs(enrichedActions),
     result: {
       ...existingResult,
       evidence
     }
   };
+}
+
+function buildAgentUsedInputs(actionResults) {
+  return (actionResults || [])
+    .filter((item) => ['type', 'select', 'check', 'uncheck', 'clear'].includes(item.action))
+    .map((item) => ({
+      action: item.action,
+      targetIndex: item.targetIndex || null,
+      targetLabel: item.targetLabel || (item.targetIndex ? `Target #${item.targetIndex}` : 'Target field'),
+      valuePreview: item.valuePreview || (item.action === 'clear' ? '(cleared)' : ''),
+      success: Boolean(item.success)
+    }))
+    .filter((item) => item.targetIndex || item.targetLabel || item.valuePreview)
+    .slice(0, 12);
 }
 
 function buildAgentEvidenceQuality(actionResults, linkedGroups, result = {}) {
@@ -3060,6 +3451,16 @@ function formatAgentResultForChat(agentResult) {
       for (const evidence of (item.linkedEvidence || []).slice(0, 3)) {
         lines.push(`  - Linked ${evidence.summary}`);
       }
+    }
+    lines.push('');
+  }
+  const usedInputs = Array.isArray(agentResult.usedInputs) ? agentResult.usedInputs : buildAgentUsedInputs(actionResults);
+  if (usedInputs.length) {
+    lines.push('Inputs used:');
+    for (const item of usedInputs) {
+      const target = item.targetLabel || (item.targetIndex ? `Target #${item.targetIndex}` : 'Target field');
+      const value = item.valuePreview || (item.action === 'clear' ? '(cleared)' : '(updated)');
+      lines.push(`- ${target}: ${value} (${item.action}, ${item.success ? 'applied' : 'needs review'})`);
     }
     lines.push('');
   }
@@ -3476,18 +3877,28 @@ function renderBugDraftCard(draft) {
     steps.appendChild(item);
   }
 
-  const expected = document.createElement('p');
-  expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(draft.expectedResult || 'Expected behavior was not provided.')}`;
-  const actual = document.createElement('p');
-  actual.innerHTML = `<strong>Actual:</strong> ${escapeHtml(draft.actualResult || 'Actual behavior was not provided.')}`;
+  const expected = makeLabelledParagraph('Expected:', draft.expectedResult || 'Expected behavior was not provided.');
+  const actual = makeLabelledParagraph('Actual:', draft.actualResult || 'Actual behavior was not provided.');
   const evidence = document.createElement('p');
   evidence.className = 'bug-draft-evidence';
-  evidence.innerHTML = `<strong>Evidence:</strong> ${escapeHtml(draft.evidenceSummary || 'Evidence summary was not provided.')}`;
+  evidence.append(makeStrongLabel('Evidence:'), document.createTextNode(` ${draft.evidenceSummary || 'Evidence summary was not provided.'}`));
 
   article.append(meta, title);
   if (steps.children.length) article.appendChild(steps);
   article.append(expected, actual, evidence);
   return article;
+}
+
+function makeLabelledParagraph(label, value) {
+  const paragraph = document.createElement('p');
+  paragraph.append(makeStrongLabel(label), document.createTextNode(` ${value || ''}`));
+  return paragraph;
+}
+
+function makeStrongLabel(label) {
+  const strong = document.createElement('strong');
+  strong.textContent = label;
+  return strong;
 }
 
 function getCurrentBugDrafts() {
@@ -3591,12 +4002,9 @@ function makeBugDraftSection(drafts) {
       li.textContent = step;
       steps.appendChild(li);
     }
-    const expected = document.createElement('p');
-    expected.innerHTML = `<strong>Expected:</strong> ${escapeHtml(draft.expectedResult || 'Expected behavior was not provided.')}`;
-    const actual = document.createElement('p');
-    actual.innerHTML = `<strong>Actual:</strong> ${escapeHtml(draft.actualResult || 'Actual behavior was not provided.')}`;
-    const evidence = document.createElement('p');
-    evidence.innerHTML = `<strong>Evidence:</strong> ${escapeHtml(draft.evidenceSummary || 'No evidence summary provided.')}`;
+    const expected = makeLabelledParagraph('Expected:', draft.expectedResult || 'Expected behavior was not provided.');
+    const actual = makeLabelledParagraph('Actual:', draft.actualResult || 'Actual behavior was not provided.');
+    const evidence = makeLabelledParagraph('Evidence:', draft.evidenceSummary || 'No evidence summary provided.');
     article.append(title, severity, steps, expected, actual, evidence);
     section.appendChild(article);
   }

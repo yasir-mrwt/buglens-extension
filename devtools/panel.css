@@ -2054,6 +2054,10 @@ body {
   overflow-x: hidden;
 }
 
+body.menu-open {
+  overflow: hidden;
+}
+
 .app-layout {
   display: block;
   min-height: 100vh;
@@ -2272,6 +2276,7 @@ body[data-active-view="settings"] .testpilot-current-view [data-view-title="sett
   gap: 8px;
   width: min(340px, 92vw);
   height: 100vh;
+  height: 100dvh;
   min-width: 0;
   padding: 18px 16px 20px;
   border: 0;
@@ -2280,9 +2285,15 @@ body[data-active-view="settings"] .testpilot-current-view [data-view-title="sett
   background: linear-gradient(180deg, #fbfaf6 0%, var(--testpilot-cream) 100%);
   box-shadow: -20px 0 42px rgba(38, 35, 28, 0.18);
   opacity: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
   pointer-events: none;
   transform: translateX(105%);
   transition: transform 160ms ease, opacity 160ms ease;
+}
+
+body.menu-open .content {
+  overflow: hidden;
 }
 
 .qa-menu.open {
@@ -2589,6 +2600,28 @@ body[data-active-view="ai"] .testpilot-chat-panel {
   background: #f3f0e7;
 }
 
+.testpilot-chat-messages .ai-chat-message.agent-live,
+.testpilot-chat-messages .ai-chat-message.agent-permission {
+  width: min(82%, 680px);
+  max-width: min(82%, 680px);
+  border: 1px solid #d8d3c7;
+  background: #fbfaf6;
+}
+
+.testpilot-chat-messages .ai-chat-message.agent-live {
+  border-left: 4px solid #2563eb;
+}
+
+.testpilot-chat-messages .ai-chat-message.agent-live.done {
+  border-left-color: #16a34a;
+}
+
+.testpilot-chat-messages .ai-chat-message.agent-permission {
+  border-color: #fed7aa;
+  border-left: 4px solid #ea580c;
+  background: #fff7ed;
+}
+
 .testpilot-chat-messages .ai-chat-message span {
   display: none;
 }
@@ -2597,6 +2630,54 @@ body[data-active-view="ai"] .testpilot-chat-panel {
   color: inherit;
   font-size: 13px;
   line-height: 1.5;
+}
+
+.testpilot-chat-messages .ai-chat-message-body strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.testpilot-chat-messages .ai-chat-message-body p {
+  margin: 0 0 7px;
+  color: #475569;
+}
+
+.agent-permission-subtitle,
+.agent-permission-next {
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.agent-permission-inputs {
+  padding: 8px 10px 8px 24px !important;
+  border: 1px solid #fed7aa;
+  border-radius: 10px;
+  background: #fffaf3;
+}
+
+.testpilot-chat-messages .ai-chat-message-body ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding-left: 18px;
+}
+
+.testpilot-chat-messages .ai-chat-message-body li {
+  color: #334155;
+  font-size: 12px;
+}
+
+.agent-permission-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.agent-permission-actions button {
+  min-height: 32px;
+  padding: 5px 11px;
 }
 
 .testpilot-chat-messages .ai-chat-message.thinking .ai-chat-message-body::after {

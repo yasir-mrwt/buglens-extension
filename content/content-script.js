@@ -6,6 +6,7 @@
   const MAX_SELECTED_TEXT_LENGTH = 5000;
   const MAX_VISIBLE_SUMMARY_LENGTH = 3000;
   const MAX_AGENT_ELEMENTS = 80;
+  const AGENT_TYPE_DELAY_MS = 38;
   const ALLOWED_AGENT_ACTIONS = new Set(['click', 'type', 'clear', 'select', 'check', 'uncheck', 'scroll', 'highlight', 'wait', 'observe', 'navigate']);
   const SAFE_DUMMY_VALUES = {
     email: 'invalid-email',
@@ -150,11 +151,50 @@
     });
     const fallbackPlan = buildAgentPlan(userCommand, taskType, pageContext, { ...options, dataStrategy });
     const plan = normalizeStructuredAgentPlan(options.structuredPlan, fallbackPlan, taskType, pageContext);
-    const safety = validateAgentPlan(plan, pageContext);
-    const actionResults = [];
+    const approvalValid = isAgentApprovalTokenValid(options.approval, requestKey);
+    const resumeFromStepIndex = approvalValid
+      ? Math.min(Math.max(0, Number(options.approval.resumeFromStepIndex || 0)), plan.steps.length)
+      : 0;
+    emitAgentEvent('started', {
+      requestKey,
+      command: userCommand,
+      taskType,
+      dataStrategy,
+      summary: plan.summary,
+      totalSteps: plan.steps.length
+    });
+    emitAgentEvent('plan-ready', {
+      requestKey,
+      taskType,
+      summary: plan.summary,
+      steps: plan.steps.map((step, index) => describeAgentStepForEvent(step, index, pageContext))
+    });
+    const safety = validateAgentPlan(plan, pageContext, options.approval, requestKey);
+    const actionResults = approvalValid
+      ? sanitizePreviousAgentActionResults(options.approval.previousActionResults)
+      : [];
+    if (safety.approved) {
+      emitAgentEvent('approval-granted', {
+        requestKey,
+        taskType,
+        summary: resumeFromStepIndex > 0
+          ? `Tester approved once. Resuming at step ${resumeFromStepIndex + 1}.`
+          : 'Tester approved the preflighted serious action once. Continuing safely.'
+      });
+    }
 
     if (!safety.ok) {
       const result = evaluateAgentResult(plan, actionResults, observeAgentPage(pageContext), safety);
+      const approvalRequest = buildAgentApprovalRequest(userCommand, requestKey, taskType, safety, actionResults, plan, null, pageContext);
+      emitAgentEvent(safety.requiresConfirmation ? 'permission-required' : 'blocked', {
+        requestKey,
+        command: userCommand,
+        taskType,
+        summary: result.summary,
+        needsConfirmation: safety.needsConfirmation || [],
+        blocked: safety.blocked || [],
+        approval: approvalRequest
+      });
       return {
         command: userCommand,
         taskType,
@@ -163,21 +203,86 @@
         pageContext: compactAgentContextForResponse(pageContext),
         plan: { ...plan, riskLevel: safety.requiresConfirmation ? 'needs_confirmation' : 'blocked' },
         safety,
+        approval: approvalRequest,
         actionResults,
         result
       };
     }
 
-    for (let index = 0; index < plan.steps.length; index += 1) {
+    for (let index = resumeFromStepIndex; index < plan.steps.length; index += 1) {
       const step = plan.steps[index];
-      const actionResult = await executeAgentStep(step, index, pageContext);
+      const confirmation = getAgentStepConfirmation(step, pageContext);
+      if (confirmation && !isAgentStepApproved(step, pageContext, options.approval, requestKey)) {
+        const pauseSafety = {
+          ...safety,
+          ok: false,
+          requiresConfirmation: true,
+          needsConfirmation: [confirmation.reason],
+          blocked: []
+        };
+        const result = {
+          status: 'blocked',
+          summary: 'Agent paused before a serious action and is waiting for tester approval.',
+          passedChecks: actionResults.filter((item) => item.success).map((item) => `${item.action}: ${item.message}`),
+          failedChecks: [],
+          evidence: [confirmation.reason],
+          recommendedNextSteps: ['Approve once to continue this exact task, or cancel and use a narrower command.']
+        };
+        const approvalRequest = buildAgentApprovalRequest(userCommand, requestKey, taskType, pauseSafety, actionResults, plan, step, pageContext, index);
+        emitAgentEvent('permission-required', {
+          requestKey,
+          command: userCommand,
+          taskType,
+          summary: result.summary,
+          needsConfirmation: pauseSafety.needsConfirmation,
+          blocked: [],
+          approval: approvalRequest
+        });
+        return {
+          command: userCommand,
+          taskType,
+          dataStrategy,
+          requestKey,
+          pageContext: compactAgentContextForResponse(pageContext),
+          plan: { ...plan, riskLevel: 'needs_confirmation' },
+          safety: pauseSafety,
+          approval: approvalRequest,
+          actionResults,
+          observation: observeAgentPage(pageContext),
+          result
+        };
+      }
+      emitAgentEvent('step-started', {
+        requestKey,
+        ...describeAgentStepForEvent(step, index, pageContext)
+      });
+      const actionResult = await executeAgentStep(step, index, pageContext, requestKey);
       actionResults.push(actionResult);
+      emitAgentEvent('step-completed', {
+        requestKey,
+        stepIndex: index,
+        action: actionResult.action,
+        targetIndex: actionResult.targetIndex,
+        targetLabel: actionResult.targetLabel,
+        success: actionResult.success,
+        message: actionResult.message,
+        valuePreview: actionResult.valuePreview || '',
+        expectedObservation: step.expectedObservation || ''
+      });
       if (!actionResult.success && ['click', 'type', 'select', 'check', 'uncheck', 'navigate'].includes(step.action)) break;
       if (['click', 'navigate', 'select'].includes(step.action)) await waitForAgent(350);
     }
 
     const observation = observeAgentPage(pageContext);
     const result = evaluateAgentResult(plan, actionResults, observation, safety);
+    emitAgentEvent('completed', {
+      requestKey,
+      taskType,
+      status: result.status,
+      summary: result.summary,
+      passed: actionResults.filter((item) => item.success).length,
+      failed: actionResults.filter((item) => !item.success).length
+    });
     return {
       command: userCommand,
       taskType,
@@ -190,6 +295,117 @@
       observation,
       result
     };
+  }
+
+  function emitAgentEvent(event, payload = {}) {
+    sendToExtension('agent-event', {
+      event,
+      requestKey: payload.requestKey || '',
+      timestamp: Date.now(),
+      url: location.href,
+      ...payload
+    });
+  }
+
+  function describeAgentStepForEvent(step, index, context) {
+    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    return {
+      stepIndex: index,
+      stepNumber: index + 1,
+      action: step.action,
+      targetIndex: step.targetIndex || null,
+      targetLabel: target ? sanitizePageText(target.label || target.text || target.placeholder || target.role, 120) : '',
+      reason: step.reason || 'QA step',
+      expectedObservation: step.expectedObservation || '',
+      valuePreview: step.action === 'type' ? maskAgentTypedValue(step.value, target) : ''
+    };
+  }
+
+  function buildAgentApprovalRequest(command, requestKey, taskType, safety, actionResults = [], plan = {}, pendingStep = null, context = {}, pendingStepIndex = null) {
+    const confirmation = pendingStep ? getAgentStepConfirmation(pendingStep, context) : null;
+    const stepFingerprint = pendingStep ? getAgentStepApprovalFingerprint(pendingStep, context, confirmation) : '';
+    const resumeFromStepIndex = Number.isFinite(Number(pendingStepIndex)) ? Number(pendingStepIndex) : 0;
+    return {
+      command,
+      requestKey,
+      taskType,
+      stepFingerprint,
+      resumeFromStepIndex,
+      reasons: [...(safety.needsConfirmation || []), ...(safety.blocked || [])].slice(0, 8),
+      warning: 'Review the filled inputs below. TestPilot will continue only after tester approval.',
+      inputSummary: summarizeAgentInputsForApproval(actionResults),
+      previousActionResults: summarizeAgentActionResultsForApproval(actionResults),
+      pendingAction: pendingStep ? describeAgentStepForEvent(pendingStep, resumeFromStepIndex, context) : null,
+      rememberable: Boolean(confirmation && confirmation.rememberable),
+      preferenceScope: confirmation ? {
+        category: confirmation.category,
+        taskType,
+        pageOrigin: safePageOrigin(context.url || location.href),
+        pagePath: safePagePath(context.url || location.href),
+        targetLabel: confirmation.targetLabel || ''
+      } : null
+    };
+  }
+
+  function summarizeAgentActionResultsForApproval(actionResults = []) {
+    return actionResults.slice(0, 12).map((item) => ({
+      stepIndex: Number(item.stepIndex || 0),
+      action: sanitizePageText(item.action || '', 40),
+      targetIndex: item.targetIndex || null,
+      targetLabel: sanitizePageText(item.targetLabel || '', 120),
+      success: Boolean(item.success),
+      message: sanitizePageText(item.message || '', 260),
+      valuePreview: sanitizePageText(item.valuePreview || '', 200),
+      timestamp: item.timestamp || Date.now(),
+      startedAt: item.startedAt || item.timestamp || Date.now(),
+      completedAt: item.completedAt || Date.now()
+    }));
+  }
+
+  function sanitizePreviousAgentActionResults(actionResults = []) {
+    if (!Array.isArray(actionResults)) return [];
+    return actionResults.slice(0, 12).map((item) => ({
+      stepIndex: Number(item.stepIndex || 0),
+      action: sanitizePageText(item.action || '', 40),
+      targetIndex: item.targetIndex || null,
+      targetLabel: sanitizePageText(item.targetLabel || '', 120),
+      success: Boolean(item.success),
+      message: sanitizePageText(item.message || '', 260),
+      valuePreview: sanitizePageText(item.valuePreview || '', 200),
+      timestamp: Number(item.timestamp || item.startedAt || Date.now()),
+      startedAt: Number(item.startedAt || item.timestamp || Date.now()),
+      completedAt: Number(item.completedAt || Date.now())
+    }));
+  }
+
+  function summarizeAgentInputsForApproval(actionResults = []) {
+    return actionResults
+      .filter((item) => ['type', 'select', 'check', 'uncheck', 'clear'].includes(item.action))
+      .map((item) => ({
+        action: item.action,
+        targetIndex: item.targetIndex || null,
+        targetLabel: item.targetLabel || (item.targetIndex ? `Target #${item.targetIndex}` : 'Target field'),
+        valuePreview: item.valuePreview || (item.action === 'clear' ? '(cleared)' : ''),
+        success: Boolean(item.success)
+      }))
+      .slice(0, 12);
+  }
+
+  function safePageOrigin(url) {
+    try {
+      return new URL(url || location.href).origin;
+    } catch {
+      return '';
+    }
+  }
+
+  function safePagePath(url) {
+    try {
+      const parsed = new URL(url || location.href);
+      return `${parsed.pathname}${parsed.search ? '?query' : ''}`;
+    } catch {
+      return '';
+    }
   }
 
   function extractAgentPageContext() {
@@ -299,6 +515,7 @@
     if (tag === 'a' && element.hasAttribute && element.hasAttribute('download')) return 'download';
     if (tag === 'a') return 'link';
     if (tag === 'input' && inputType === 'file') return 'upload';
+    if (tag === 'input' && ['button', 'submit', 'reset'].includes(inputType)) return 'button';
     if (tag === 'input' && inputType === 'checkbox') return 'checkbox';
     if (tag === 'input' && inputType === 'radio') return 'radio';
     if (tag === 'input') return 'input';
@@ -591,35 +808,130 @@
     return sanitizePageText(String(value || SAFE_DUMMY_VALUES.generic), 200);
   }
 
-  function validateAgentPlan(plan, context) {
+  function validateAgentPlan(plan, context, approval = {}, requestKey = '') {
     const blocked = [];
-    const needsConfirmation = [];
+    const confirmations = [];
+    const approvalGranted = isAgentApprovalTokenValid(approval, requestKey);
     const indexed = new Map((context.elements || []).map((item) => [item.index, item]));
     for (const step of plan.steps || []) {
       const target = step.targetIndex ? indexed.get(step.targetIndex) : null;
-      const text = `${target?.text || ''} ${target?.label || ''} ${step.value || ''} ${step.url || ''}`.toLowerCase();
       if (step.targetIndex && !target) blocked.push(`Step target #${step.targetIndex} is not available.`);
       if (target && target.disabled) blocked.push(`Target #${target.index} is disabled.`);
-      if (/delete|remove|destroy|logout|log out|sign out|reset password|payment|checkout|pay now|purchase|subscribe|bank|billing/.test(text)) {
-        needsConfirmation.push(`Risky action blocked for target #${target?.index || 'unknown'}: ${target?.text || target?.label || step.action}`);
-      }
-      if (target && target.role === 'upload') needsConfirmation.push(`File upload requires explicit tester confirmation for target #${target.index}.`);
-      if (step.action === 'navigate' && step.url && !isSafeAgentLink(step.url)) {
-        needsConfirmation.push(`External navigation requires confirmation: ${step.url}`);
-      }
-      if (target && target.role === 'link' && target.href && !isSafeAgentLink(target.href)) {
-        needsConfirmation.push(`External or unsafe link requires confirmation: ${target.href}`);
+      const confirmation = getAgentStepConfirmation(step, context);
+      if (confirmation) {
+        confirmations.push({
+          reason: confirmation.reason,
+          fingerprint: getAgentStepApprovalFingerprint(step, context, confirmation)
+        });
       }
     }
+    const unresolvedConfirmation = approvalGranted
+      ? confirmations.filter((item) => item.fingerprint !== approval.stepFingerprint).map((item) => item.reason)
+      : confirmations.map((item) => item.reason);
     return {
-      ok: blocked.length === 0 && needsConfirmation.length === 0,
+      ok: blocked.length === 0,
       blocked,
-      requiresConfirmation: needsConfirmation.length > 0,
-      needsConfirmation
+      requiresConfirmation: unresolvedConfirmation.length > 0,
+      needsConfirmation: unresolvedConfirmation,
+      approved: approvalGranted && confirmations.length > unresolvedConfirmation.length
     };
   }
 
-  async function executeAgentStep(step, stepIndex, context) {
+  function isAgentApprovalTokenValid(approval, requestKey) {
+    return Boolean(approval
+      && approval.approved === true
+      && approval.requestKey
+      && String(approval.requestKey) === String(requestKey || '')
+      && typeof approval.stepFingerprint === 'string'
+      && approval.stepFingerprint);
+  }
+
+  function isAgentStepApproved(step, context, approval, requestKey) {
+    if (!isAgentApprovalTokenValid(approval, requestKey)) return false;
+    return getAgentStepApprovalFingerprint(step, context) === approval.stepFingerprint;
+  }
+
+  function getAgentStepConfirmationReason(step, context) {
+    return getAgentStepConfirmation(step, context)?.reason || '';
+  }
+
+  function getAgentStepConfirmation(step, context) {
+    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const text = `${target?.text || ''} ${target?.label || ''} ${step.value || ''} ${step.url || ''}`.toLowerCase();
+    const targetLabel = target?.text || target?.label || target?.placeholder || step.action;
+    if (target && target.role === 'upload') {
+      return {
+        reason: `File upload requires explicit tester confirmation for target #${target.index}.`,
+        category: 'file-upload',
+        rememberable: false,
+        targetLabel
+      };
+    }
+    if (step.action === 'navigate' && step.url && !isSafeAgentLink(step.url)) {
+      return {
+        reason: `External navigation requires confirmation: ${step.url}`,
+        category: 'external-navigation',
+        rememberable: false,
+        targetLabel: step.url
+      };
+    }
+    if (target && target.role === 'link' && target.href && !isSafeAgentLink(target.href)) {
+      return {
+        reason: `External or unsafe link requires confirmation: ${target.href}`,
+        category: 'external-navigation',
+        rememberable: false,
+        targetLabel: target.href
+      };
+    }
+    if (isAgentFormSubmitAction(step, target, context)) {
+      const destructive = isHighRiskAgentActionText(text);
+      return {
+        reason: `Form submit/continue requires approval for target #${target?.index || 'unknown'}: ${targetLabel}`,
+        category: destructive ? 'high-risk-action' : 'form-submit',
+        rememberable: !destructive,
+        targetLabel
+      };
+    }
+    if (['click', 'navigate', 'select', 'check', 'uncheck'].includes(step.action)
+      && /delete|remove|destroy|logout|log out|sign out|reset password|payment|checkout|pay now|purchase|subscribe|bank|billing|create account|register|sign up|signup|save changes|confirm order|place order/.test(text)) {
+      const destructive = isHighRiskAgentActionText(text);
+      return {
+        reason: `Serious action requires approval for target #${target?.index || 'unknown'}: ${targetLabel}`,
+        category: destructive ? 'high-risk-action' : 'form-submit',
+        rememberable: !destructive,
+        targetLabel
+      };
+    }
+    return null;
+  }
+
+  function isAgentFormSubmitAction(step, target, context) {
+    if (!step || step.action !== 'click' || !target) return false;
+    const text = `${target.text || ''} ${target.label || ''} ${target.type || ''}`.toLowerCase();
+    const formSubmitTargets = new Set((context.forms || []).flatMap((form) => form.submitButtons || []));
+    if (formSubmitTargets.has(target.index)) return true;
+    if (target.role !== 'button') return false;
+    if (/search|filter|sort|close|cancel|back|previous|prev|menu|tab/.test(text)) return false;
+    return /submit|continue|next|send|save|log in|login|sign in|sign up|signup|register|create account|place order|checkout|pay|purchase|apply/.test(text);
+  }
+
+  function isHighRiskAgentActionText(text) {
+    return /delete|remove|destroy|logout|log out|sign out|reset password|payment|checkout|pay now|purchase|subscribe|bank|billing|confirm order|place order/.test(String(text || '').toLowerCase());
+  }
+
+  function getAgentStepApprovalFingerprint(step, context, confirmation = null) {
+    const target = step && step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const resolvedConfirmation = confirmation || getAgentStepConfirmation(step, context) || {};
+    return simpleHash(JSON.stringify({
+      action: step?.action || '',
+      targetIndex: step?.targetIndex || null,
+      targetLabel: resolvedConfirmation.targetLabel || target?.label || target?.text || '',
+      category: resolvedConfirmation.category || '',
+      url: step?.url || ''
+    }));
+  }
+
+  async function executeAgentStep(step, stepIndex, context, requestKey) {
     const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
     const element = target ? getElementBySelector(target.selectorHint) : null;
     const startedAt = Date.now();
@@ -655,23 +967,71 @@
         return finish({ success: true, message: 'Page scrolled.' });
       }
       if (step.action === 'clear') {
+        highlightAgentElement(element, 900);
         setElementValue(element, '');
-        return finish({ success: true, message: 'Field cleared.' });
+        emitAgentEvent('field-updated', {
+          requestKey,
+          stepIndex,
+          targetIndex: step.targetIndex || null,
+          targetLabel: base.targetLabel,
+          action: 'clear',
+          valuePreview: '',
+          message: 'Field cleared.'
+        });
+        return finish({ success: true, message: 'Field cleared.', valuePreview: '' });
       }
       if (step.action === 'type') {
-        setElementValue(element, sanitizePageText(step.value || SAFE_DUMMY_VALUES.generic, 200));
-        return finish({ success: true, message: 'Safe QA value entered.' });
+        const value = sanitizePageText(step.value || SAFE_DUMMY_VALUES.generic, 200);
+        highlightAgentElement(element, Math.max(1200, value.length * AGENT_TYPE_DELAY_MS + 800));
+        await setElementValueAnimated(element, value, {
+          requestKey,
+          stepIndex,
+          targetIndex: step.targetIndex || null,
+          targetLabel: base.targetLabel,
+          target,
+          reason: step.reason
+        });
+        return finish({
+          success: true,
+          message: `Entered ${maskAgentTypedValue(value, target)} into ${base.targetLabel || 'target field'}.`,
+          valuePreview: maskAgentTypedValue(value, target)
+        });
       }
       if (step.action === 'select') {
+        highlightAgentElement(element, 1000);
         const selected = selectSafeOption(element, step.value);
-        return finish({ success: selected.ok, message: selected.message });
+        emitAgentEvent('field-updated', {
+          requestKey,
+          stepIndex,
+          targetIndex: step.targetIndex || null,
+          targetLabel: base.targetLabel,
+          action: 'select',
+          valuePreview: selected.valuePreview || '',
+          message: selected.message
+        });
+        return finish({ success: selected.ok, message: selected.message, valuePreview: selected.valuePreview || '' });
       }
       if (step.action === 'check' || step.action === 'uncheck') {
+        highlightAgentElement(element, 1000);
         element.checked = step.action === 'check';
         dispatchAgentInputEvents(element);
-        return finish({ success: true, message: `Control ${step.action === 'check' ? 'checked' : 'unchecked'}.` });
+        emitAgentEvent('field-updated', {
+          requestKey,
+          stepIndex,
+          targetIndex: step.targetIndex || null,
+          targetLabel: base.targetLabel,
+          action: step.action,
+          valuePreview: step.action === 'check' ? 'checked' : 'unchecked',
+          message: `Control ${step.action === 'check' ? 'checked' : 'unchecked'}.`
+        });
+        return finish({
+          success: true,
+          message: `Control ${step.action === 'check' ? 'checked' : 'unchecked'}.`,
+          valuePreview: step.action === 'check' ? 'checked' : 'unchecked'
+        });
       }
       if (step.action === 'click') {
+        highlightAgentElement(element, 900);
         element.scrollIntoView?.({ block: 'center', inline: 'center' });
         await waitForAgent(80);
         element.click();
@@ -1054,20 +1414,23 @@
     return new Promise((resolve) => setTimeout(resolve, Math.max(0, Number(ms) || 0)));
   }
 
-  function highlightAgentElement(element) {
+  function highlightAgentElement(element, durationMs = 1800) {
     if (!element || !element.style) return;
     const previousOutline = element.style.outline;
     const previousOutlineOffset = element.style.outlineOffset;
+    const previousBoxShadow = element.style.boxShadow;
     element.style.outline = '3px solid #2563eb';
     element.style.outlineOffset = '2px';
+    element.style.boxShadow = '0 0 0 5px rgba(37, 99, 235, 0.18)';
     setTimeout(() => {
       try {
         element.style.outline = previousOutline;
         element.style.outlineOffset = previousOutlineOffset;
+        element.style.boxShadow = previousBoxShadow;
       } catch {
         // Element may have been removed.
       }
-    }, 1800);
+    }, Math.max(300, Number(durationMs) || 1800));
   }
 
   function setElementValue(element, value) {
@@ -1083,6 +1446,41 @@
       element.value = value;
     }
     dispatchAgentInputEvents(element);
+  }
+
+  async function setElementValueAnimated(element, value, meta = {}) {
+    if (!element) return;
+    element.scrollIntoView?.({ block: 'center', inline: 'center' });
+    element.focus?.();
+    setElementValue(element, '');
+    await waitForAgent(90);
+    const text = String(value || '');
+    let current = '';
+    const target = meta.target || null;
+    for (const char of text) {
+      current += char;
+      setElementValue(element, current);
+      emitAgentEvent('field-updated', {
+        requestKey: meta.requestKey || '',
+        stepIndex: meta.stepIndex,
+        targetIndex: meta.targetIndex || null,
+        targetLabel: meta.targetLabel || '',
+        action: 'type',
+        valuePreview: maskAgentTypedValue(current, target),
+        message: `Typing ${maskAgentTypedValue(current, target)} into ${meta.targetLabel || 'field'}.`,
+        reason: meta.reason || ''
+      });
+      await waitForAgent(AGENT_TYPE_DELAY_MS);
+    }
+    dispatchAgentInputEvents(element);
+  }
+
+  function maskAgentTypedValue(value, target) {
+    const text = String(value || '');
+    const hint = `${target?.type || ''} ${target?.label || ''} ${target?.placeholder || ''}`.toLowerCase();
+    if (/password|secret|token|api/.test(hint)) return '••••••••';
+    if (text.length > 36) return `${text.slice(0, 18)}…${text.slice(-8)}`;
+    return text;
   }
 
   function dispatchAgentInputEvents(element) {
@@ -1105,7 +1503,8 @@
     if (!next) return { ok: false, message: 'No safe selectable option was available.' };
     element.value = next.value;
     dispatchAgentInputEvents(element);
-    return { ok: true, message: `Selected option "${sanitizePageText(next.textContent || next.value, 80)}".` };
+    const valuePreview = sanitizePageText(next.textContent || next.value, 80);
+    return { ok: true, message: `Selected option "${valuePreview}".`, valuePreview };
   }
 
   function capturePageContext(mode) {

@@ -275,7 +275,10 @@ Steps:
 Expected:
 
 - Agent detects fields.
-- Agent clears/types safe dummy data.
+- Agent shows a live progress bubble while it works.
+- Agent focuses and highlights each field it is filling.
+- Agent clears/types safe dummy data visibly instead of silently setting final values.
+- Chat progress says which field is being cleared, typed into, selected, checked, or observed.
 - Agent submits only when the detected submit control is safe.
 - Result includes pass/fail/needs-review summary.
 - Validation messages, route changes, API calls, and console events are linked when they occur.
@@ -286,7 +289,70 @@ Pass:
 
 Fail:
 
-- Agent types sensitive data, submits a risky payment/checkout/delete action, or claims pass/fail without evidence.
+- Agent silently changes fields with no live status, types sensitive data, submits a risky payment/checkout/delete/account-creation action without approval, or claims pass/fail without evidence.
+
+## 9A. Agent Permission Prompt
+
+Test command:
+
+```text
+Test the signup form with valid dummy data.
+```
+
+Steps:
+
+1. Open a staging/test signup page with a visible `Create account`, `Register`, or `Sign up` submit button.
+2. Start a session and reload.
+3. Switch to `Agent`.
+4. Send the command above.
+5. Watch the chat progress.
+6. When TestPilot asks for permission, click `Cancel`.
+7. Run the command again and click `Continue Once`.
+8. Run another similar safe form-validation command and click `Allow Similar This Session`.
+
+Expected:
+
+- Agent fills safe dummy fields visibly before any serious submit.
+- The live Agent card tells the tester which field is being cleared, typed, selected, checked, or observed.
+- Plain form `Submit`, `Continue`, `Save`, `Send`, login, signup, checkout, and order buttons pause with one consolidated `Permission required` card.
+- The card explains why approval is needed, lists prepared inputs, and shows the next action.
+- `Cancel` stops the action.
+- `Continue Once` continues only the exact preflighted task.
+- `Allow Similar This Session` is available only for rememberable non-destructive form-submit style actions.
+- After allowing similar actions for the session, the Agent can continue similar safe actions on the same page path without repeatedly prompting.
+- Approval is scoped to the exact pending submit/continue action. A different risky step must ask again.
+- After approval, the Agent resumes from the pending action instead of rerunning the whole plan from the top.
+- The final Agent response includes outcome, evidence confidence, observed action results, inputs used, and next steps.
+
+Pass:
+
+- No serious action runs before tester approval.
+- Form submit/continue buttons do not click before tester approval.
+
+Fail:
+
+- TestPilot clicks a risky submit/create/save/payment/logout/delete action without asking first.
+- TestPilot clicks a form `Submit` or `Continue` button without asking first.
+- The final Agent response does not show the safe inputs that were applied.
+- Payment, destructive, logout, file upload, and external-navigation actions become permanently auto-approved.
+
+## 9B. Chat Scroll And Menu Overlay
+
+Steps:
+
+1. Run an Agent command that produces a long response.
+2. Scroll upward inside the chat transcript while the Agent is still updating.
+3. Confirm the transcript does not jump back to the newest message until you scroll near the bottom or send another message.
+4. Open `Menu`.
+5. Scroll the current tab content behind the menu.
+
+Expected:
+
+- Manual transcript scroll position is respected while Agent progress updates.
+- Sending a new message still moves the transcript to the bottom.
+- The menu drawer stays fixed on the right.
+- The menu scrolls inside itself if its own content is taller than the viewport.
+- The tab content behind the open menu does not scroll.
 
 ## 10. Agent Mode: Search / Filter
 
@@ -538,6 +604,7 @@ node --check devtools/panel.js
 node --check content/content-script.js
 node --check background/service-worker.js
 node --check ai-backend/server.js
+node tests/agent-live-workflow-smoke.js
 node tests/ai-provider-settings-smoke.js
 node tests/responsive-ui-smoke.js
 node tests/network-analyzer-smoke.js
