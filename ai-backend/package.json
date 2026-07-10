@@ -5,11 +5,16 @@
   "type": "module",
   "description": "Local TestPilot AI backend for Ollama-powered QA analysis.",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js",
-    "health": "node scripts/health-check.js"
+    "build": "tsc -p tsconfig.json",
+    "start": "npm run build && node dist/server.js",
+    "dev": "npm run build && node dist/server.js",
+    "health": "npm run build && node dist/scripts/health-check.js"
   },
   "engines": {
     "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "typescript": "^5.7.2"
   }
 }

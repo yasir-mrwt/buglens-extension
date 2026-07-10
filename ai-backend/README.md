@@ -4,6 +4,8 @@ Local development backend for TestPilot AI assistance.
 
 The Chrome extension talks to this backend at `http://localhost:8787`. For now the backend is locked to local Ollama, so chat and analysis do not call remote API providers.
 
+The editable backend source is TypeScript in `src/`. `npm start` runs `npm run build` first and then starts the generated runtime from `dist/server.js`.
+
 Default provider:
 
 ```text
