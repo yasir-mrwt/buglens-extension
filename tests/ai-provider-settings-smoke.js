@@ -95,7 +95,7 @@ const context = {
 
 vm.createContext(context);
 
-const panelSource = fs.readFileSync('devtools/panel.js', 'utf8');
+const panelSource = fs.readFileSync('src/devtools/panel/panelController.ts', 'utf8');
 const testSource = `
 state.settings = normalizeSettings({
   ...DEFAULT_SETTINGS,
@@ -123,7 +123,7 @@ try {
 validateAiProviderSettings({ provider: 'local-backend', apiKey: '' });
 `;
 
-vm.runInContext(`${panelSource}\n${testSource}`, context, { filename: 'devtools/panel.js' });
+vm.runInContext(`${panelSource}\n${testSource}`, context, { filename: 'src/devtools/panel/panelController.ts' });
 
 if (!context.__masked.includes('••••')) {
   throw new Error('API key mask does not hide the stored key.');

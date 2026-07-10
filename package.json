@@ -1,0 +1,27 @@
+{
+  "name": "testpilot-extension",
+  "version": "0.4.1",
+  "private": true,
+  "type": "module",
+  "description": "Build foundation for the TestPilot Manifest V3 Chrome extension.",
+  "scripts": {
+    "dev": "vite build --watch",
+    "build": "npm run build:extension && npm run build:backend",
+    "build:extension": "npm run typecheck && vite build",
+    "build:backend": "npm --prefix ai-backend run build",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/chrome": "^0.0.287",
+    "@types/node": "^22.10.2",
+    "@types/react": "^19.0.2",
+    "@types/react-dom": "^19.0.2",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5"
+  }
+}

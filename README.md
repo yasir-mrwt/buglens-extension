@@ -57,7 +57,7 @@ Stopping a session pauses capture but keeps results available for review and exp
 
 - Google Chrome 116 or newer
 - A normal `http://` or `https://` page that extensions are allowed to inspect
-- No build step is required for the Chrome extension UI
+- Node.js 18 or newer for the React/TypeScript extension build
 - Optional AI Chat/Agent answers require Node.js 18 or newer, Ollama, and the local backend in `ai-backend`
 
 ## Install
@@ -65,14 +65,30 @@ Stopping a session pauses capture but keeps results available for review and exp
 1. Open `chrome://extensions`.
 2. Enable **Developer mode**.
 3. Click **Load unpacked**.
-4. Select the project root folder that contains `manifest.json`.
+4. Build the extension with `npm run build`.
+5. Select the project root folder that contains `manifest.json`.
    - In this workspace, select `buglens-extension`.
-   - Do **not** select `ai-backend`, `devtools`, `popup`, or any subfolder.
-5. Confirm **TestPilot QA Agent** appears without manifest errors.
-6. Reload any page that was already open before the extension was installed.
-7. Open or reopen Chrome DevTools on a normal web page and select the **TestPilot** panel. It may be under the DevTools `»` overflow menu.
+   - Run `npm run build` first so the generated runtime files exist at Chrome's expected paths.
+   - Do **not** select `ai-backend`, `devtools`, `popup`, `src`, or any subfolder.
+6. Confirm **TestPilot QA Agent** appears without manifest errors.
+7. Reload any page that was already open before the extension was installed.
+8. Open or reopen Chrome DevTools on a normal web page and select the **TestPilot** panel. It may be under the DevTools `»` overflow menu.
 
 After editing extension files, click the extension's **Reload** button on `chrome://extensions`, then reload the inspected page and reopen DevTools.
+
+## React And TypeScript Build
+
+The extension now builds from React, TypeScript, and Vite. The DevTools panel and popup HTML files are React mount shells; their visible UI is rendered from `src/devtools/panel` and `src/popup`. The complex DevTools panel controller is TypeScript source in `src/devtools/panel/panelController.ts` and is emitted to `dist/devtools/panel.js` for Chrome.
+
+```text
+npm install
+npm run typecheck
+npm run build
+```
+
+`npm run build` creates the React UI bundles and TypeScript-built extension runtime, then copies the Chrome runtime files to the root extension paths used by `manifest.json`. **Load unpacked** should select the project root after every build.
+
+Use `src/` as the editable source. Root `.js` files and `dist/` files are generated output; do not edit them by hand.
 
 ## Use TestPilot
 
@@ -349,7 +365,7 @@ Attached context is sanitized, truncated, shown in the AI tab, and included in J
 
 Use this exact checklist:
 
-1. Confirm the loaded folder is the project root that contains `manifest.json`.
+1. Confirm the loaded folder is `buglens-extension`, then confirm `content/content-script.js` and `content/injected-console-listener.js` exist after `npm run build`.
 2. On `chrome://extensions`, confirm **TestPilot QA Agent** has no red manifest/runtime errors.
 3. Click the extension **Reload** button.
 4. Reload the inspected web page.
@@ -411,13 +427,13 @@ Reload TestPilot on `chrome://extensions`, reload the target page, and reopen th
 
 ```text
 manifest.json                         Manifest V3 configuration
-background/service-worker.js          Event relay and preference initialization
-content/injected-console-listener.js  Main-world console/error listener
-content/content-script.js             Message bridge and bounded UI scanner
-devtools/devtools.js                  DevTools panel registration
+src/background/service-worker.ts          Event relay and preference initialization
+src/content/injected-console-listener.ts  Main-world console/error listener
+src/content/content-script.ts             Message bridge and bounded UI scanner
+src/devtools/devtools.ts                  DevTools panel registration
 devtools/panel.html                   Main QA interface
 devtools/panel.css                    Panel styling
-devtools/panel.js                     Session, analyzers, UI, storage, and reports
+src/devtools/panel/panelController.ts                     Session, analyzers, UI, storage, and reports
 popup/                                Quick usage popup
 docs/quick-start.html                 In-extension quick-start guide
 ```
@@ -439,22 +455,19 @@ docs/quick-start.html                 In-extension quick-start guide
 
 ## Development and Verification
 
-The project uses plain JavaScript, HTML, and CSS with no build step.
+The project uses React, TypeScript, and Vite for the extension source. Chrome loads the project root manifest, which points to generated root runtime files.
 
 Run local static checks:
 
 ```bash
-for file in \
-  background/service-worker.js \
-  content/content-script.js \
-  content/injected-console-listener.js \
-  devtools/devtools.js \
-  devtools/panel.js \
-  popup/popup.js
-do
-  node --check "$file"
-done
-
+npm run typecheck
+npm run build
+node --check dist/background/service-worker.js
+node --check dist/content/content-script.js
+node --check dist/content/injected-console-listener.js
+node --check dist/devtools/devtools.js
+node --check dist/devtools/panel.js
+node --check dist/popup/popup.js
 jq empty manifest.json
 node tests/network-analyzer-smoke.js
 node tests/ui-scanner-smoke.js

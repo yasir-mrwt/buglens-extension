@@ -13,14 +13,14 @@ High-Level Architecture
 TestPilot has three separate intelligence paths:
 
 1. Agent browser workflow
-   - Runs inside the inspected page through content/content-script.js.
+   - Runs inside the inspected page through src/content/content-script.ts.
    - Uses deterministic local planning and DOM inspection.
    - Does not currently let the LLM execute arbitrary browser actions.
    - Fills fields, highlights controls, clicks safe controls, observes page state, and reports evidence.
    - Requires tester approval before submit/continue/save/send/login/signup/order/payment-style actions.
 
 2. AI chat
-   - Runs from devtools/panel.js.
+   - Runs from src/devtools/panel/panelController.ts.
    - Sends sanitized QA session context to the configured AI provider.
    - For local development, the default provider is the local backend at http://localhost:8787.
    - Uses streaming local backend chat when possible.
@@ -42,7 +42,7 @@ manifest.json
 devtools/devtools.html
   - Chrome DevTools entry page.
 
-devtools/devtools.js
+src/devtools/devtools.ts
   - Creates the TestPilot DevTools panel.
   - If this file is wrong, the panel may not appear inside Chrome DevTools.
 
@@ -54,25 +54,25 @@ devtools/panel.css
   - Main DevTools panel styling.
   - Owns chat layout, permission cards, menu drawer, tabs, test case cards, bug report cards, and responsive behavior.
 
-devtools/panel.js
+src/devtools/panel/panelController.ts
   - Main controller for the DevTools panel.
   - Owns UI state, session state, storage, AI provider settings, chat submission, Agent command dispatch,
     Agent live event rendering, permission cards, generated artifacts, exports, and report builder.
 
-content/content-script.js
+src/content/content-script.ts
   - Runs in the inspected page.
   - Owns DOM scanning, Agent planning, action execution, field filling, approval gating,
     observations, UI bug scanning, and Agent event emission back to the DevTools panel.
 
-content/injected-console-listener.js
+src/content/injected-console-listener.ts
   - Runs in page context to capture page console warnings/errors safely.
   - Sends serialized console evidence to the extension without breaking the host app console.
 
-background/service-worker.js
+src/background/service-worker.ts
   - Extension service worker.
   - Coordinates runtime/background behavior and extension lifecycle hooks.
 
-ai-backend/server.js
+ai-backend/src/server.ts
   - Local Node.js AI backend.
   - Default provider is Ollama.
   - Exposes health, chat, streaming chat, analyze session, generate test cases, and generate bug report endpoints.
@@ -81,7 +81,7 @@ ai-backend/server.js
 ai-backend/.env and ai-backend/.env.example
   - Configure local backend port, Ollama base URL, model, and timeouts.
 
-ai-backend/scripts/health-check.js
+ai-backend/src/scripts/health-check.ts
   - CLI health check for the backend.
 
 tests/agent-live-workflow-smoke.js
@@ -106,7 +106,7 @@ docs/working-flow-test.md
 Agent Browser Workflow
 ----------------------
 Entry point:
-  devtools/panel.js -> runAgentCommand(command, options)
+  src/devtools/panel/panelController.ts -> runAgentCommand(command, options)
 
 Message sent to inspected page:
   type: TESTPILOT_RUN_AGENT
@@ -120,11 +120,11 @@ Message sent to inspected page:
     approval
 
 Receiver:
-  content/content-script.js -> chrome.runtime.onMessage listener
+  src/content/content-script.ts -> chrome.runtime.onMessage listener
   message.type === TESTPILOT_RUN_AGENT
   calls runAgentWorkflow(command, options)
 
-Core Agent functions in content/content-script.js:
+Core Agent functions in src/content/content-script.ts:
   runAgentWorkflow(command, options)
     - Sanitizes tester command.
     - Extracts current page context.
@@ -168,17 +168,17 @@ The Agent command is natural language from the tester, but it is not passed dire
 
 Current Agent prompt flow:
   1. Tester types command in Agent mode.
-  2. devtools/panel.js submitAiChat() detects Agent mode.
-  3. devtools/panel.js runAgentCommand() sends command to content script.
-  4. content/content-script.js classifies the command with rule-based logic.
-  5. content/content-script.js builds a deterministic plan from DOM context.
+  2. src/devtools/panel/panelController.ts submitAiChat() detects Agent mode.
+  3. src/devtools/panel/panelController.ts runAgentCommand() sends command to content script.
+  4. src/content/content-script.ts classifies the command with rule-based logic.
+  5. src/content/content-script.ts builds a deterministic plan from DOM context.
   6. Agent executes the plan with safety gates.
 
 Important classification functions:
-  content/content-script.js -> detectDataStrategy(command)
+  src/content/content-script.ts -> detectDataStrategy(command)
     - Determines whether the user asked for empty, invalid, dummy, valid dummy, or real user provided data.
 
-  content/content-script.js -> classifyAgentTask(command, context, dataStrategy)
+  src/content/content-script.ts -> classifyAgentTask(command, context, dataStrategy)
     - Maps command to task type:
       required_field_validation
       invalid_login_test
@@ -221,28 +221,28 @@ Approval-required actions include:
   - External or unsafe navigation
 
 Core safety functions:
-  content/content-script.js -> validateAgentPlan(plan, context, approval, requestKey)
+  src/content/content-script.ts -> validateAgentPlan(plan, context, approval, requestKey)
     - Checks unavailable targets and disabled targets.
     - Finds confirmation-required steps.
     - Confirms whether approval matches the request and pending step.
 
-  content/content-script.js -> getAgentStepConfirmation(step, context)
+  src/content/content-script.ts -> getAgentStepConfirmation(step, context)
     - Decides if a step requires approval.
     - Returns reason, category, rememberable flag, and target label.
 
-  content/content-script.js -> isAgentFormSubmitAction(step, target, context)
+  src/content/content-script.ts -> isAgentFormSubmitAction(step, target, context)
     - Detects form submit/continue/save/send/login/signup-style buttons.
 
-  content/content-script.js -> getAgentStepApprovalFingerprint(step, context, confirmation)
+  src/content/content-script.ts -> getAgentStepApprovalFingerprint(step, context, confirmation)
     - Creates a step-scoped approval fingerprint.
     - Prevents a single approval from approving all risky actions in the plan.
 
-  content/content-script.js -> buildAgentApprovalRequest(...)
+  src/content/content-script.ts -> buildAgentApprovalRequest(...)
     - Builds permission payload for the panel.
     - Includes prepared inputs, pending action, step fingerprint, resume step index, and previous action results.
 
 Panel permission UI:
-  devtools/panel.js -> renderAgentPermissionMessage(message)
+  src/devtools/panel/panelController.ts -> renderAgentPermissionMessage(message)
     - Shows prepared inputs.
     - Shows next action.
     - Explains that TestPilot will continue automatically after approval.
@@ -252,18 +252,18 @@ Panel permission UI:
       Cancel
 
 Approval execution:
-  devtools/panel.js -> approveAgentPermission(requestKey, options)
+  src/devtools/panel/panelController.ts -> approveAgentPermission(requestKey, options)
     - Sends approval payload back to content script.
     - Includes stepFingerprint, resumeFromStepIndex, and previousActionResults.
 
 Resume behavior:
-  content/content-script.js -> runAgentWorkflow()
+  src/content/content-script.ts -> runAgentWorkflow()
     - If approval is valid, it resumes at resumeFromStepIndex.
     - It does not rerun the whole plan from the top.
     - Previous safe actions are preserved in final result.
 
 Session preference behavior:
-  devtools/panel.js -> agentApprovalPreferences
+  src/devtools/panel/panelController.ts -> agentApprovalPreferences
     - In-memory only for this panel session.
     - Allows similar non-destructive form-submit actions this session.
     - Scope includes page origin, page path, task type, action category, and target label.
@@ -272,7 +272,7 @@ Session preference behavior:
 
 Agent Live Event Flow
 ---------------------
-content/content-script.js emits Agent events through emitAgentEvent().
+src/content/content-script.ts emits Agent events through emitAgentEvent().
 
 Events include:
   started
@@ -286,11 +286,11 @@ Events include:
   completed
 
 Panel handler:
-  devtools/panel.js -> handleAgentEvent(payload, sessionId)
+  src/devtools/panel/panelController.ts -> handleAgentEvent(payload, sessionId)
 
 Panel rendering:
-  devtools/panel.js -> renderAgentLiveMessage(message)
-  devtools/panel.js -> renderAgentPermissionMessage(message)
+  src/devtools/panel/panelController.ts -> renderAgentLiveMessage(message)
+  src/devtools/panel/panelController.ts -> renderAgentPermissionMessage(message)
   devtools/panel.css -> .ai-chat-message.agent-live
   devtools/panel.css -> .ai-chat-message.agent-permission
 
@@ -302,7 +302,7 @@ Important UI behavior:
 AI Chat Flow
 ------------
 Entry point:
-  devtools/panel.js -> submitAiChat(value)
+  src/devtools/panel/panelController.ts -> submitAiChat(value)
 
 If current mode is Agent:
   submitAiChat() calls runAgentCommand(question)
@@ -311,15 +311,15 @@ If current mode is Chat:
   submitAiChat() calls completeChatWithSelectedProvider(question, options)
 
 Local backend chat:
-  devtools/panel.js -> streamLocalBackendChat(question, options)
+  src/devtools/panel/panelController.ts -> streamLocalBackendChat(question, options)
     POST /api/ai/chat-stream
 
 Non-streaming backend fallback:
-  devtools/panel.js -> completeChatWithSelectedProvider()
+  src/devtools/panel/panelController.ts -> completeChatWithSelectedProvider()
     POST /api/ai/chat
 
 Frontend provider prompt builder:
-  devtools/panel.js -> buildProviderChatMessages(question)
+  src/devtools/panel/panelController.ts -> buildProviderChatMessages(question)
     System prompt:
       - You are TestPilot, a concise QA assistant inside Chrome DevTools.
       - Answer only from sanitized QA session context.
@@ -331,7 +331,7 @@ Frontend provider prompt builder:
       - responseStyle
 
 Context builder:
-  devtools/panel.js -> buildCompactAiSessionSummary(task)
+  src/devtools/panel/panelController.ts -> buildCompactAiSessionSummary(task)
     - Uses buildAiSessionSummary(task).
     - Applies context mode limits: fast, balanced, deep.
     - Redacts sensitive data.
@@ -346,7 +346,7 @@ Buttons/menu actions:
   Generate Bug Report
 
 Entry point:
-  devtools/panel.js -> runAiTask(task, options)
+  src/devtools/panel/panelController.ts -> runAiTask(task, options)
 
 Task endpoints for local backend:
   analyze-session      -> POST /api/ai/analyze-session
@@ -357,21 +357,21 @@ Payload:
   { session: buildCompactAiSessionSummary(task) }
 
 Frontend fallback/provider path:
-  devtools/panel.js -> completeAiTaskWithSelectedProvider(task)
-  devtools/panel.js -> buildProviderTaskMessages(task)
+  src/devtools/panel/panelController.ts -> completeAiTaskWithSelectedProvider(task)
+  src/devtools/panel/panelController.ts -> buildProviderTaskMessages(task)
 
 Task system prompt in frontend:
-  devtools/panel.js -> buildProviderTaskMessages(task)
+  src/devtools/panel/panelController.ts -> buildProviderTaskMessages(task)
     - Return only valid JSON.
     - Use sanitized session evidence only.
     - Do not invent product features or credentials.
     - Mark weak evidence as needs review.
 
 Expected schema:
-  devtools/panel.js -> getAiAnalysisResponseSchema(task)
+  src/devtools/panel/panelController.ts -> getAiAnalysisResponseSchema(task)
 
 Validation:
-  devtools/panel.js -> validateAiAnalysis(value)
+  src/devtools/panel/panelController.ts -> validateAiAnalysis(value)
     - Normalizes model output.
     - Creates fallback test cases or bug drafts when needed.
     - Prevents empty/generic outputs from breaking UI.
@@ -380,7 +380,7 @@ Validation:
 Local AI Backend Flow
 ---------------------
 Main file:
-  ai-backend/server.js
+  ai-backend/src/server.ts
 
 Runtime:
   Node.js 18+
@@ -432,19 +432,19 @@ Analysis/test/bug generation:
     - Normalizes/merges model result with fallback.
 
 Backend prompt builder:
-  ai-backend/server.js -> buildSystemPrompt(task)
+  ai-backend/src/server.ts -> buildSystemPrompt(task)
     - Tells model to use only sanitized summary.
     - Tells model not to invent issues.
     - Separates real issues from false positives.
     - Requires strict JSON shape.
 
 Backend sanitization:
-  ai-backend/server.js -> sanitizeIncomingSession(session)
-  ai-backend/server.js -> redactText(text)
-  ai-backend/server.js -> redactSensitiveValue(value)
+  ai-backend/src/server.ts -> sanitizeIncomingSession(session)
+  ai-backend/src/server.ts -> redactText(text)
+  ai-backend/src/server.ts -> redactSensitiveValue(value)
 
 Provider implementation:
-  ai-backend/server.js -> OllamaProvider
+  ai-backend/src/server.ts -> OllamaProvider
     completeJson()
       - Calls Ollama OpenAI-compatible /v1/chat/completions.
       - Requests response_format json_object.
@@ -459,29 +459,29 @@ Provider implementation:
 Model and Provider Handling in Panel
 ------------------------------------
 Provider config:
-  devtools/panel.js -> AI_PROVIDER_DEFAULTS
-  devtools/panel.js -> DEFAULT_AI_PROVIDER_SETTINGS
-  devtools/panel.js -> normalizeAiProviderSettings()
-  devtools/panel.js -> readSettingsFromForm()
-  devtools/panel.js -> syncProviderSettingsToForm()
+  src/devtools/panel/panelController.ts -> AI_PROVIDER_DEFAULTS
+  src/devtools/panel/panelController.ts -> DEFAULT_AI_PROVIDER_SETTINGS
+  src/devtools/panel/panelController.ts -> normalizeAiProviderSettings()
+  src/devtools/panel/panelController.ts -> readSettingsFromForm()
+  src/devtools/panel/panelController.ts -> syncProviderSettingsToForm()
 
 Health:
-  devtools/panel.js -> checkAiHealth(options)
-  devtools/panel.js -> testAiConnection(settings)
+  src/devtools/panel/panelController.ts -> checkAiHealth(options)
+  src/devtools/panel/panelController.ts -> testAiConnection(settings)
 
 Provider calls:
-  devtools/panel.js -> completeWithAiProvider(...)
+  src/devtools/panel/panelController.ts -> completeWithAiProvider(...)
     - Routes to local backend, Ollama direct, Gemini, OpenAI-compatible providers, etc.
     - For local backend, normal use is http://localhost:8787.
 
 Timeouts:
-  devtools/panel.js -> getProviderTimeoutMs(mode)
+  src/devtools/panel/panelController.ts -> getProviderTimeoutMs(mode)
     - chat: 90 seconds
     - test-cases / bug-report: 180 seconds
     - default: 60 seconds
 
 Token limits:
-  devtools/panel.js -> getProviderMaxTokens(task)
+  src/devtools/panel/panelController.ts -> getProviderMaxTokens(task)
     - Chat is capped smaller.
     - Test cases and bug reports request larger output.
 
@@ -489,58 +489,58 @@ Token limits:
 Evidence Flow
 -------------
 Network evidence:
-  devtools/panel.js
+  src/devtools/panel/panelController.ts
     - registerNetworkListener()
     - processNetworkEntry()
     - issues/state.networkStats
 
 Console evidence:
-  content/injected-console-listener.js
+  src/content/injected-console-listener.ts
     - Captures page console error/warn.
 
-  content/content-script.js
+  src/content/content-script.ts
     - Receives page console messages and forwards to extension.
 
-  devtools/panel.js
+  src/devtools/panel/panelController.ts
     - Converts console events into findings and recent evidence.
 
 UI evidence:
-  content/content-script.js
+  src/content/content-script.ts
     - Runs UI scan and returns rule-based UI findings.
 
 Agent linked evidence:
-  devtools/panel.js -> linkEvidenceToAgentResult(agentResult)
+  src/devtools/panel/panelController.ts -> linkEvidenceToAgentResult(agentResult)
     - Links recent API/console events to Agent action windows.
     - Adds evidenceQuality.
     - Adds usedInputs.
 
 AI summary context:
-  devtools/panel.js -> buildAiSessionSummary(task)
-  devtools/panel.js -> summarizeAgentResultForAi(agentResult)
-  devtools/panel.js -> summarizeIssueForAi(issue)
+  src/devtools/panel/panelController.ts -> buildAiSessionSummary(task)
+  src/devtools/panel/panelController.ts -> summarizeAgentResultForAi(agentResult)
+  src/devtools/panel/panelController.ts -> summarizeIssueForAi(issue)
 
 
 Storage and Persistence
 -----------------------
 Primary session storage:
-  devtools/panel.js -> SESSION_STORAGE_KEY
-  devtools/panel.js -> persistSession()
-  devtools/panel.js -> setStoredSessionSnapshot(serializable)
+  src/devtools/panel/panelController.ts -> SESSION_STORAGE_KEY
+  src/devtools/panel/panelController.ts -> persistSession()
+  src/devtools/panel/panelController.ts -> setStoredSessionSnapshot(serializable)
 
 Fallback local backup:
-  devtools/panel.js -> LOCAL_SESSION_STORAGE_KEY
+  src/devtools/panel/panelController.ts -> LOCAL_SESSION_STORAGE_KEY
   Used if chrome.storage.session rejects the snapshot.
 
 Restore:
-  devtools/panel.js -> restoreSession()
+  src/devtools/panel/panelController.ts -> restoreSession()
     - Reads session storage first.
     - Falls back to local backup.
 
 Storage compaction:
-  devtools/panel.js -> buildSessionSnapshot()
-  devtools/panel.js -> compactAiStateForStorage(ai)
-  devtools/panel.js -> compactAiAnalysisForStorage(analysis)
-  devtools/panel.js -> compactStorageValue(value)
+  src/devtools/panel/panelController.ts -> buildSessionSnapshot()
+  src/devtools/panel/panelController.ts -> compactAiStateForStorage(ai)
+  src/devtools/panel/panelController.ts -> compactAiAnalysisForStorage(analysis)
+  src/devtools/panel/panelController.ts -> compactStorageValue(value)
 
 Reason:
   Agent results and generated AI outputs can become large. Compaction prevents Chrome storage failures.
@@ -549,24 +549,24 @@ Reason:
 Report and Output Reuse
 -----------------------
 Test cases:
-  devtools/panel.js -> renderTestCasesState()
-  devtools/panel.js -> buildTestCasesMarkdown()
-  devtools/panel.js -> exportTestCasesMarkdown()
+  src/devtools/panel/panelController.ts -> renderTestCasesState()
+  src/devtools/panel/panelController.ts -> buildTestCasesMarkdown()
+  src/devtools/panel/panelController.ts -> exportTestCasesMarkdown()
 
 Bug reports:
-  devtools/panel.js -> renderBugReportsState()
-  devtools/panel.js -> renderBugDraftCard()
-  devtools/panel.js -> buildBugReportsMarkdown()
-  devtools/panel.js -> exportBugReportMarkdown()
-  devtools/panel.js -> exportBugReportJson()
+  src/devtools/panel/panelController.ts -> renderBugReportsState()
+  src/devtools/panel/panelController.ts -> renderBugDraftCard()
+  src/devtools/panel/panelController.ts -> buildBugReportsMarkdown()
+  src/devtools/panel/panelController.ts -> exportBugReportMarkdown()
+  src/devtools/panel/panelController.ts -> exportBugReportJson()
 
 Reports:
-  devtools/panel.js -> buildReport()
-  devtools/panel.js -> buildReportHtml()
-  devtools/panel.js -> buildReportMarkdown()
-  devtools/panel.js -> exportReportJson()
-  devtools/panel.js -> exportReportHtml()
-  devtools/panel.js -> exportReportMarkdown()
+  src/devtools/panel/panelController.ts -> buildReport()
+  src/devtools/panel/panelController.ts -> buildReportHtml()
+  src/devtools/panel/panelController.ts -> buildReportMarkdown()
+  src/devtools/panel/panelController.ts -> exportReportJson()
+  src/devtools/panel/panelController.ts -> exportReportHtml()
+  src/devtools/panel/panelController.ts -> exportReportMarkdown()
 
 Latest Agent result is included in:
   - AI session context
@@ -578,7 +578,7 @@ Latest Agent result is included in:
 Current Safety Boundaries
 -------------------------
 1. LLM does not execute browser actions.
-2. Agent action execution is deterministic and validated in content/content-script.js.
+2. Agent action execution is deterministic and validated in src/content/content-script.ts.
 3. Approval is required before form submit/continue/save/send/login/signup/payment/destructive actions.
 4. Approval is scoped to a request key and step fingerprint.
 5. Approval resumes from the pending step, not from the beginning.
@@ -591,8 +591,8 @@ Current Safety Boundaries
 Known Extension Points for Senior Updates
 -----------------------------------------
 If adding LLM planning:
-  - Add model planning in devtools/panel.js or ai-backend/server.js.
-  - Keep content/content-script.js as final validator.
+  - Add model planning in src/devtools/panel/panelController.ts or ai-backend/src/server.ts.
+  - Keep src/content/content-script.ts as final validator.
   - Never execute model steps directly.
   - Normalize model steps through normalizeStructuredAgentPlan().
   - Keep ALLOWED_AGENT_ACTIONS limited.
@@ -626,9 +626,9 @@ If improving permissions:
 If improving prompts:
   - Frontend chat prompt: buildProviderChatMessages().
   - Frontend JSON task prompt: buildProviderTaskMessages().
-  - Backend task prompt: ai-backend/server.js buildSystemPrompt().
-  - Backend chat prompt: ai-backend/server.js buildChatSystemPrompt().
-  - Schema: getAiAnalysisResponseSchema() in panel.js and backend strict JSON shape in server.js.
+  - Backend task prompt: ai-backend/src/server.ts buildSystemPrompt().
+  - Backend chat prompt: ai-backend/src/server.ts buildChatSystemPrompt().
+  - Schema: getAiAnalysisResponseSchema() in src/devtools/panel/panelController.ts and backend strict JSON shape in ai-backend/src/server.ts.
 
 If improving generated artifacts:
   - Test cases: runAiTask('generate-test-cases'), validateAiAnalysis(), buildLocalTestCases().
@@ -639,10 +639,12 @@ If improving generated artifacts:
 Recommended Validation After Agent Changes
 ------------------------------------------
 Run:
-  node --check content/content-script.js
-  node --check devtools/panel.js
-  node --check background/service-worker.js
-  node --check ai-backend/server.js
+  npm run typecheck
+  npm run build
+  node --check dist/content/content-script.js
+  node --check dist/devtools/panel.js
+  node --check dist/background/service-worker.js
+  node --check ai-backend/dist/server.js
   node tests/agent-live-workflow-smoke.js
   node tests/responsive-ui-smoke.js
   node tests/ui-scanner-smoke.js
@@ -663,4 +665,3 @@ Manual browser validation:
   10. Confirm Agent submits/continues automatically from that step.
   11. Confirm final response includes inputs used, action results, evidence, and next steps.
   12. Try a second risky action and confirm it asks again unless it is covered by a safe session preference.
-

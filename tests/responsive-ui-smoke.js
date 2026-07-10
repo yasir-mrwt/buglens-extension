@@ -1,12 +1,14 @@
 const fs = require('fs');
 
-const html = fs.readFileSync('devtools/panel.html', 'utf8');
+const panelShellSource = fs.readFileSync('src/devtools/panel/PanelShell.tsx', 'utf8');
 const css = fs.readFileSync('devtools/panel.css', 'utf8');
-const js = fs.readFileSync('devtools/panel.js', 'utf8');
+const js = fs.readFileSync('src/devtools/panel/panelController.ts', 'utf8');
 
 function assert(condition, message) {
   if (!condition) throw new Error(message);
 }
+
+const html = panelShellSource.replaceAll('className=', 'class=');
 
 function between(source, start, end) {
   const startIndex = source.indexOf(start);

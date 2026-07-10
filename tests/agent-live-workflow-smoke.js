@@ -1,7 +1,7 @@
 const fs = require('fs');
 
-const content = fs.readFileSync('content/content-script.js', 'utf8');
-const panel = fs.readFileSync('devtools/panel.js', 'utf8');
+const content = fs.readFileSync('src/content/content-script.ts', 'utf8');
+const panel = fs.readFileSync('src/devtools/panel/panelController.ts', 'utf8');
 const css = fs.readFileSync('devtools/panel.css', 'utf8');
 
 function assert(condition, message) {

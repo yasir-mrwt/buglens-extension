@@ -7,45 +7,7 @@
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
-    <section class="popup-shell">
-      <header>
-        <img src="../assets/icons/icon48.png" alt="" />
-        <div>
-          <div class="title-row">
-            <h1>TestPilot</h1>
-            <span>v0.4.1</span>
-          </div>
-          <p>Professional QA for Chrome DevTools</p>
-        </div>
-      </header>
-
-      <section class="status-card">
-        <span id="statusDot" class="status-dot" aria-hidden="true"></span>
-        <div>
-          <strong id="statusTitle">Checking DevTools connection</strong>
-          <p id="status">TestPilot is checking for an open panel.</p>
-        </div>
-      </section>
-
-      <section class="card">
-        <span class="eyebrow">Quick workflow</span>
-        <ol>
-          <li><span>1</span><div><strong>Open DevTools</strong><p>Select the TestPilot panel.</p></div></li>
-          <li><span>2</span><div><strong>Start and reload</strong><p>Capture the complete page flow.</p></div></li>
-          <li><span>3</span><div><strong>Review, ask AI, export</strong><p>Scan UI, analyze locally, then create a report.</p></div></li>
-        </ol>
-      </section>
-
-      <section class="privacy-card">
-        <span class="privacy-indicator" aria-hidden="true"></span>
-        <div>
-          <strong>Private by design</strong>
-          <p>Session evidence stays temporary and local. Nothing is uploaded.</p>
-        </div>
-      </section>
-
-      <button id="openDocsBtn">Open Setup Guide</button>
-    </section>
-    <script src="popup.js"></script>
+    <div id="testpilotPopupRoot"></div>
+    <script type="module" src="popup.js"></script>
   </body>
 </html>

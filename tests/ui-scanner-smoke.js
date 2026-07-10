@@ -213,8 +213,8 @@ const context = {
 };
 
 vm.createContext(context);
-vm.runInContext(fs.readFileSync('content/content-script.js', 'utf8'), context, {
-  filename: 'content/content-script.js'
+vm.runInContext(fs.readFileSync('src/content/content-script.ts', 'utf8'), context, {
+  filename: 'src/content/content-script.ts'
 });
 
 function scan() {

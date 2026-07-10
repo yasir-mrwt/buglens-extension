@@ -38,10 +38,11 @@ Expected:
 3. Enable Developer mode.
 4. Click `Load unpacked`.
 5. Select the project root folder that contains `manifest.json`: `buglens-extension`.
-6. Do not select `ai-backend`, `devtools`, `popup`, or any subfolder.
-7. Open a normal web page, not `chrome://`, Chrome Web Store, or browser internal pages.
-8. Reload the page if it was already open before installing the extension.
-9. Open DevTools and select `TestPilot`; it may be under the DevTools `»` overflow menu.
+6. Run `npm run build` first so the root manifest can load generated runtime files.
+7. Do not select `ai-backend`, `devtools`, `popup`, `src`, `dist`, or any subfolder.
+8. Open a normal web page, not `chrome://`, Chrome Web Store, or browser internal pages.
+9. Reload the page if it was already open before installing the extension.
+10. Open DevTools and select `TestPilot`; it may be under the DevTools `»` overflow menu.
 
 Expected:
 
@@ -600,10 +601,12 @@ Fail:
 Run these after code changes:
 
 ```bash
-node --check devtools/panel.js
-node --check content/content-script.js
-node --check background/service-worker.js
-node --check ai-backend/server.js
+npm run typecheck
+npm run build
+node --check dist/devtools/panel.js
+node --check dist/content/content-script.js
+node --check dist/background/service-worker.js
+node --check ai-backend/dist/server.js
 node tests/agent-live-workflow-smoke.js
 node tests/ai-provider-settings-smoke.js
 node tests/responsive-ui-smoke.js

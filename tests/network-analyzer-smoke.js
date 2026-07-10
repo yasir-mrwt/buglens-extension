@@ -84,7 +84,7 @@ const context = {
 
 vm.createContext(context);
 
-const panelSource = fs.readFileSync('devtools/panel.js', 'utf8');
+const panelSource = fs.readFileSync('src/devtools/panel/panelController.ts', 'utf8');
 const testSource = `
 state.active = true;
 state.sessionId = 'network-test';
@@ -246,7 +246,7 @@ sendTabMessage({ type: 'TESTPILOT_PING_CONTENT' }).then((result) => {
 `;
 
 vm.runInContext(`${panelSource}\n${testSource}`, context, {
-  filename: 'devtools/panel.js'
+  filename: 'src/devtools/panel/panelController.ts'
 });
 
 setTimeout(() => {
