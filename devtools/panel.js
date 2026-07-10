@@ -225,6 +225,7 @@ const state = {
     activeMode: 'analysis',
     chatMessages: [],
     lastAgentResult: null,
+    agentRun: createEmptyAgentRunState(),
     error: '',
     log: ['Backend not checked yet. Start ai-backend with npm start, then click Check AI.']
   },
@@ -245,12 +246,50 @@ let lastAutoUiScanAt = 0;
 let aiApiKeyTouched = false;
 let reportBuilderDirty = false;
 let forceNextAiChatScroll = false;
+let debugDrawerOpen = false;
 const pendingAgentApprovals = new Map();
 const agentApprovalPreferences = new Map();
+
+function createEmptyAgentRunState() {
+  return {
+    state: 'idle',
+    status: 'idle',
+    requestKey: '',
+    promptId: '',
+    taskId: '',
+    planHash: '',
+    taskType: '',
+    command: '',
+    retrievedEvidenceIds: [],
+    evidenceCards: [],
+    planPreview: null,
+    actionTrace: [],
+    lastUpdatedAt: null,
+    error: ''
+  };
+}
 
 const els = {
   startBtn: document.getElementById('startBtn'),
   stopBtn: document.getElementById('stopBtn'),
+  stopAgentBtn: document.getElementById('stopAgentBtn'),
+  debugDrawerBtn: document.getElementById('debugDrawerBtn'),
+  debugDrawer: document.getElementById('debugDrawer'),
+  debugDrawerCloseBtn: document.getElementById('debugDrawerCloseBtn'),
+  headerAiStatus: document.getElementById('headerAiStatus'),
+  headerAgentState: document.getElementById('headerAgentState'),
+  headerContextMode: document.getElementById('headerContextMode'),
+  debugSessionId: document.getElementById('debugSessionId'),
+  debugPromptId: document.getElementById('debugPromptId'),
+  debugTaskId: document.getElementById('debugTaskId'),
+  debugPlanHash: document.getElementById('debugPlanHash'),
+  debugAgentState: document.getElementById('debugAgentState'),
+  debugProviderStatus: document.getElementById('debugProviderStatus'),
+  debugContextMode: document.getElementById('debugContextMode'),
+  debugTokenUsage: document.getElementById('debugTokenUsage'),
+  debugEvidenceIds: document.getElementById('debugEvidenceIds'),
+  debugPlanJson: document.getElementById('debugPlanJson'),
+  debugActionTrace: document.getElementById('debugActionTrace'),
   uiScanBtn: document.getElementById('uiScanBtn'),
   clearBtn: document.getElementById('clearBtn'),
   sessionBanner: document.getElementById('sessionBanner'),
@@ -365,6 +404,7 @@ const els = {
   generateTestCasesTabBtn: document.getElementById('generateTestCasesTabBtn'),
   copyTestCasesBtn: document.getElementById('copyTestCasesBtn'),
   exportTestCasesMarkdownBtn: document.getElementById('exportTestCasesMarkdownBtn'),
+  exportTestCasesJsonBtn: document.getElementById('exportTestCasesJsonBtn'),
   clearTestCasesBtn: document.getElementById('clearTestCasesBtn'),
   testCasesStatus: document.getElementById('testCasesStatus'),
   testCasesOutput: document.getElementById('testCasesOutput'),
@@ -471,6 +511,15 @@ async function init() {
 function bindEvents() {
   els.startBtn.addEventListener('click', startSession);
   els.stopBtn.addEventListener('click', stopSession);
+  els.stopAgentBtn?.addEventListener('click', () => {
+    void cancelActiveAgentRun('manual stop');
+    markAgentRunStopped('Stopped by tester.');
+  });
+  els.debugDrawerBtn?.addEventListener('click', () => toggleDebugDrawer());
+  els.debugDrawerCloseBtn?.addEventListener('click', () => toggleDebugDrawer(false));
+  els.debugDrawer?.addEventListener('click', (event) => {
+    if (event.target === els.debugDrawer) toggleDebugDrawer(false);
+  });
   els.clearBtn.addEventListener('click', requestClearSession);
   els.uiScanBtn.addEventListener('click', runUiScan);
   if (menuToggleBtn && workspaceNav) {
@@ -574,6 +623,7 @@ function bindEvents() {
   els.generateTestCasesTabBtn?.addEventListener('click', () => runAiTask('generate-test-cases', { source: 'test-cases-tab' }));
   els.copyTestCasesBtn?.addEventListener('click', copyTestCases);
   els.exportTestCasesMarkdownBtn?.addEventListener('click', exportTestCasesMarkdown);
+  els.exportTestCasesJsonBtn?.addEventListener('click', exportTestCasesJson);
   els.clearTestCasesBtn?.addEventListener('click', clearTestCases);
   els.testCaseTypeSelect?.addEventListener('change', renderTestCasesState);
   els.testCaseFormatSelect?.addEventListener('change', renderTestCasesState);
@@ -935,6 +985,39 @@ function toggleMenu() {
   }
 }
 
+function toggleDebugDrawer(open) {
+  debugDrawerOpen = arguments.length ? Boolean(open) : !debugDrawerOpen;
+  if (els.debugDrawer) {
+    els.debugDrawer.classList.toggle('open', debugDrawerOpen);
+    els.debugDrawer.setAttribute('aria-hidden', String(!debugDrawerOpen));
+  }
+  if (document.body?.classList) document.body.classList.toggle('debug-open', debugDrawerOpen);
+  renderDebugDrawer();
+}
+
+function renderDebugDrawer() {
+  const run = state.ai.agentRun || createEmptyAgentRunState();
+  const provider = normalizeAiProviderSettings(state.settings.aiProvider);
+  const usage = provider.usage || {};
+  setText(els.debugSessionId, state.sessionId || 'not captured');
+  setText(els.debugPromptId, run.promptId || 'not captured');
+  setText(els.debugTaskId, run.taskId || 'not captured');
+  setText(els.debugPlanHash, run.planHash || run.requestKey || 'not captured');
+  setText(els.debugAgentState, run.state || run.status || 'idle');
+  setText(els.debugProviderStatus, `${AI_PROVIDER_DEFAULTS[provider.provider]?.label || provider.provider}: ${providerStatusLabel(normalizeProviderStatus(provider.status))}`);
+  setText(els.debugContextMode, state.settings.aiContextMode || 'fast');
+  setText(els.debugTokenUsage, usage.totalTokens ? `${usage.totalTokens} total` : 'not captured');
+  setText(els.debugEvidenceIds, JSON.stringify(run.retrievedEvidenceIds || [], null, 2));
+  setText(els.debugPlanJson, JSON.stringify(run.planPreview || {}, null, 2).slice(0, 6000));
+  setText(els.debugActionTrace, (run.actionTrace || []).length
+    ? run.actionTrace.map((item) => `[${new Date(item.timestamp || Date.now()).toLocaleTimeString()}] ${item.line}`).join('\n')
+    : 'No agent actions yet.');
+}
+
+function setText(element, value) {
+  if (element) element.textContent = String(value ?? '');
+}
+
 function setTestPilotChatMode(mode) {
   const activeMode = mode === 'agent' ? 'agent' : 'chat';
   const previousMode = document.body?.dataset?.testpilotMode || 'chat';
@@ -1078,6 +1161,9 @@ async function restoreSession() {
     state.networkStats = { ...createEmptyNetworkStats(), ...savedNetworkStats };
     state.droppedIssues = { api: 0, console: 0, ui: 0, ...(saved.droppedIssues || {}) };
     state.ai = { ...state.ai, ...(saved.ai || {}) };
+    state.ai.agentRun = normalizeStoredAgentRunState(state.ai.agentRun);
+    state.ai.chatMessages = Array.isArray(state.ai.chatMessages) ? state.ai.chatMessages : [];
+    state.ai.lastAgentResult = state.ai.lastAgentResult || null;
     if (!Array.isArray(state.ai.log) || state.ai.log.length === 0) {
       state.ai.log = ['Backend not checked yet. Start ai-backend with npm start, then click Check AI.'];
     }
@@ -1196,6 +1282,9 @@ async function startSession() {
     analysis: null,
     lastTask: '',
     activeMode: 'analysis',
+    chatMessages: [],
+    lastAgentResult: null,
+    agentRun: createEmptyAgentRunState(),
     error: '',
     log: ['New QA session started. AI is optional; click Check AI before analysis.']
   };
@@ -1213,6 +1302,8 @@ function stopSession() {
   state.endedAt = Date.now();
   state.lastUpdatedAt = state.endedAt;
   state.timeline.push({ type: 'session-stopped', timestamp: state.endedAt, pageUrl: state.pageUrl });
+  void cancelActiveAgentRun('session stopped');
+  markAgentRunStopped('Session stopped.');
   void setContentSession(null);
   schedulePersist();
   render();
@@ -1227,7 +1318,10 @@ function requestClearSession() {
 
   if (clearConfirmationArmed) {
     clearConfirmationArmed = false;
-    if (clearConfirmationTimer) clearTimeout(clearConfirmationTimer);
+    if (clearConfirmationTimer) {
+      clearTimeout(clearConfirmationTimer);
+      clearConfirmationTimer = null;
+    }
     els.clearBtn.textContent = 'Clear';
     void clearSession();
     return;
@@ -1236,8 +1330,10 @@ function requestClearSession() {
   clearConfirmationArmed = true;
   els.clearBtn.textContent = 'Confirm Clear';
   showToast('Click Confirm Clear to remove this temporary session.');
+  if (clearConfirmationTimer) clearTimeout(clearConfirmationTimer);
   clearConfirmationTimer = setTimeout(() => {
     clearConfirmationArmed = false;
+    clearConfirmationTimer = null;
     els.clearBtn.textContent = 'Clear';
   }, 3500);
 }
@@ -1268,6 +1364,11 @@ async function clearSession() {
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = new Map();
   recentEvidenceEvents = [];
+  pendingAgentApprovals.clear();
+  agentApprovalPreferences.clear();
+  state.ai.agentRun = createEmptyAgentRunState();
+  state.ai.lastAgentResult = null;
+  await cancelActiveAgentRun('session cleared');
   await setContentSession(null);
   await removeStoredSessionSnapshot();
   render();
@@ -1285,6 +1386,34 @@ async function setContentSession(sessionId) {
     type: 'TESTPILOT_SET_SESSION',
     sessionId
   });
+}
+
+async function cancelActiveAgentRun(reason) {
+  try {
+    await sendTabMessage({
+      type: 'TESTPILOT_CANCEL_AGENT',
+      reason
+    });
+  } catch {
+    // Content script may be unavailable on restricted pages.
+  }
+}
+
+function markAgentRunStopped(reason) {
+  state.ai.agentRun = {
+    ...(state.ai.agentRun || createEmptyAgentRunState()),
+    state: 'cancelled',
+    status: 'idle',
+    error: reason || '',
+    lastUpdatedAt: Date.now(),
+    actionTrace: boundedArray([
+      ...((state.ai.agentRun && state.ai.agentRun.actionTrace) || []),
+      { event: 'cancelled', line: reason || 'Agent run cancelled.', timestamp: Date.now() }
+    ], 80)
+  };
+  pendingAgentApprovals.clear();
+  aiChatBusy = false;
+  render();
 }
 
 function sendTabMessage(message) {
@@ -1410,9 +1539,30 @@ function compactAiStateForStorage(ai) {
       streaming: false
     })),
     lastAgentResult: summarizeAgentResultForAi(safeAi.lastAgentResult),
+    agentRun: compactAgentRunForStorage(safeAi.agentRun),
     error: safeAi.error || '',
     log: boundedArray(safeAi.log, MAX_PERSISTED_AI_LOGS)
   };
+}
+
+function normalizeStoredAgentRunState(agentRun) {
+  const safe = agentRun && typeof agentRun === 'object' ? agentRun : {};
+  return {
+    ...createEmptyAgentRunState(),
+    ...safe,
+    retrievedEvidenceIds: boundedArray(safe.retrievedEvidenceIds, 20).map((item) => String(item).slice(0, 40)),
+    evidenceCards: boundedArray(safe.evidenceCards, 15).map((item) => String(item).slice(0, 300)),
+    planPreview: safe.planPreview && typeof safe.planPreview === 'object' ? compactStorageValue(safe.planPreview, 0) : null,
+    actionTrace: boundedArray(safe.actionTrace, 80).map((item) => ({
+      event: String(item?.event || 'event').slice(0, 60),
+      line: String(item?.line || '').slice(0, 400),
+      timestamp: Number(item?.timestamp || Date.now())
+    }))
+  };
+}
+
+function compactAgentRunForStorage(agentRun) {
+  return normalizeStoredAgentRunState(agentRun);
 }
 
 function compactAiAnalysisForStorage(analysis) {
@@ -1998,6 +2148,7 @@ function handleAgentEvent(payload, sessionId) {
   const requestKey = String(payload.requestKey || '');
   if (!requestKey) return;
   const event = String(payload.event || 'progress');
+  updateAgentRunDebugState(event, payload, requestKey);
   const live = getOrCreateAgentLiveMessage(requestKey);
   live.timestamp = Date.now();
   live.status = event;
@@ -2015,6 +2166,9 @@ function handleAgentEvent(payload, sessionId) {
     const approval = payload.approval || {};
     pendingAgentApprovals.set(requestKey, {
       requestKey,
+      planHash: approval.planHash || requestKey,
+      promptId: approval.promptId || '',
+      taskId: approval.taskId || '',
       stepFingerprint: approval.stepFingerprint || '',
       resumeFromStepIndex: Number(approval.resumeFromStepIndex || 0),
       command: approval.command || payload.command || '',
@@ -2035,7 +2189,76 @@ function handleAgentEvent(payload, sessionId) {
   }
 
   state.ai.chatMessages = boundedArray(state.ai.chatMessages, 24);
+  renderDebugDrawer();
   renderAiChatMessages();
+}
+
+function updateAgentRunDebugState(event, payload, requestKey) {
+  const previous = state.ai.agentRun || createEmptyAgentRunState();
+  const next = {
+    ...previous,
+    requestKey,
+    promptId: payload.promptId || previous.promptId || '',
+    taskId: payload.taskId || previous.taskId || '',
+    planHash: payload.planHash || previous.planHash || requestKey,
+    taskType: payload.taskType || previous.taskType || '',
+    command: payload.command || previous.command || '',
+    lastUpdatedAt: Date.now(),
+    error: previous.error || ''
+  };
+
+  if (event === 'started') {
+    next.state = 'running';
+    next.status = 'running';
+    next.actionTrace = [];
+  } else if (event === 'state-changed') {
+    next.state = payload.state || next.state || 'running';
+    next.status = agentStatusFromState(next.state);
+  } else if (event === 'evidence-retrieved') {
+    next.state = 'planning';
+    next.status = 'running';
+    next.evidenceCards = Array.isArray(payload.evidenceCards) ? payload.evidenceCards.slice(0, 15) : [];
+    next.retrievedEvidenceIds = next.evidenceCards
+      .map((card) => String(card).match(/\[([A-Z]+-\d{3})\]/)?.[1])
+      .filter(Boolean);
+  } else if (event === 'plan-ready') {
+    next.state = 'planned';
+    next.status = 'running';
+    next.planPreview = {
+      taskType: payload.taskType || next.taskType,
+      evidenceIds: payload.evidenceIds || next.retrievedEvidenceIds || [],
+      steps: payload.steps || []
+    };
+    if (Array.isArray(payload.evidenceIds)) next.retrievedEvidenceIds = payload.evidenceIds.slice(0, 20);
+  } else if (event === 'permission-required') {
+    next.state = 'waiting';
+    next.status = 'waiting';
+  } else if (event === 'blocked') {
+    next.state = 'blocked';
+    next.status = 'blocked';
+    next.error = payload.summary || 'Blocked';
+  } else if (event === 'completed') {
+    next.state = 'completed';
+    next.status = 'idle';
+  }
+
+  const traceLine = formatAgentEventLine(event, payload);
+  if (traceLine) {
+    next.actionTrace = boundedArray([...(next.actionTrace || []), {
+      event,
+      line: traceLine,
+      timestamp: Date.now()
+    }], 80);
+  }
+  state.ai.agentRun = next;
+}
+
+function agentStatusFromState(stateValue) {
+  if (['awaiting_confirmation', 'waiting'].includes(stateValue)) return 'waiting';
+  if (['blocked'].includes(stateValue)) return 'blocked';
+  if (['failed', 'cancelled'].includes(stateValue)) return 'failed';
+  if (['idle', 'completed'].includes(stateValue)) return 'idle';
+  return 'running';
 }
 
 function getOrCreateAgentLiveMessage(requestKey) {
@@ -2059,6 +2282,8 @@ function formatAgentEventLine(event, payload) {
   const step = Number(payload.stepNumber || Number(payload.stepIndex || 0) + 1);
   const target = payload.targetLabel ? ` on ${payload.targetLabel}` : (payload.targetIndex ? ` on #${payload.targetIndex}` : '');
   if (event === 'started') return `Started ${String(payload.taskType || 'agent task').replace(/_/g, ' ')}.`;
+  if (event === 'evidence-retrieved') return `Retrieved grounded evidence before planning.`;
+  if (event === 'state-changed') return `State: ${String(payload.state || 'working').replace(/_/g, ' ')}.`;
   if (event === 'plan-ready') return `Created a safe plan with ${Number(payload.totalSteps || (payload.steps || []).length || 0)} step(s).`;
   if (event === 'step-started') return `Step ${step}: ${payload.action}${target}. ${payload.reason || ''}`.trim();
   if (event === 'field-updated') return `${capitalize(payload.action || 'update')}${target}: ${payload.valuePreview || payload.message || 'updated'}.`;
@@ -2539,7 +2764,10 @@ function render() {
   els.quickExportBtn.disabled = !hasSession;
   els.quickCopyBtn.disabled = !hasSession;
   const aiBusy = state.ai.status === 'checking' || state.ai.status === 'analyzing';
+  const agentRun = state.ai.agentRun || createEmptyAgentRunState();
+  const agentRunning = ['running', 'waiting', 'blocked'].includes(agentRun.status);
   els.checkAiBtn.disabled = aiBusy;
+  if (els.stopAgentBtn) els.stopAgentBtn.disabled = !['running', 'waiting'].includes(agentRun.status);
   if (els.analyzeAiBtn) els.analyzeAiBtn.disabled = aiBusy || !hasSession;
   if (els.generateTestsBtn) els.generateTestsBtn.disabled = aiBusy || !hasSession;
   if (els.generateBugsBtn) els.generateBugsBtn.disabled = aiBusy || !hasSession;
@@ -2553,6 +2781,7 @@ function render() {
   if (els.generateTestCasesTabBtn) els.generateTestCasesTabBtn.disabled = aiBusy || !hasSession;
   if (els.copyTestCasesBtn) els.copyTestCasesBtn.disabled = !hasTestCases;
   if (els.exportTestCasesMarkdownBtn) els.exportTestCasesMarkdownBtn.disabled = !hasTestCases;
+  if (els.exportTestCasesJsonBtn) els.exportTestCasesJsonBtn.disabled = !hasTestCases;
   if (els.clearTestCasesBtn) els.clearTestCasesBtn.disabled = !hasTestCases;
   const hasBugDrafts = getCurrentBugDrafts().length > 0;
   if (els.generateBugReportTabBtn) els.generateBugReportTabBtn.disabled = aiBusy || !hasSession;
@@ -2571,8 +2800,24 @@ function render() {
   renderReportBuilderState();
   renderDashboardGuidance(counts);
   renderAiState();
+  renderHeaderRuntimeStatus();
+  renderDebugDrawer();
 
   renderIssues();
+}
+
+function renderHeaderRuntimeStatus() {
+  const run = state.ai.agentRun || createEmptyAgentRunState();
+  const aiLabel = getAiStatusLabel();
+  setText(els.headerAiStatus, aiLabel);
+  setText(els.headerAgentState, capitalize(String(run.status || 'idle').replace(/_/g, ' ')));
+  setText(els.headerContextMode, capitalize(state.settings.aiContextMode || 'fast'));
+  if (els.headerAiStatus?.parentElement?.dataset) {
+    els.headerAiStatus.parentElement.dataset.status = state.ai.status || 'not-configured';
+  }
+  if (els.headerAgentState?.parentElement?.dataset) {
+    els.headerAgentState.parentElement.dataset.status = run.status || 'idle';
+  }
 }
 
 function getAiStatusLabel() {
@@ -2942,6 +3187,7 @@ async function submitAiChat(value) {
   }
 
   if (document.body?.dataset?.testpilotMode === 'agent') {
+    cancelPendingAgentApprovalsForNewPrompt(question);
     void checkAiHealth({ silent: true, reason: 'agent-send' });
     await runAgentCommand(question);
     return;
@@ -3178,12 +3424,15 @@ async function runAgentCommand(command, options = {}) {
       throw new Error((result.response && result.response.error) || result.error || 'Agent could not connect to the inspected page.');
     }
     const rawAgentResult = result.response.result;
-    if (rawAgentResult?.safety?.requiresConfirmation) {
+    const approvalPayload = rawAgentResult?.safety?.approval || rawAgentResult?.approval || null;
+    if (rawAgentResult?.safety?.requiresConfirmation && approvalPayload) {
       const requestKey = rawAgentResult.requestKey || rawAgentResult.safety?.requestKey || '';
-      const approvalPayload = rawAgentResult.safety.approval || rawAgentResult.approval || null;
       if (requestKey && !pendingAgentApprovals.has(requestKey)) {
         pendingAgentApprovals.set(requestKey, {
           requestKey,
+          planHash: approvalPayload?.planHash || requestKey,
+          promptId: approvalPayload?.promptId || '',
+          taskId: approvalPayload?.taskId || '',
           stepFingerprint: approvalPayload?.stepFingerprint || '',
           resumeFromStepIndex: Number(approvalPayload?.resumeFromStepIndex || 0),
           command: approvalPayload?.command || command,
@@ -3226,6 +3475,17 @@ async function runAgentCommand(command, options = {}) {
       text: `Agent could not complete the workflow.\n\nReason: ${formatAiError(error)}\n\nReload the inspected page, confirm this is a normal web page, then try a narrower command such as "Test the search box."`,
       timestamp: Date.now()
     });
+    state.ai.agentRun = {
+      ...(state.ai.agentRun || createEmptyAgentRunState()),
+      state: 'failed',
+      status: 'failed',
+      error: formatAiError(error),
+      lastUpdatedAt: Date.now(),
+      actionTrace: boundedArray([
+        ...((state.ai.agentRun && state.ai.agentRun.actionTrace) || []),
+        { event: 'failed', line: `Agent failed: ${formatAiError(error)}`, timestamp: Date.now() }
+      ], 80)
+    };
     addAiLog(`agent failed: ${formatAiError(error)}`);
   } finally {
     aiChatBusy = false;
@@ -3267,12 +3527,30 @@ function buildAgentApprovalPayload(requestKey, reason, approval = {}) {
   return {
     approved: true,
     requestKey,
+    planHash: approval.planHash || requestKey,
+    promptId: approval.promptId || '',
+    taskId: approval.taskId || '',
     stepFingerprint: approval.stepFingerprint || '',
     resumeFromStepIndex: Number(approval.resumeFromStepIndex || 0),
     previousActionResults: Array.isArray(approval.previousActionResults) ? approval.previousActionResults : [],
     approvedAt: Date.now(),
     reason
   };
+}
+
+function cancelPendingAgentApprovalsForNewPrompt(question) {
+  if (!pendingAgentApprovals.size) return;
+  const cancelled = Array.from(pendingAgentApprovals.keys());
+  pendingAgentApprovals.clear();
+  for (const requestKey of cancelled) {
+    markAgentPermissionMessage(requestKey, `Cancelled stale approval because a new Agent prompt was sent: "${String(question || '').slice(0, 120)}"`);
+  }
+  state.ai.chatMessages.push({
+    role: 'assistant',
+    type: 'separator',
+    text: 'Previous pending Agent approval was cancelled. A fresh plan is being built for the new prompt.',
+    timestamp: Date.now()
+  });
 }
 
 function shouldAutoApproveAgent(approval) {
@@ -3422,6 +3700,7 @@ function formatLinkedEvidenceEvent(event) {
 
 function formatAgentResultForChat(agentResult) {
   const result = agentResult.result || {};
+  if (result.finalOutput) return String(result.finalOutput).trim();
   const plan = agentResult.plan || {};
   const actionResults = Array.isArray(agentResult.actionResults) ? agentResult.actionResults : [];
   const quality = agentResult.evidenceQuality || buildAgentEvidenceQuality(actionResults, agentResult.linkedEvidence || [], result);
@@ -3726,23 +4005,35 @@ function getCurrentTestCases() {
 }
 
 function getSelectedTestCaseType() {
-  return String(els.testCaseTypeSelect?.value || 'All Types').trim();
+  const select = els.testCaseTypeSelect;
+  return String(select && select.value ? select.value : 'All Types').trim();
 }
 
 function getSelectedTestCaseFormat() {
-  return String(els.testCaseFormatSelect?.value || 'Step-by-step').trim();
+  const select = els.testCaseFormatSelect;
+  return String(select && select.value ? select.value : 'Step-by-step').trim();
 }
 
-function filterTestCasesForSelectedType(testCases) {
-  const selected = getSelectedTestCaseType().toLowerCase();
-  if (!selected || selected === 'all types') return testCases;
-  return testCases.filter((testCase) => String(testCase.type || '').toLowerCase().includes(selected.replace(/\s+/g, ' ')));
-}
+function filterTestCasesForSelectedType(testCases = []) {
+  const selected = String(getSelectedTestCaseType() || '').trim().toLowerCase();
+  const items = Array.isArray(testCases) ? testCases : [];
 
+  if (!selected || selected === 'all types') return items;
+
+  const normalized = selected.replace(/\s+/g, ' ').trim();
+
+  return items.filter((testCase) => {
+    const type = String(testCase?.type || '').trim().toLowerCase();
+    if (normalized === 'edge') return type.includes('edge');
+    return type.includes(normalized);
+  });
+}
 function readTestCasePreferences() {
+  const type = getSelectedTestCaseType();
+  const format = getSelectedTestCaseFormat();
   return {
-    type: getSelectedTestCaseType(),
-    format: getSelectedTestCaseFormat()
+    type,
+    format
   };
 }
 
@@ -3763,6 +4054,25 @@ function exportTestCasesMarkdown() {
   }
   downloadBlob(buildTestCasesMarkdown(testCases), `testpilot-test-cases-${dateFilePart()}.md`, 'text/markdown;charset=utf-8');
   showToast('Test cases exported.', 'success');
+}
+
+function exportTestCasesJson() {
+  const testCases = filterTestCasesForSelectedType(getCurrentTestCases());
+  if (!testCases.length) {
+    showToast('No test cases to export yet.', 'error');
+    return;
+  }
+  const payload = {
+    tool: 'TestPilot',
+    version: VERSION,
+    generatedAt: new Date().toISOString(),
+    pageUrl: state.pageUrl,
+    contextMode: state.settings.aiContextMode || 'fast',
+    evidenceCards: buildSessionEvidenceCards(buildCompactAiSessionSummary('generate-test-cases'), 'generate-test-cases', getAiContextMode('generate-test-cases')),
+    testCases
+  };
+  downloadBlob(JSON.stringify(redactObject(payload), null, 2), `testpilot-test-cases-${dateFilePart()}.json`, 'application/json');
+  showToast('Test case JSON exported.', 'success');
 }
 
 function clearTestCases() {
@@ -3881,12 +4191,25 @@ function renderBugDraftCard(draft) {
   const actual = makeLabelledParagraph('Actual:', draft.actualResult || 'Actual behavior was not provided.');
   const evidence = document.createElement('p');
   evidence.className = 'bug-draft-evidence';
-  evidence.append(makeStrongLabel('Evidence:'), document.createTextNode(` ${draft.evidenceSummary || 'Evidence summary was not provided.'}`));
+  const evidenceSummary = draft.evidenceSummary || 'Evidence summary was not provided.';
+  evidence.append(makeStrongLabel('Evidence:'), document.createTextNode(` ${evidenceSummary}`));
+  const evidenceIds = extractEvidenceIds(evidenceSummary);
+  const evidenceIdLine = document.createElement('p');
+  evidenceIdLine.className = 'bug-draft-evidence-ids';
+  evidenceIdLine.append(makeStrongLabel('Evidence IDs:'), document.createTextNode(` ${evidenceIds.length ? evidenceIds.join(', ') : 'not captured'}`));
+  const weakEvidence = !evidenceIds.length || /needs review|not captured|weak|uncertain/i.test(`${draft.severity || ''} ${evidenceSummary}`);
+  const warning = document.createElement('p');
+  warning.className = `bug-draft-warning${weakEvidence ? '' : ' hidden'}`;
+  warning.textContent = 'Needs-review warning: evidence is weak or missing IDs. Confirm manually before filing.';
 
   article.append(meta, title);
   if (steps.children.length) article.appendChild(steps);
-  article.append(expected, actual, evidence);
+  article.append(expected, actual, evidence, evidenceIdLine, warning);
   return article;
+}
+
+function extractEvidenceIds(text) {
+  return Array.from(new Set(String(text || '').match(/\b[A-Z]+-\d{3}\b/g) || [])).slice(0, 20);
 }
 
 function makeLabelledParagraph(label, value) {
@@ -3969,7 +4292,13 @@ function buildBugReportsMarkdown(drafts) {
     (draft.stepsToReproduce || []).forEach((step, index) => lines.push(`${index + 1}. ${step}`));
     lines.push('', `Expected Result: ${draft.expectedResult || 'N/A'}`);
     lines.push(`Actual Result: ${draft.actualResult || 'N/A'}`);
-    lines.push(`Evidence: ${draft.evidenceSummary || 'N/A'}`, '');
+    const evidenceIds = extractEvidenceIds(draft.evidenceSummary || '');
+    lines.push(`Evidence: ${draft.evidenceSummary || 'N/A'}`);
+    lines.push(`Evidence IDs: ${evidenceIds.length ? evidenceIds.join(', ') : 'not captured'}`);
+    if (!evidenceIds.length || /needs review|not captured|weak|uncertain/i.test(`${draft.severity || ''} ${draft.evidenceSummary || ''}`)) {
+      lines.push('Needs-review warning: evidence is weak or missing IDs. Confirm manually before filing.');
+    }
+    lines.push('');
   }
 
   return lines.join('\n').trim();
@@ -4119,6 +4448,7 @@ function buildProviderChatMessages(question) {
       content: [
         'You are TestPilot, a concise QA assistant inside a Chrome DevTools extension.',
         'Answer only from the provided sanitized QA session context.',
+        'Prefer the retrieved evidenceCards. Cite evidence IDs when making concrete API, console, UI, or Agent claims.',
         'Do not invent bugs. If evidence is missing, ask for the next useful test.',
         'Never request or reveal API keys, cookies, passwords, or tokens.'
       ].join(' ')
@@ -4149,7 +4479,8 @@ function buildProviderTaskMessages(task) {
       content: [
         `You are TestPilot AI for ${taskLabel}.`,
         'Return only valid JSON matching the requested schema.',
-        'Use only the sanitized session evidence.',
+        'Use only the sanitized session evidence, especially evidenceCards.',
+        'Concrete claims must be supported by evidence IDs or marked needs review.',
         'Do not invent product features, credentials, headers, cookies, tokens, or screenshots.',
         'Mark weak evidence as needs review.'
       ].join(' ')
@@ -4207,6 +4538,7 @@ function buildCompactAiSessionSummary(task) {
   const compact = {
     ...session,
     contextMode: mode,
+    evidenceCards: buildSessionEvidenceCards(session, task, mode),
     actionableFindings: dedupeAiItems(session.actionableFindings).slice(0, limits.actionable),
     needsReviewFindings: dedupeAiItems(session.needsReviewFindings).slice(0, limits.review),
     recommendedLimits: {
@@ -4223,6 +4555,51 @@ function buildCompactAiSessionSummary(task) {
   }
   if (compact.recommendedNextTests) compact.recommendedNextTests = compact.recommendedNextTests.slice(0, limits.tests);
   return redactObject(compact);
+}
+
+function buildSessionEvidenceCards(session, task, mode = 'fast') {
+  const limit = { fast: 8, balanced: 12, deep: 15 }[mode] || 8;
+  const cards = [];
+  const add = (id, type, text, score = 1) => {
+    if (!id || !text || cards.some((card) => card.id === id)) return;
+    cards.push({
+      id,
+      type,
+      score,
+      text: `[${id}] ${redactText(String(text), 260)}`
+    });
+  };
+  let apiIndex = 1;
+  let conIndex = 1;
+  let uiIndex = 1;
+  for (const issue of [...(session.actionableFindings || []), ...(session.needsReviewFindings || [])].slice(0, 24)) {
+    const prefix = issue.type === 'api'
+      ? `API-${String(apiIndex++).padStart(3, '0')}`
+      : (issue.type === 'console'
+        ? `CON-${String(conIndex++).padStart(3, '0')}`
+        : `UI-${String(uiIndex++).padStart(3, '0')}`);
+    const score = issue.category === 'actionable' ? 6 : 3;
+    add(prefix, issue.type || 'finding', `${issue.title || 'Finding'} - ${issue.evidenceSummary || issue.description || 'not captured'}`, score);
+  }
+  const agent = session.latestAgentResult;
+  if (agent) {
+    add('RESULT-001', 'agent-result', `Agent ${agent.taskType || 'task'} ended ${agent.status || 'needs_review'}: ${agent.summary || 'not captured'}`, 8);
+    let actionIndex = 1;
+    for (const action of agent.actionResults || []) {
+      add(`ACT-${String(actionIndex++).padStart(3, '0')}`, 'agent-action', `${action.action || 'action'} ${action.targetLabel || ''}: ${action.message || 'not captured'}`, action.success ? 5 : 7);
+    }
+  }
+  for (const event of recentEvidenceEvents.slice(-8)) {
+    const prefix = event.type === 'console'
+      ? `CON-${String(conIndex++).padStart(3, '0')}`
+      : `API-${String(apiIndex++).padStart(3, '0')}`;
+    add(prefix, event.type || 'event', event.summary || event.title || 'Recent evidence event', 4);
+  }
+  if (session.pageUrl) add('PAGE-001', 'page', `Current URL ${session.pageUrl}`, 2);
+  return cards
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit)
+    .map(({ score, ...card }) => card);
 }
 
 function getAiContextMode(task) {

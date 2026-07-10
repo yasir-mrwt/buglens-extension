@@ -8,6 +8,11 @@
   const MAX_AGENT_ELEMENTS = 80;
   const AGENT_TYPE_DELAY_MS = 38;
   const ALLOWED_AGENT_ACTIONS = new Set(['click', 'type', 'clear', 'select', 'check', 'uncheck', 'scroll', 'highlight', 'wait', 'observe', 'navigate']);
+  const AGENT_EVIDENCE_CARD_LIMITS = {
+    fast: 8,
+    balanced: 12,
+    deep: 15
+  };
   const SAFE_DUMMY_VALUES = {
     email: 'invalid-email',
     validEmail: 'qa.test@example.com',
@@ -18,9 +23,627 @@
     invalidPhone: 'abc',
     message: 'This is a QA validation test.',
     search: 'test',
+    symbols: '!@#$%^&*()_+-=[]{};:,.<>?',
     generic: 'test'
   };
   let activeSessionId = null;
+  const agentRuntime = {
+    sessionId: null,
+    state: 'idle',
+    cancelled: false,
+    activeTaskId: null,
+    counters: { PAGE: 0, DOM: 0, ACT: 0, OBS: 0, API: 0, CON: 0, PLAN: 0, RESULT: 0, PROMPT: 0, TASK: 0 },
+    memory: {
+      prompts: [],
+      pages: [],
+      dom: [],
+      plans: [],
+      actions: [],
+      observations: [],
+      results: [],
+      console: [],
+      network: [],
+      traces: []
+    }
+  };
+
+  const AgentToolRegistry = {
+    click: { targets: ['button', 'link', 'tab', 'accordion', 'pagination', 'modal_trigger'], timeoutMs: 2500, retryStale: true, observe: true },
+    type: { targets: ['input', 'textarea'], timeoutMs: 4000, retryStale: true, observe: true },
+    clear: { targets: ['input', 'textarea'], timeoutMs: 1800, retryStale: true, observe: true },
+    select: { targets: ['select'], timeoutMs: 2500, retryStale: true, observe: true },
+    check: { targets: ['checkbox', 'radio'], timeoutMs: 1800, retryStale: true, observe: true },
+    uncheck: { targets: ['checkbox', 'radio'], timeoutMs: 1800, retryStale: true, observe: true },
+    scroll: { targets: ['page'], timeoutMs: 1500, retryStale: false, observe: true },
+    highlight: { targets: ['button', 'link', 'input', 'textarea', 'select', 'checkbox', 'radio', 'tab', 'accordion', 'pagination', 'modal_trigger', 'table', 'upload'], timeoutMs: 1200, retryStale: true, observe: false },
+    observe: { targets: ['page'], timeoutMs: 1000, retryStale: false, observe: true },
+    wait: { targets: ['page'], timeoutMs: 3500, retryStale: false, observe: true }
+  };
+
+  const SessionManager = {
+    setSession(sessionId) {
+      if (agentRuntime.sessionId !== sessionId) this.reset(sessionId);
+      agentRuntime.sessionId = sessionId || null;
+      agentRuntime.cancelled = false;
+      AgentStateMachine.set('idle', { reason: sessionId ? 'session-set' : 'session-cleared' });
+    },
+    reset(sessionId = null) {
+      agentRuntime.sessionId = sessionId || null;
+      agentRuntime.cancelled = false;
+      agentRuntime.activeTaskId = null;
+      agentRuntime.counters = { PAGE: 0, DOM: 0, ACT: 0, OBS: 0, API: 0, CON: 0, PLAN: 0, RESULT: 0, PROMPT: 0, TASK: 0 };
+      agentRuntime.memory = { prompts: [], pages: [], dom: [], plans: [], actions: [], observations: [], results: [], console: [], network: [], traces: [] };
+    },
+    createRun(prompt) {
+      const promptId = EvidenceStore.nextId('PROMPT');
+      const taskId = EvidenceStore.nextId('TASK');
+      agentRuntime.activeTaskId = taskId;
+      EvidenceStore.add('prompts', { id: promptId, taskId, prompt, timestamp: Date.now() });
+      return { promptId, taskId };
+    },
+    cancel(reason = 'cancelled') {
+      agentRuntime.cancelled = true;
+      AgentStateMachine.set('cancelled', { reason });
+    }
+  };
+
+  const EvidenceStore = {
+    nextId(prefix) {
+      const key = String(prefix || '').toUpperCase();
+      agentRuntime.counters[key] = Number(agentRuntime.counters[key] || 0) + 1;
+      return `${key}-${String(agentRuntime.counters[key]).padStart(3, '0')}`;
+    },
+    add(bucket, item) {
+      if (!agentRuntime.memory[bucket]) agentRuntime.memory[bucket] = [];
+      agentRuntime.memory[bucket].push({ ...item, timestamp: item.timestamp || Date.now() });
+      agentRuntime.memory[bucket] = agentRuntime.memory[bucket].slice(-80);
+      return item;
+    },
+    snapshot() {
+      return {
+        state: agentRuntime.state,
+        activeTaskId: agentRuntime.activeTaskId,
+        prompts: agentRuntime.memory.prompts.slice(-6),
+        pages: agentRuntime.memory.pages.slice(-4),
+        plans: agentRuntime.memory.plans.slice(-4),
+        actions: agentRuntime.memory.actions.slice(-16),
+        observations: agentRuntime.memory.observations.slice(-8),
+        results: agentRuntime.memory.results.slice(-4),
+        console: agentRuntime.memory.console.slice(-8),
+        network: agentRuntime.memory.network.slice(-8),
+        traces: agentRuntime.memory.traces.slice(-20)
+      };
+    }
+  };
+
+  const DebugTraceService = {
+    log(stage, detail = {}) {
+      const trace = {
+        id: EvidenceStore.nextId('OBS'),
+        stage,
+        detail: compactAgentDebugDetail(detail),
+        timestamp: Date.now()
+      };
+      EvidenceStore.add('traces', trace);
+      return trace;
+    }
+  };
+
+  const AgentStateMachine = {
+    set(state, payload = {}) {
+      agentRuntime.state = state;
+      DebugTraceService.log(`state:${state}`, payload);
+      emitAgentEvent('state-changed', {
+        requestKey: payload.requestKey || '',
+        state,
+        summary: payload.summary || `Agent state changed to ${state}.`
+      });
+    },
+    assertActive() {
+      if (agentRuntime.cancelled) throw new Error('Agent run was cancelled.');
+    }
+  };
+
+  const PageSnapshotService = {
+    capture() {
+      AgentStateMachine.set('snapshotting', { summary: 'Capturing compact page snapshot.' });
+      const context = extractAgentPageContext();
+      context.snapshotId = EvidenceStore.nextId('PAGE');
+      context.elements = (context.elements || []).map((element) => ({
+        ...element,
+        evidenceId: element.evidenceId || EvidenceStore.nextId('DOM')
+      }));
+      context.forms = (context.forms || []).map((form) => ({ ...form, evidenceId: form.evidenceId || EvidenceStore.nextId('DOM') }));
+      context.snapshotHash = simpleHash(JSON.stringify({
+        url: context.url,
+        title: context.title,
+        pageType: context.pageType,
+        elements: context.elements.map((item) => [item.evidenceId, item.role, item.label, item.text, item.type, item.riskFlags]),
+        forms: context.forms
+      }));
+      EvidenceStore.add('pages', {
+        id: context.snapshotId,
+        url: context.url,
+        title: context.title,
+        pageType: context.pageType,
+        snapshotHash: context.snapshotHash,
+        elementCount: context.elements.length
+      });
+      for (const element of context.elements.slice(0, 80)) EvidenceStore.add('dom', element);
+      return context;
+    }
+  };
+
+  const DataStrategyResolver = {
+    resolve(command) {
+      return detectDataStrategy(command);
+    }
+  };
+
+  const IntentClassifier = {
+    classify(command, context) {
+      AgentStateMachine.set('classifying', { summary: 'Classifying tester intent.' });
+      const text = String(command || '').toLowerCase();
+      const dataStrategy = DataStrategyResolver.resolve(command);
+      let intent = 'inspect';
+      if (/\b(generate|create|draft|write)\b.*\b(test|case|scenario)\b/.test(text)) intent = 'generate_tests';
+      else if (/\b(bug report|jira|defect|issue report)\b/.test(text)) intent = 'bug_report';
+      else if (/^(why|what|explain|is\b|are\b|where\b|how\b)/.test(text) || /\bbroken\b/.test(text)) intent = 'answer';
+      else if (/\b(highlight|show|inspect|scan|review|check)\b/.test(text)) intent = 'inspect';
+      if (/\b(click|open|try|continue|go to|select)\b/.test(text)) intent = 'click';
+      if (/\b(fill|type|enter|change|input)\b/.test(text)) intent = 'fill';
+      if (/\b(submit|save|send|login|log in|sign in|register|sign up|signup|create account|place order|checkout)\b/.test(text)) intent = 'submit';
+      if (/\b(validate|validation|required|empty|invalid|symbols|symbol)\b/.test(text)) intent = ['click', 'submit'].includes(intent) ? intent : 'validate';
+      const target = TargetResolver.detectTargetLabel(text, context);
+      const taskType = mapIntentToAgentTask(intent, target, dataStrategy, command, context);
+      const risk = SafetyValidator.classifyIntentRisk(intent, target, dataStrategy);
+      return {
+        intent,
+        target,
+        dataStrategy,
+        taskType,
+        risk,
+        executionMode: risk === 'blocked' ? 'blocked' : (risk === 'needs_confirmation' ? 'needs_confirmation' : (intent === 'answer' ? 'answer_only' : 'plan_action'))
+      };
+    }
+  };
+
+  const TargetResolver = {
+    detectTargetLabel(text, context) {
+      if (/\b(first input|first field|1st input|1st field)\b/.test(text)) return 'first input';
+      if (/\bgoogle|gmail|oauth|sso|social login\b/.test(text)) return 'google button';
+      if (/\bsignup|sign up|register|create account|join\b/.test(text)) return 'signup link';
+      if (/\blogin|log in|sign in\b/.test(text)) return 'login button';
+      if (/\bsearch\b/.test(text)) return 'search box';
+      if (/\bmodal|dialog|popup\b/.test(text)) return 'modal';
+      if (/\btable|row|column\b/.test(text)) return 'table';
+      if (context.forms && context.forms.length) return 'form';
+      return 'page';
+    },
+    resolve(intentContext, context) {
+      const target = intentContext.target;
+      const elements = context.elements || [];
+      const textFor = (item) => `${item.role || ''} ${item.text || ''} ${item.label || ''} ${item.placeholder || ''} ${item.type || ''}`.toLowerCase();
+      let matches = [];
+      if (target === 'first input') matches = elements.filter((item) => ['input', 'textarea'].includes(item.role)).slice(0, 1);
+      else if (target === 'google button') matches = elements.filter((item) => /google|gmail|oauth|sso/.test(textFor(item))).slice(0, 3);
+      else if (target === 'signup link') matches = elements.filter((item) => ['link', 'button'].includes(item.role) && /sign up|signup|register|create account|join/.test(textFor(item))).slice(0, 3);
+      else if (target === 'login button') matches = elements.filter((item) => ['link', 'button'].includes(item.role) && /log in|login|sign in/.test(textFor(item))).slice(0, 3);
+      else if (target === 'search box') matches = elements.filter((item) => ['input', 'textarea'].includes(item.role) && /search|query|keyword/.test(textFor(item))).slice(0, 2);
+      else if (target === 'modal') matches = elements.filter((item) => ['modal_trigger', 'button', 'link'].includes(item.role) && /modal|dialog|popup|open/.test(textFor(item))).slice(0, 3);
+      else if (target === 'table') matches = elements.filter((item) => item.role === 'table').slice(0, 2);
+      else if (target === 'form') matches = elements.filter((item) => ['input', 'textarea', 'select', 'checkbox', 'radio', 'button'].includes(item.role)).slice(0, 8);
+      const targetEvidenceIds = matches.map((item) => item.evidenceId).filter(Boolean);
+      return { target, elements: matches, targetEvidenceIds, primary: matches[0] || null };
+    }
+  };
+
+  const SessionRagRetriever = {
+    retrieve({ prompt, context, intentContext, targetResolution, mode = 'fast' }) {
+      const limit = AGENT_EVIDENCE_CARD_LIMITS[mode] || AGENT_EVIDENCE_CARD_LIMITS.fast;
+      const terms = tokenizeForRag([
+        prompt,
+        intentContext?.intent,
+        intentContext?.target,
+        intentContext?.dataStrategy,
+        context?.url,
+        context?.pageType
+      ].join(' '));
+      const cards = [];
+      const add = (candidate) => {
+        if (!candidate || !candidate.id) return;
+        if (cards.some((item) => item.id === candidate.id)) return;
+        cards.push(candidate);
+      };
+
+      for (const element of context.elements || []) {
+        const haystack = [
+          element.role,
+          element.type,
+          element.text,
+          element.label,
+          element.placeholder,
+          element.href,
+          element.riskFlags?.join(' ')
+        ].join(' ');
+        const score = scoreEvidenceCandidate({
+          text: haystack,
+          terms,
+          type: 'dom',
+          url: context.url,
+          currentUrl: context.url,
+          isTarget: (targetResolution?.targetEvidenceIds || []).includes(element.evidenceId),
+          recencyRank: 1,
+          intent: intentContext?.intent,
+          role: element.role
+        });
+        if (score <= 0) continue;
+        add({
+          id: element.evidenceId,
+          type: 'dom',
+          score,
+          text: formatDomEvidenceCard(element),
+          role: element.role,
+          targetIndex: element.index,
+          targetEvidenceId: element.evidenceId
+        });
+      }
+
+      for (const [index, action] of [...agentRuntime.memory.actions].reverse().slice(0, 12).entries()) {
+        const score = scoreEvidenceCandidate({
+          text: `${action.action || ''} ${action.targetLabel || ''} ${action.message || ''}`,
+          terms,
+          type: 'action',
+          currentUrl: context.url,
+          recencyRank: index + 1,
+          intent: intentContext?.intent
+        });
+        if (score <= 0) continue;
+        add({
+          id: action.id || `ACT-${String(index + 1).padStart(3, '0')}`,
+          type: 'action',
+          score,
+          text: `[${action.id || 'ACT'}] ${capitalizeAgentText(action.action || 'Action')} ${action.targetLabel ? `on "${action.targetLabel}" ` : ''}${action.success ? 'succeeded' : 'needs review'}: ${sanitizePageText(action.message || 'not captured', 160)}`,
+          actionId: action.id || '',
+          timestamp: action.timestamp || 0
+        });
+      }
+
+      for (const [index, observation] of [...agentRuntime.memory.observations].reverse().slice(0, 8).entries()) {
+        const text = Array.isArray(observation.evidence) ? observation.evidence.join(' ') : String(observation.evidence || '');
+        const score = scoreEvidenceCandidate({
+          text,
+          terms,
+          type: 'observation',
+          url: observation.url,
+          currentUrl: context.url,
+          recencyRank: index + 1,
+          intent: intentContext?.intent
+        });
+        if (score <= 0) continue;
+        add({
+          id: observation.id || `OBS-${String(index + 1).padStart(3, '0')}`,
+          type: 'observation',
+          score,
+          text: `[${observation.id || 'OBS'}] ${sanitizePageText(text || 'Observation captured with no visible result.', 220)}`,
+          timestamp: observation.timestamp || 0
+        });
+      }
+
+      for (const [index, item] of [...agentRuntime.memory.console].reverse().slice(0, 8).entries()) {
+        const score = scoreEvidenceCandidate({
+          text: `${item.level || ''} ${item.message || ''}`,
+          terms,
+          type: 'console',
+          url: item.url,
+          currentUrl: context.url,
+          recencyRank: index + 1,
+          intent: intentContext?.intent
+        });
+        if (score <= 0) continue;
+        add({
+          id: item.id,
+          type: 'console',
+          score,
+          text: `[${item.id}] Console ${item.level || 'event'}: ${sanitizePageText(item.message || 'not captured', 180)}`,
+          timestamp: item.timestamp || 0
+        });
+      }
+
+      const currentPageCard = {
+        id: context.snapshotId,
+        type: 'page',
+        score: 4,
+        text: `[${context.snapshotId}] ${context.pageType || 'page'} at ${safeRelativeUrl(context.url)}: ${sanitizePageText(context.summary || 'not captured', 220)}`
+      };
+      return [currentPageCard, ...cards]
+        .sort((a, b) => b.score - a.score)
+        .slice(0, limit)
+        .map((card, index) => ({ ...card, rank: index + 1 }));
+    }
+  };
+
+  const GroundedPlanner = {
+    build({ command, taskType, context, options, evidenceCards, promptId, taskId, planHash }) {
+      const targetEvidenceIds = new Set((evidenceCards || []).map((card) => card.targetEvidenceId || card.id));
+      const plan = buildAgentPlan(command, taskType, context, { ...options, evidenceCards });
+      plan.userRequirement = command;
+      plan.evidenceIds = (evidenceCards || []).map((card) => card.id).slice(0, 15);
+      plan.steps = (plan.steps || []).map((step) => normalizePlanStepEvidence(step, context, targetEvidenceIds));
+      plan.steps = plan.steps.filter(Boolean);
+      plan.executionMode = options.intentContext?.executionMode || plan.executionMode || 'plan_action';
+      plan.risk = plan.executionMode === 'blocked'
+        ? 'blocked'
+        : (plan.executionMode === 'needs_confirmation' ? 'needs_confirmation' : 'safe');
+      plan.promptId = promptId;
+      plan.taskId = taskId;
+      plan.planHash = planHash;
+      return plan;
+    }
+  };
+
+  const SafetyValidator = {
+    classifyIntentRisk(intent, target, dataStrategy) {
+      if (dataStrategy === 'user_provided') return 'needs_confirmation';
+      if (/google|oauth|sso/.test(target)) return 'needs_confirmation';
+      if (['submit'].includes(intent)) return 'needs_confirmation';
+      return 'safe';
+    }
+  };
+
+  const PlanHashService = {
+    create({ sessionId, pageUrl, userPrompt, intent, targetEvidenceIds, dataStrategy, pageSnapshotHash }) {
+      const source = [
+        sessionId || '',
+        pageUrl || '',
+        userPrompt || '',
+        intent || '',
+        (targetEvidenceIds || []).join(','),
+        dataStrategy || 'none',
+        pageSnapshotHash || ''
+      ].join('|');
+      return simpleHash(source);
+    }
+  };
+
+  function compactAgentDebugDetail(detail = {}) {
+    try {
+      return JSON.parse(JSON.stringify(detail, (key, value) => {
+        if (typeof value === 'string') return sanitizePageText(value, 240);
+        if (Array.isArray(value)) return value.slice(0, 12);
+        return value;
+      }));
+    } catch {
+      return {};
+    }
+  }
+
+  function normalizePlanStepEvidence(step, context, allowedEvidenceIds = new Set()) {
+    if (!step || typeof step !== 'object') return null;
+    const action = String(step.action || '').toLowerCase();
+    if (!ALLOWED_AGENT_ACTIONS.has(action)) return null;
+    let target = resolveAgentStepTarget(step, context);
+    if (!target && step.targetIndex) target = (context.elements || []).find((item) => item.index === step.targetIndex);
+    if (!target && step.targetEvidenceId) target = (context.elements || []).find((item) => item.evidenceId === step.targetEvidenceId);
+    const requiresTarget = !['observe', 'wait', 'scroll'].includes(action);
+    if (requiresTarget && !target) return null;
+    if (target && allowedEvidenceIds.size && !allowedEvidenceIds.has(target.evidenceId) && action !== 'observe') {
+      return null;
+    }
+    return {
+      ...step,
+      action,
+      targetIndex: target?.index || step.targetIndex,
+      targetEvidenceId: target?.evidenceId || step.targetEvidenceId || '',
+      reason: sanitizePageText(step.reason || 'QA step based on retrieved evidence.', 220),
+      expectedObservation: sanitizePageText(step.expectedObservation || 'Observe evidence after the step.', 220)
+    };
+  }
+
+  function resolveAgentStepTarget(step, context) {
+    if (!step || !context) return null;
+    const elements = context.elements || [];
+    if (step.targetEvidenceId) {
+      const byId = elements.find((item) => item.evidenceId === step.targetEvidenceId);
+      if (byId) return byId;
+    }
+    if (step.targetIndex) {
+      const byIndex = elements.find((item) => item.index === step.targetIndex);
+      if (byIndex) return byIndex;
+    }
+    return null;
+  }
+
+  function validateAgentToolStep(step, target) {
+    const registry = AgentToolRegistry[step.action];
+    if (!registry) return { ok: false, message: `Unsupported controlled action: ${step.action}` };
+    if (!target) {
+      return ['observe', 'wait', 'scroll'].includes(step.action)
+        ? { ok: true }
+        : { ok: false, message: 'Target evidence was not captured for this action.' };
+    }
+    if (!registry.targets.includes(target.role) && !registry.targets.includes('page')) {
+      return { ok: false, message: `Action "${step.action}" is not allowed for captured ${target.role} target ${target.evidenceId || ''}.` };
+    }
+    return { ok: true };
+  }
+
+  function maybeAddLoginContinuationSteps(plan, currentIndex, context, actionResults, dataStrategy) {
+    const lastAction = actionResults[actionResults.length - 1];
+    if (!lastAction || lastAction.action !== 'click' || !lastAction.success) return;
+    if (!['form_validation', 'valid_dummy_data_flow', 'invalid_login_test', 'login_validation'].includes(plan.taskType)) return;
+    const alreadyTypedPassword = actionResults.some((item) => {
+      const label = `${item.targetLabel || ''} ${item.message || ''}`.toLowerCase();
+      return item.action === 'type' && /password/.test(label);
+    });
+    if (alreadyTypedPassword) return;
+
+    const fresh = captureAgentContinuationContext();
+    const passwordField = (fresh.elements || []).find((item) => (
+      ['input', 'textarea'].includes(item.role)
+      && !item.disabled
+      && /password/.test(`${item.type || ''} ${item.label || ''} ${item.placeholder || ''}`.toLowerCase())
+    ));
+    if (!passwordField) return;
+
+    Object.assign(context, {
+      url: fresh.url,
+      title: fresh.title,
+      summary: fresh.summary,
+      pageType: fresh.pageType,
+      headings: fresh.headings,
+      importantText: fresh.importantText,
+      visibleAlerts: fresh.visibleAlerts,
+      elements: fresh.elements,
+      forms: fresh.forms,
+      availableSafeActions: fresh.availableSafeActions,
+      contextHash: fresh.contextHash,
+      snapshotHash: fresh.snapshotHash || fresh.contextHash
+    });
+
+    const submit = findSubmitButtonForContext(context);
+    const continuation = [
+      {
+        action: 'clear',
+        targetIndex: passwordField.index,
+        targetEvidenceId: passwordField.evidenceId,
+        reason: 'Clear newly visible password field before continuing the login flow.',
+        expectedObservation: 'Password field is empty.'
+      },
+      {
+        action: 'type',
+        targetIndex: passwordField.index,
+        targetEvidenceId: passwordField.evidenceId,
+        value: dataStrategy === 'valid_dummy' || plan.taskType === 'valid_dummy_data_flow'
+          ? SAFE_DUMMY_VALUES.password
+          : SAFE_DUMMY_VALUES.invalidPassword,
+        reason: 'Enter safe QA password after the page revealed the password field.',
+        expectedObservation: 'Password field receives masked QA test data.'
+      }
+    ];
+    if (submit) {
+      continuation.push({
+        action: 'click',
+        targetIndex: submit.index,
+        targetEvidenceId: submit.evidenceId,
+        reason: 'Submit the completed login form after tester approval.',
+        expectedObservation: 'Login success, validation, route, API, or console evidence appears.'
+      });
+    }
+    continuation.push({
+      action: 'observe',
+      reason: 'Observe final login result after password step.',
+      expectedObservation: 'Final login state is captured without inventing success.'
+    });
+
+    plan.steps.splice(currentIndex + 1, 0, ...continuation);
+  }
+
+  function captureAgentContinuationContext() {
+    const context = extractAgentPageContext();
+    context.snapshotId = EvidenceStore.nextId('PAGE');
+    context.elements = (context.elements || []).map((element) => ({
+      ...element,
+      evidenceId: element.evidenceId || EvidenceStore.nextId('DOM')
+    }));
+    context.forms = (context.forms || []).map((form) => ({ ...form, evidenceId: form.evidenceId || EvidenceStore.nextId('DOM') }));
+    context.snapshotHash = simpleHash(JSON.stringify({
+      url: context.url,
+      title: context.title,
+      pageType: context.pageType,
+      elements: context.elements.map((item) => [item.evidenceId, item.role, item.label, item.text, item.type, item.riskFlags]),
+      forms: context.forms
+    }));
+    EvidenceStore.add('pages', {
+      id: context.snapshotId,
+      url: context.url,
+      title: context.title,
+      pageType: context.pageType,
+      snapshotHash: context.snapshotHash,
+      elementCount: context.elements.length
+    });
+    for (const element of context.elements.slice(0, 80)) EvidenceStore.add('dom', element);
+    return context;
+  }
+
+  function findSubmitButtonForContext(context) {
+    const elements = context.elements || [];
+    const primaryForm = context.forms && context.forms[0];
+    return (primaryForm ? primaryForm.submitButtons : [])
+      .map((index) => elements.find((item) => item.index === index))
+      .find(Boolean)
+      || elements.find((item) => (
+        item.role === 'button'
+        && !item.disabled
+        && /submit|log in|login|sign in|continue|next/.test(`${item.text || ''} ${item.label || ''}`.toLowerCase())
+      ));
+  }
+
+  function tokenizeForRag(text) {
+    return Array.from(new Set(String(text || '')
+      .toLowerCase()
+      .replace(/https?:\/\/\S+/g, ' ')
+      .split(/[^a-z0-9_@.-]+/)
+      .filter((token) => token.length >= 2 && !['the', 'and', 'for', 'with', 'this', 'that', 'into', 'only'].includes(token))));
+  }
+
+  function scoreEvidenceCandidate({ text, terms = [], type, url, currentUrl, isTarget = false, recencyRank = 20, intent = '', role = '' }) {
+    const haystack = String(text || '').toLowerCase();
+    let score = 0;
+    for (const term of terms) {
+      if (haystack.includes(term)) score += term.length > 4 ? 2 : 1;
+    }
+    if (isTarget) score += 8;
+    if (currentUrl && url && safePageOrigin(currentUrl) === safePageOrigin(url)) score += 2;
+    if (type === 'dom') score += 3;
+    if (type === 'action' || type === 'observation') score += 4;
+    if (type === 'console' || type === 'network') score += 2;
+    if (['click', 'submit'].includes(intent) && ['button', 'link'].includes(role)) score += 2;
+    if (['fill', 'validate'].includes(intent) && ['input', 'textarea', 'select'].includes(role)) score += 2;
+    score += Math.max(0, 5 - Number(recencyRank || 20));
+    return score;
+  }
+
+  function formatDomEvidenceCard(element) {
+    const label = sanitizePageText(element.label || element.text || element.placeholder || element.role || 'element', 120);
+    const detail = [
+      element.role,
+      element.type && element.type !== element.role ? element.type : '',
+      element.href ? safeRelativeUrl(element.href) : '',
+      element.required ? 'required' : '',
+      element.disabled ? 'disabled' : '',
+      element.riskFlags && element.riskFlags.length ? `risk:${element.riskFlags.join(',')}` : ''
+    ].filter(Boolean).join(', ');
+    return `[${element.evidenceId}] ${capitalizeAgentText(element.role || 'Element')} "${label}"${detail ? ` (${detail})` : ''}`;
+  }
+
+  function safeRelativeUrl(url) {
+    try {
+      const parsed = new URL(url, location.href);
+      return `${parsed.pathname}${parsed.search ? '?query' : ''}${parsed.hash ? '#hash' : ''}`;
+    } catch {
+      return sanitizePageText(url || '', 120);
+    }
+  }
+
+  function capitalizeAgentText(value) {
+    const text = String(value || '');
+    return text ? text.charAt(0).toUpperCase() + text.slice(1) : '';
+  }
+
+  function mapIntentToAgentTask(intent, target, dataStrategy, command, context) {
+    const text = String(command || '').toLowerCase();
+    if (intent === 'answer') return 'page_summary';
+    if (intent === 'generate_tests') return 'test_case_generation';
+    if (intent === 'bug_report') return 'bug_report_generation';
+    if (intent === 'inspect' && /highlight|interactive/.test(text)) return 'highlight_interactions';
+    if (target === 'signup link' || target === 'google button' || intent === 'click') return 'targeted_click';
+    if (intent === 'fill' || target === 'first input' || dataStrategy === 'symbols') return 'targeted_fill';
+    if (/\b(full login|complete login|try .*login|login with|clio login)\b/.test(text)) return 'valid_dummy_data_flow';
+    if (intent === 'submit') return dataStrategy === 'valid_dummy' ? 'valid_dummy_data_flow' : 'form_validation';
+    if (intent === 'validate') return classifyAgentTask(command, context, dataStrategy);
+    return classifyAgentTask(command, context, dataStrategy);
+  }
 
   function sendToExtension(kind, payload) {
     try {
@@ -41,6 +664,14 @@
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     if (!event.data || event.data.source !== PAGE_CONSOLE_SOURCE) return;
+    const payload = event.data.payload || {};
+    EvidenceStore.add('console', {
+      id: EvidenceStore.nextId('CON'),
+      level: sanitizePageText(payload.level || payload.channel || 'console', 30),
+      message: sanitizePageText(payload.message || '', 500),
+      url: payload.url || location.href,
+      timestamp: Number(payload.timestamp || Date.now())
+    });
     sendToExtension('console', event.data.payload);
   }, false);
 
@@ -93,7 +724,14 @@
 
     if (message.type === 'TESTPILOT_SET_SESSION') {
       activeSessionId = typeof message.sessionId === 'string' ? message.sessionId : null;
+      SessionManager.setSession(activeSessionId);
       sendResponse({ ok: true, sessionId: activeSessionId });
+      return true;
+    }
+
+    if (message.type === 'TESTPILOT_CANCEL_AGENT') {
+      SessionManager.cancel(message.reason || 'cancel requested');
+      sendResponse({ ok: true, state: agentRuntime.state });
       return true;
     }
 
@@ -137,36 +775,99 @@
 
   async function runAgentWorkflow(command, options = {}) {
     const userCommand = sanitizePageText(command, 1000);
-    const pageContext = extractAgentPageContext();
-    const dataStrategy = detectDataStrategy(userCommand);
-    const taskType = classifyAgentTask(userCommand, pageContext, dataStrategy);
-    const requestKey = buildAgentRequestKey({
+    agentRuntime.cancelled = false;
+    const { promptId, taskId } = SessionManager.createRun(userCommand);
+    AgentStateMachine.set('classifying', { summary: 'Starting deterministic Agent run.' });
+    const pageContext = PageSnapshotService.capture();
+    pageContext.initialActionSnapshot = captureAgentActionSnapshot(pageContext);
+    const intentContext = IntentClassifier.classify(userCommand, pageContext);
+    const dataStrategy = intentContext.dataStrategy;
+    const taskType = intentContext.taskType;
+    const targetResolution = TargetResolver.resolve(intentContext, pageContext);
+    const evidenceCards = SessionRagRetriever.retrieve({
+      prompt: userCommand,
+      context: pageContext,
+      intentContext,
+      targetResolution,
+      mode: options.contextMode || 'fast'
+    });
+    const planHash = PlanHashService.create({
       sessionId: activeSessionId || options.sessionId || '',
       pageUrl: pageContext.url,
-      mode: options.mode || 'agent',
-      userMessage: userCommand,
-      taskType,
+      userPrompt: userCommand,
+      intent: intentContext.intent,
+      targetEvidenceIds: evidenceCards.map((card) => card.id),
       dataStrategy,
-      pageContextHash: pageContext.contextHash
+      pageSnapshotHash: pageContext.snapshotHash || pageContext.contextHash
     });
-    const fallbackPlan = buildAgentPlan(userCommand, taskType, pageContext, { ...options, dataStrategy });
+    const requestKey = planHash;
+    AgentStateMachine.set('planning', { requestKey, summary: 'Building deterministic plan.' });
+    emitAgentEvent('evidence-retrieved', {
+      requestKey,
+      promptId,
+      taskId,
+      planHash,
+      summary: `Retrieved ${evidenceCards.length} compact evidence card(s) before planning.`,
+      evidenceCards: evidenceCards.map((card) => card.text)
+    });
+    const fallbackPlan = GroundedPlanner.build({
+      command: userCommand,
+      taskType,
+      context: pageContext,
+      options: { ...options, dataStrategy, intentContext, targetResolution },
+      evidenceCards,
+      promptId,
+      taskId,
+      planHash
+    });
     const plan = normalizeStructuredAgentPlan(options.structuredPlan, fallbackPlan, taskType, pageContext);
-    const approvalValid = isAgentApprovalTokenValid(options.approval, requestKey);
+    plan.promptId = promptId;
+    plan.taskId = taskId;
+    plan.planId = EvidenceStore.nextId('PLAN');
+    plan.planHash = planHash;
+    plan.intent = intentContext.intent;
+    plan.target = targetResolution.target;
+    plan.targetEvidenceIds = targetResolution.targetEvidenceIds;
+    plan.executionMode = intentContext.executionMode;
+    EvidenceStore.add('plans', {
+      id: plan.planId,
+      promptId,
+      taskId,
+      planHash,
+      intent: intentContext.intent,
+      target: targetResolution.target,
+      targetEvidenceIds: targetResolution.targetEvidenceIds,
+      evidenceIds: plan.evidenceIds || evidenceCards.map((card) => card.id),
+      dataStrategy,
+      steps: plan.steps.map((step) => ({
+        action: step.action,
+        targetEvidenceId: step.targetEvidenceId || '',
+        targetIndex: step.targetIndex || null
+      }))
+    });
+    const approvalValid = isAgentApprovalTokenValid(options.approval, requestKey, planHash);
     const resumeFromStepIndex = approvalValid
       ? Math.min(Math.max(0, Number(options.approval.resumeFromStepIndex || 0)), plan.steps.length)
       : 0;
     emitAgentEvent('started', {
       requestKey,
+      promptId,
+      taskId,
+      planHash,
       command: userCommand,
       taskType,
+      intent: intentContext.intent,
+      target: targetResolution.target,
       dataStrategy,
       summary: plan.summary,
+      evidenceCards: evidenceCards.map((card) => card.text),
       totalSteps: plan.steps.length
     });
     emitAgentEvent('plan-ready', {
       requestKey,
       taskType,
       summary: plan.summary,
+      evidenceIds: plan.evidenceIds || evidenceCards.map((card) => card.id),
       steps: plan.steps.map((step, index) => describeAgentStepForEvent(step, index, pageContext))
     });
     const safety = validateAgentPlan(plan, pageContext, options.approval, requestKey);
@@ -184,7 +885,12 @@
     }
 
     if (!safety.ok) {
-      const result = evaluateAgentResult(plan, actionResults, observeAgentPage(pageContext), safety);
+      AgentStateMachine.set(safety.requiresConfirmation ? 'awaiting_confirmation' : 'blocked', { requestKey, summary: 'Agent cannot continue without tester decision.' });
+      const observation = observeAgentPage(pageContext, {
+        evidenceCards,
+        beforeSnapshot: pageContext.initialActionSnapshot || null
+      });
+      const result = validateAgentClaims(evaluateAgentResult(plan, actionResults, observation, safety), plan, actionResults, observation, evidenceCards);
       const approvalRequest = buildAgentApprovalRequest(userCommand, requestKey, taskType, safety, actionResults, plan, null, pageContext);
       emitAgentEvent(safety.requiresConfirmation ? 'permission-required' : 'blocked', {
         requestKey,
@@ -205,14 +911,18 @@
         safety,
         approval: approvalRequest,
         actionResults,
-        result
+        evidenceCards,
+        result,
+        memory: EvidenceStore.snapshot()
       };
     }
 
+    AgentStateMachine.set('executing', { requestKey, summary: 'Executing deterministic Agent plan.' });
     for (let index = resumeFromStepIndex; index < plan.steps.length; index += 1) {
+      AgentStateMachine.assertActive();
       const step = plan.steps[index];
       const confirmation = getAgentStepConfirmation(step, pageContext);
-      if (confirmation && !isAgentStepApproved(step, pageContext, options.approval, requestKey)) {
+      if (confirmation && !isAgentStepApproved(step, pageContext, options.approval, requestKey, planHash)) {
         const pauseSafety = {
           ...safety,
           ok: false,
@@ -229,6 +939,7 @@
           recommendedNextSteps: ['Approve once to continue this exact task, or cancel and use a narrower command.']
         };
         const approvalRequest = buildAgentApprovalRequest(userCommand, requestKey, taskType, pauseSafety, actionResults, plan, step, pageContext, index);
+        AgentStateMachine.set('awaiting_confirmation', { requestKey, summary: 'Waiting for tester approval before the pending action.' });
         emitAgentEvent('permission-required', {
           requestKey,
           command: userCommand,
@@ -249,19 +960,24 @@
           approval: approvalRequest,
           actionResults,
           observation: observeAgentPage(pageContext),
-          result
+          result,
+          memory: EvidenceStore.snapshot()
         };
       }
       emitAgentEvent('step-started', {
         requestKey,
         ...describeAgentStepForEvent(step, index, pageContext)
       });
-      const actionResult = await executeAgentStep(step, index, pageContext, requestKey);
+      const actionId = EvidenceStore.nextId('ACT');
+      const actionResult = await executeAgentStep(step, index, pageContext, requestKey, actionId);
       actionResults.push(actionResult);
+      EvidenceStore.add('actions', { id: actionId, planHash, taskId, ...actionResult });
       emitAgentEvent('step-completed', {
         requestKey,
+        actionId,
         stepIndex: index,
         action: actionResult.action,
+        targetEvidenceId: actionResult.targetEvidenceId || '',
         targetIndex: actionResult.targetIndex,
         targetLabel: actionResult.targetLabel,
         success: actionResult.success,
@@ -269,12 +985,22 @@
         valuePreview: actionResult.valuePreview || '',
         expectedObservation: step.expectedObservation || ''
       });
+      maybeAddLoginContinuationSteps(plan, index, pageContext, actionResults, dataStrategy);
       if (!actionResult.success && ['click', 'type', 'select', 'check', 'uncheck', 'navigate'].includes(step.action)) break;
       if (['click', 'navigate', 'select'].includes(step.action)) await waitForAgent(350);
     }
 
-    const observation = observeAgentPage(pageContext);
-    const result = evaluateAgentResult(plan, actionResults, observation, safety);
+    AgentStateMachine.set('observing', { requestKey, summary: 'Observing page after Agent actions.' });
+    const observation = observeAgentPage(pageContext, { evidenceCards, actionResults });
+    EvidenceStore.add('observations', { id: EvidenceStore.nextId('OBS'), planHash, taskId, ...observation });
+    AgentStateMachine.set('evaluating', { requestKey, summary: 'Evaluating Agent evidence.' });
+    const completedSafety = safety.approved
+      ? { ...safety, requiresConfirmation: false, needsConfirmation: [] }
+      : safety;
+    const result = validateAgentClaims(evaluateAgentResult(plan, actionResults, observation, completedSafety), plan, actionResults, observation, evidenceCards);
+    const resultId = EvidenceStore.nextId('RESULT');
+    EvidenceStore.add('results', { id: resultId, planHash, taskId, result });
+    AgentStateMachine.set('completed', { requestKey, summary: 'Agent workflow completed.' });
     emitAgentEvent('completed', {
       requestKey,
       taskType,
@@ -285,15 +1011,20 @@
     });
     return {
       command: userCommand,
+      promptId,
+      taskId,
+      planHash,
       taskType,
       dataStrategy,
       requestKey,
       pageContext: compactAgentContextForResponse(pageContext),
       plan,
-      safety,
+      safety: completedSafety,
       actionResults,
+      evidenceCards,
       observation,
-      result
+      result: { ...result, resultId },
+      memory: EvidenceStore.snapshot()
     };
   }
 
@@ -308,11 +1039,12 @@
   }
 
   function describeAgentStepForEvent(step, index, context) {
-    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const target = resolveAgentStepTarget(step, context);
     return {
       stepIndex: index,
       stepNumber: index + 1,
       action: step.action,
+      targetEvidenceId: step.targetEvidenceId || target?.evidenceId || '',
       targetIndex: step.targetIndex || null,
       targetLabel: target ? sanitizePageText(target.label || target.text || target.placeholder || target.role, 120) : '',
       reason: step.reason || 'QA step',
@@ -329,6 +1061,10 @@
       command,
       requestKey,
       taskType,
+      promptId: plan.promptId || '',
+      taskId: plan.taskId || '',
+      planHash: plan.planHash || requestKey,
+      planId: plan.planId || '',
       stepFingerprint,
       resumeFromStepIndex,
       reasons: [...(safety.needsConfirmation || []), ...(safety.blocked || [])].slice(0, 8),
@@ -351,6 +1087,8 @@
     return actionResults.slice(0, 12).map((item) => ({
       stepIndex: Number(item.stepIndex || 0),
       action: sanitizePageText(item.action || '', 40),
+      actionId: sanitizePageText(item.actionId || '', 40),
+      targetEvidenceId: sanitizePageText(item.targetEvidenceId || '', 40),
       targetIndex: item.targetIndex || null,
       targetLabel: sanitizePageText(item.targetLabel || '', 120),
       success: Boolean(item.success),
@@ -367,6 +1105,8 @@
     return actionResults.slice(0, 12).map((item) => ({
       stepIndex: Number(item.stepIndex || 0),
       action: sanitizePageText(item.action || '', 40),
+      actionId: sanitizePageText(item.actionId || '', 40),
+      targetEvidenceId: sanitizePageText(item.targetEvidenceId || '', 40),
       targetIndex: item.targetIndex || null,
       targetLabel: sanitizePageText(item.targetLabel || '', 120),
       success: Boolean(item.success),
@@ -383,6 +1123,8 @@
       .filter((item) => ['type', 'select', 'check', 'uncheck', 'clear'].includes(item.action))
       .map((item) => ({
         action: item.action,
+        actionId: item.actionId || '',
+        targetEvidenceId: item.targetEvidenceId || '',
         targetIndex: item.targetIndex || null,
         targetLabel: item.targetLabel || (item.targetIndex ? `Target #${item.targetIndex}` : 'Target field'),
         valuePreview: item.valuePreview || (item.action === 'clear' ? '(cleared)' : ''),
@@ -492,19 +1234,37 @@
     const role = inferAgentRole(element, tag, inputType);
     const selectorHint = getSelector(element);
     const label = getElementLabel(element) || getAssociatedLabel(element);
+    const text = sanitizePageText(getShortText(element), 120);
+    const riskFlags = getAgentElementRiskFlags(element, tag, inputType, label, text);
     return {
       index,
+      evidenceId: `DOM-${String(index).padStart(3, '0')}`,
       role,
-      text: sanitizePageText(getShortText(element), 120),
+      text,
       label: sanitizePageText(label, 120),
       placeholder: sanitizePageText(element.getAttribute && element.getAttribute('placeholder') || '', 120),
       type: inputType || tag,
+      riskFlags,
       required: Boolean(element.required || element.getAttribute && element.getAttribute('aria-required') === 'true'),
       disabled: Boolean(element.disabled || element.getAttribute && element.getAttribute('aria-disabled') === 'true'),
       visible: true,
       selectorHint,
       href: tag === 'a' ? sanitizePageText(element.getAttribute('href') || '', 240) : undefined
     };
+  }
+
+  function getAgentElementRiskFlags(element, tag, inputType, label, text) {
+    const href = tag === 'a' && element.getAttribute ? element.getAttribute('href') || '' : '';
+    const haystack = `${text || ''} ${label || ''} ${element.getAttribute && (element.getAttribute('aria-label') || element.getAttribute('class') || '')} ${href}`.toLowerCase();
+    const flags = [];
+    if (/google|gmail|oauth|sso|facebook|apple|github|microsoft/.test(haystack)) flags.push('oauth');
+    if (/delete|remove|destroy/.test(haystack)) flags.push('destructive');
+    if (/logout|log out|sign out/.test(haystack)) flags.push('logout');
+    if (/checkout|payment|pay|purchase|billing|place order/.test(haystack)) flags.push('payment');
+    if (/reset password|forgot password/.test(haystack)) flags.push('password-reset');
+    if (inputType === 'file') flags.push('file-upload');
+    if (href && !isSafeAgentLink(href)) flags.push('external-navigation');
+    return flags;
   }
 
   function inferAgentRole(element, tag, inputType) {
@@ -533,13 +1293,16 @@
     const value = String(command || '').toLowerCase();
     const asksEmpty = /\b(empty|required|blank|missing)\b/.test(value);
     const asksInvalid = /\b(invalid|fake|wrong|negative|bad|dummy login|fake email|fake emails)\b/.test(value);
+    const asksSymbols = /\b(symbol|symbols|special characters?|punctuation)\b/.test(value);
     const asksValid = /\b(valid|real|realistic|signup|sign up|register|account|create account|dummy account)\b/.test(value);
     const hasProvidedData = /(?:email|username|password|phone|name)\s*[:=]\s*\S+/i.test(String(command || ''));
+    if (hasProvidedData) return 'user_provided';
+    if (asksSymbols) return 'symbols';
     if (asksEmpty && asksInvalid) return 'fake_invalid';
     if (asksEmpty) return 'empty';
     if (asksInvalid) return asksValid ? 'fake_invalid' : 'invalid';
-    if (asksValid) return hasProvidedData ? 'real_user_provided' : 'valid_dummy';
-    return 'unknown';
+    if (asksValid) return 'valid_dummy';
+    return 'none';
   }
 
   function classifyAgentTask(command, context, dataStrategy = 'unknown') {
@@ -550,11 +1313,11 @@
     if (/bug report|create.*bug|draft.*bug|jira|github issue/.test(value)) return 'bug_report_generation';
     if (/accessib|a11y|alt text|label|heading/.test(value)) return 'accessibility_check';
     if (/signup|sign up|register|account|create account/.test(value) && ['invalid', 'fake_invalid'].includes(dataStrategy)) return 'invalid_signup_validation';
-    if (/signup|sign up|register|account|create account/.test(value) && ['valid_dummy', 'real_user_provided'].includes(dataStrategy)) return 'valid_dummy_data_flow';
+    if (/signup|sign up|register|account|create account/.test(value) && ['valid_dummy', 'user_provided', 'real_user_provided'].includes(dataStrategy)) return 'valid_dummy_data_flow';
     if (/empty|required|blank/.test(value) && /invalid|fake|dummy|wrong/.test(value) && /field|form|input|login|signup|sign up|email|credential/.test(value)) return 'login_validation';
     if (/empty|required|blank/.test(value) && /field|form|input|login|signup|sign up/.test(value)) return 'required_field_validation';
     if (/invalid|fake|dummy|wrong/.test(value) && /email|credential|login|password/.test(value)) return 'invalid_login_test';
-    if (['valid_dummy', 'real_user_provided'].includes(dataStrategy) && /login|form|password|contact/.test(value)) return 'valid_dummy_data_flow';
+    if (['valid_dummy', 'user_provided', 'real_user_provided'].includes(dataStrategy) && /login|form|password|contact/.test(value)) return 'valid_dummy_data_flow';
     if (/login|signup|sign up|form|password|contact/.test(value)) return 'form_validation';
     if (/search/.test(value)) return 'search_test';
     if (/filter|dropdown|select|category|sort/.test(value)) return 'filter_test';
@@ -609,12 +1372,20 @@
   }
 
   function buildAgentPlan(command, taskType, context, options = {}) {
-    const dataStrategy = options.dataStrategy || 'unknown';
+    const dataStrategy = options.dataStrategy || 'none';
+    const intentContext = options.intentContext || {};
+    const targetResolution = options.targetResolution || { elements: [], targetEvidenceIds: [], target: 'page' };
     const steps = [];
     const targetElements = [];
     const addStep = (step) => {
-      if (step.targetIndex) targetElements.push(step.targetIndex);
-      steps.push(step);
+      const target = step.targetEvidenceId
+        ? (context.elements || []).find((item) => item.evidenceId === step.targetEvidenceId)
+        : (step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null);
+      const normalized = target
+        ? { ...step, targetIndex: target.index, targetEvidenceId: target.evidenceId }
+        : step;
+      if (normalized.targetIndex) targetElements.push(normalized.targetIndex);
+      steps.push(normalized);
     };
     const elements = context.elements || [];
     const first = (predicate) => elements.find((item) => predicate(item) && !item.disabled);
@@ -626,7 +1397,27 @@
     const submitButton = () => (primaryForm ? primaryForm.submitButtons : []).map((index) => elements.find((item) => item.index === index)).find(Boolean)
       || first((item) => item.role === 'button' && /submit|log in|login|sign in|sign up|send|continue|save|search|place/i.test(`${item.text || ''} ${item.label || ''}`));
 
-    if (taskType === 'highlight_interactions') {
+    if (intentContext.executionMode === 'answer_only') {
+      addStep({ action: 'observe', reason: 'Answer from current page/session evidence without changing the page.', expectedObservation: 'Visible page state is summarized without clicking or typing.' });
+    } else if (taskType === 'targeted_click') {
+      const target = targetResolution.primary;
+      if (target) {
+        addStep({ action: 'highlight', targetIndex: target.index, reason: `Highlight resolved target: ${targetResolution.target}.`, expectedObservation: 'Target is visible before action.' });
+        addStep({ action: 'click', targetIndex: target.index, reason: `Click resolved target for "${targetResolution.target}".`, expectedObservation: 'Target click produces navigation, modal, validation, or visible state evidence.' });
+      } else {
+        addStep({ action: 'observe', reason: `Target "${targetResolution.target}" was not captured. Refresh snapshot or try a narrower command.`, expectedObservation: 'No action is taken when target is missing.' });
+      }
+      addStep({ action: 'observe', reason: 'Observe result after targeted click.', expectedObservation: 'Evidence is collected without inventing behavior.' });
+    } else if (taskType === 'targeted_fill') {
+      const target = targetResolution.primary || elements.find((item) => ['input', 'textarea'].includes(item.role) && !item.disabled);
+      if (target) {
+        addStep({ action: 'clear', targetIndex: target.index, reason: `Clear resolved target: ${targetResolution.target || 'field'}.`, expectedObservation: 'Target field is empty.' });
+        addStep({ action: 'type', targetIndex: target.index, value: valueForDataStrategy(dataStrategy, target), reason: `Type ${dataStrategy.replace(/_/g, ' ')} data into the resolved target only.`, expectedObservation: 'Only the resolved field changes.' });
+      } else {
+        addStep({ action: 'observe', reason: 'Requested field target was not captured. No typing performed.', expectedObservation: 'Tester sees that no target field was available.' });
+      }
+      addStep({ action: 'observe', reason: 'Observe field state after targeted fill.', expectedObservation: 'Field change evidence is available.' });
+    } else if (taskType === 'highlight_interactions') {
       for (const item of many((element) => ['button', 'link', 'input', 'select', 'textarea', 'checkbox', 'radio', 'tab', 'accordion', 'pagination'].includes(element.role), 12)) {
         addStep({ action: 'highlight', targetIndex: item.index, reason: 'Highlight this visible interactive element with its index.', expectedObservation: 'Element is visibly outlined for QA review.' });
       }
@@ -763,9 +1554,11 @@
     }
 
     const availableTargets = new Set((context.elements || []).map((item) => item.index));
+    const availableEvidenceIds = new Set((context.elements || []).map((item) => item.evidenceId).filter(Boolean));
+    const evidenceIdToIndex = new Map((context.elements || []).map((item) => [item.evidenceId, item.index]));
     const normalizedSteps = candidatePlan.steps
       .slice(0, 12)
-      .map((step) => normalizeStructuredAgentStep(step, availableTargets))
+      .map((step) => normalizeStructuredAgentStep(step, availableTargets, availableEvidenceIds, evidenceIdToIndex))
       .filter(Boolean);
 
     if (!normalizedSteps.length) return fallbackPlan;
@@ -785,15 +1578,18 @@
     };
   }
 
-  function normalizeStructuredAgentStep(step, availableTargets) {
+  function normalizeStructuredAgentStep(step, availableTargets, availableEvidenceIds = new Set(), evidenceIdToIndex = new Map()) {
     if (!step || typeof step !== 'object') return null;
     const action = String(step.action || '').toLowerCase().trim();
     if (!ALLOWED_AGENT_ACTIONS.has(action)) return null;
-    const targetIndex = Number(step.targetIndex || 0);
+    const rawEvidenceId = sanitizePageText(step.targetEvidenceId || '', 40);
+    const targetIndex = Number(step.targetIndex || (rawEvidenceId ? evidenceIdToIndex.get(rawEvidenceId) : 0) || 0);
     const requiresTarget = !['observe', 'wait', 'scroll'].includes(action);
     if (requiresTarget && (!Number.isFinite(targetIndex) || !availableTargets.has(targetIndex))) return null;
+    if (rawEvidenceId && !availableEvidenceIds.has(rawEvidenceId)) return null;
     return {
       action,
+      targetEvidenceId: rawEvidenceId || '',
       targetIndex: Number.isFinite(targetIndex) && targetIndex > 0 ? targetIndex : undefined,
       value: sanitizeStructuredStepValue(action, step.value),
       url: action === 'navigate' ? sanitizePageText(step.url || '', 300) : undefined,
@@ -811,12 +1607,20 @@
   function validateAgentPlan(plan, context, approval = {}, requestKey = '') {
     const blocked = [];
     const confirmations = [];
-    const approvalGranted = isAgentApprovalTokenValid(approval, requestKey);
+    const approvalGranted = isAgentApprovalTokenValid(approval, requestKey, plan.planHash);
     const indexed = new Map((context.elements || []).map((item) => [item.index, item]));
+    const byEvidenceId = new Map((context.elements || []).map((item) => [item.evidenceId, item]));
     for (const step of plan.steps || []) {
-      const target = step.targetIndex ? indexed.get(step.targetIndex) : null;
+      const registry = AgentToolRegistry[step.action];
+      const target = resolveAgentStepTarget(step, context) || (step.targetIndex ? indexed.get(step.targetIndex) : null);
+      if (!registry) blocked.push(`Action "${step.action}" is not in the controlled TestPilot action registry.`);
+      if (step.targetEvidenceId && !byEvidenceId.has(step.targetEvidenceId)) blocked.push(`Target evidence ${step.targetEvidenceId} is not available in the current snapshot.`);
+      if (step.targetIndex && !step.targetEvidenceId && target?.evidenceId) blocked.push(`Step target #${step.targetIndex} is missing a targetEvidenceId.`);
       if (step.targetIndex && !target) blocked.push(`Step target #${step.targetIndex} is not available.`);
       if (target && target.disabled) blocked.push(`Target #${target.index} is disabled.`);
+      if (registry && target && !registry.targets.includes(target.role) && !registry.targets.includes('page')) {
+        blocked.push(`Action "${step.action}" is not allowed for ${target.role} target ${target.evidenceId || `#${target.index}`}.`);
+      }
       const confirmation = getAgentStepConfirmation(step, context);
       if (confirmation) {
         confirmations.push({
@@ -837,17 +1641,18 @@
     };
   }
 
-  function isAgentApprovalTokenValid(approval, requestKey) {
+  function isAgentApprovalTokenValid(approval, requestKey, planHash = '') {
     return Boolean(approval
       && approval.approved === true
       && approval.requestKey
       && String(approval.requestKey) === String(requestKey || '')
+      && (!planHash || String(approval.planHash || '') === String(planHash || ''))
       && typeof approval.stepFingerprint === 'string'
       && approval.stepFingerprint);
   }
 
-  function isAgentStepApproved(step, context, approval, requestKey) {
-    if (!isAgentApprovalTokenValid(approval, requestKey)) return false;
+  function isAgentStepApproved(step, context, approval, requestKey, planHash = '') {
+    if (!isAgentApprovalTokenValid(approval, requestKey, planHash)) return false;
     return getAgentStepApprovalFingerprint(step, context) === approval.stepFingerprint;
   }
 
@@ -856,9 +1661,17 @@
   }
 
   function getAgentStepConfirmation(step, context) {
-    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const target = resolveAgentStepTarget(step, context);
     const text = `${target?.text || ''} ${target?.label || ''} ${step.value || ''} ${step.url || ''}`.toLowerCase();
     const targetLabel = target?.text || target?.label || target?.placeholder || step.action;
+    if (target && Array.isArray(target.riskFlags) && target.riskFlags.includes('oauth')) {
+      return {
+        reason: `OAuth/social login requires tester confirmation for target #${target.index}: ${targetLabel}`,
+        category: 'oauth',
+        rememberable: false,
+        targetLabel
+      };
+    }
     if (target && target.role === 'upload') {
       return {
         reason: `File upload requires explicit tester confirmation for target #${target.index}.`,
@@ -920,10 +1733,11 @@
   }
 
   function getAgentStepApprovalFingerprint(step, context, confirmation = null) {
-    const target = step && step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
+    const target = resolveAgentStepTarget(step, context);
     const resolvedConfirmation = confirmation || getAgentStepConfirmation(step, context) || {};
     return simpleHash(JSON.stringify({
       action: step?.action || '',
+      targetEvidenceId: step?.targetEvidenceId || target?.evidenceId || '',
       targetIndex: step?.targetIndex || null,
       targetLabel: resolvedConfirmation.targetLabel || target?.label || target?.text || '',
       category: resolvedConfirmation.category || '',
@@ -931,22 +1745,46 @@
     }));
   }
 
-  async function executeAgentStep(step, stepIndex, context, requestKey) {
-    const target = step.targetIndex ? (context.elements || []).find((item) => item.index === step.targetIndex) : null;
-    const element = target ? getElementBySelector(target.selectorHint) : null;
+  async function executeAgentStep(step, stepIndex, context, requestKey, actionId = '') {
+    const target = resolveAgentStepTarget(step, context);
+    const beforeSnapshot = captureAgentActionSnapshot(context);
+    let element = target ? getElementBySelector(target.selectorHint) : null;
     const startedAt = Date.now();
     const base = {
+      actionId,
       stepIndex,
       action: step.action,
+      targetEvidenceId: target?.evidenceId || step.targetEvidenceId || '',
       targetIndex: step.targetIndex || null,
       targetLabel: target ? (target.label || target.text || target.role) : '',
       timestamp: startedAt,
       startedAt
     };
-    const finish = (result) => ({ ...base, ...result, completedAt: Date.now() });
+    const finish = (result) => {
+      const completedAt = Date.now();
+      const afterSnapshot = captureAgentActionSnapshot(context);
+      const observation = observeAgentPage(context, {
+        actionId,
+        step,
+        beforeSnapshot,
+        afterSnapshot,
+        windowStart: startedAt,
+        windowEnd: completedAt
+      });
+      return {
+        ...base,
+        ...result,
+        completedAt,
+        observation,
+        observedEvidenceIds: observation.evidenceIds || [],
+        observedText: result.observedText || observation.evidence
+      };
+    };
     try {
+      const toolCheck = validateAgentToolStep(step, target);
+      if (!toolCheck.ok) return finish({ success: false, message: toolCheck.message });
       if (step.action === 'observe') {
-        const observation = observeAgentPage(context);
+        const observation = observeAgentPage(context, { actionId, step, beforeSnapshot, afterSnapshot: beforeSnapshot });
         return finish({ success: true, message: formatObservationMessage(observation), observedText: observation.evidence });
       }
       if (step.action === 'wait') {
@@ -954,6 +1792,14 @@
         return finish({ success: true, message: 'Wait completed.' });
       }
       if (!element && step.action !== 'scroll') return finish({ success: false, message: 'Target element was not found on the page.' });
+      if (element
+        && document.documentElement
+        && typeof document.documentElement.contains === 'function'
+        && !document.documentElement.contains(element)
+        && AgentToolRegistry[step.action]?.retryStale) {
+        await waitForAgent(120);
+        element = target ? getElementBySelector(target.selectorHint) : null;
+      }
       if (element && !isVisibleElement(element, true)) return finish({ success: false, message: 'Target element is hidden or outside the visible viewport.' });
       if (element && (element.disabled || element.getAttribute && element.getAttribute('aria-disabled') === 'true')) {
         return finish({ success: false, message: 'Target element is disabled.' });
@@ -971,7 +1817,9 @@
         setElementValue(element, '');
         emitAgentEvent('field-updated', {
           requestKey,
+          actionId,
           stepIndex,
+          targetEvidenceId: target?.evidenceId || '',
           targetIndex: step.targetIndex || null,
           targetLabel: base.targetLabel,
           action: 'clear',
@@ -985,7 +1833,9 @@
         highlightAgentElement(element, Math.max(1200, value.length * AGENT_TYPE_DELAY_MS + 800));
         await setElementValueAnimated(element, value, {
           requestKey,
+          actionId,
           stepIndex,
+          targetEvidenceId: target?.evidenceId || '',
           targetIndex: step.targetIndex || null,
           targetLabel: base.targetLabel,
           target,
@@ -1002,7 +1852,9 @@
         const selected = selectSafeOption(element, step.value);
         emitAgentEvent('field-updated', {
           requestKey,
+          actionId,
           stepIndex,
+          targetEvidenceId: target?.evidenceId || '',
           targetIndex: step.targetIndex || null,
           targetLabel: base.targetLabel,
           action: 'select',
@@ -1017,7 +1869,9 @@
         dispatchAgentInputEvents(element);
         emitAgentEvent('field-updated', {
           requestKey,
+          actionId,
           stepIndex,
+          targetEvidenceId: target?.evidenceId || '',
           targetIndex: step.targetIndex || null,
           targetLabel: base.targetLabel,
           action: step.action,
@@ -1036,8 +1890,20 @@
         await waitForAgent(80);
         element.click();
         await waitForAgent(350);
-        const observation = observeAgentPage(context);
-        return finish({ success: true, message: `Clicked safe target. ${formatObservationMessage(observation)}`, observedText: observation.evidence });
+        const afterClickSnapshot = captureAgentActionSnapshot(context);
+        const observation = observeAgentPage(context, {
+          actionId,
+          step,
+          beforeSnapshot,
+          afterSnapshot: afterClickSnapshot,
+          windowStart: startedAt,
+          windowEnd: Date.now()
+        });
+        return finish({
+          success: true,
+          message: `Clicked safe target. ${formatObservationMessage(observation)}`,
+          observedText: observation.evidence
+        });
       }
       if (step.action === 'navigate') {
         if (!isSafeAgentLink(step.url)) return finish({ success: false, message: 'Unsafe navigation was blocked.' });
@@ -1050,7 +1916,10 @@
     }
   }
 
-  function observeAgentPage(context) {
+  function observeAgentPage(context, options = {}) {
+    const observationId = options.observationId || EvidenceStore.nextId('OBS');
+    const beforeSnapshot = options.beforeSnapshot || null;
+    const afterSnapshot = options.afterSnapshot || captureAgentActionSnapshot(context);
     const alerts = getVisibleAlertTexts();
     const validation = getFieldValidationEvidence();
     const dialogs = Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]'))
@@ -1065,20 +1934,33 @@
     const resultSignals = getResultCountSignals();
     const buttonSignals = getButtonStateSignals();
     const accessibility = getAccessibilityObservations();
+    const snapshotDiff = diffAgentActionSnapshots(beforeSnapshot, afterSnapshot);
+    const consoleEvidence = getAgentConsoleEventsInWindow(options.windowStart, options.windowEnd);
     const evidence = [
-      `URL: ${location.href}`,
+      `[${observationId}] URL: ${location.href}`,
       document.title ? `Title: ${document.title}` : '',
+      snapshotDiff.urlChanged ? `Route changed from ${snapshotDiff.fromUrl || 'not captured'} to ${snapshotDiff.toUrl || 'not captured'}` : '',
+      snapshotDiff.fieldChanges.length ? `Field changes: ${snapshotDiff.fieldChanges.join(' | ')}` : '',
+      snapshotDiff.messageChanges.length ? `Visible message changes: ${snapshotDiff.messageChanges.join(' | ')}` : '',
+      snapshotDiff.dialogChanges.length ? `Dialog changes: ${snapshotDiff.dialogChanges.join(' | ')}` : '',
+      snapshotDiff.tableChanges.length ? `Table/list changes: ${snapshotDiff.tableChanges.join(' | ')}` : '',
       alerts.length ? `Visible messages: ${alerts.join(' | ')}` : '',
       validation.length ? `Field validation: ${validation.join(' | ')}` : '',
       dialogs.length ? `Visible dialogs: ${dialogs.join(' | ')}` : '',
       tables.length ? `Tables: ${tables.join(' | ')}` : '',
       resultSignals.length ? `Results/lists: ${resultSignals.join(' | ')}` : '',
       buttonSignals.length ? `Button states: ${buttonSignals.join(' | ')}` : '',
-      accessibility.length ? `Accessibility observations: ${accessibility.join(' | ')}` : ''
+      accessibility.length ? `Accessibility observations: ${accessibility.join(' | ')}` : '',
+      consoleEvidence.length ? `Console near action: ${consoleEvidence.map((item) => `${item.id} ${item.level}: ${item.message}`).join(' | ')}` : ''
     ].filter(Boolean);
     return {
+      id: observationId,
+      actionId: options.actionId || '',
       url: location.href,
       title: document.title || '',
+      beforeSnapshotHash: beforeSnapshot ? simpleHash(JSON.stringify(beforeSnapshot)) : '',
+      afterSnapshotHash: afterSnapshot ? simpleHash(JSON.stringify(afterSnapshot)) : '',
+      diff: snapshotDiff,
       visibleAlerts: alerts,
       fieldValidation: validation,
       visibleDialogs: dialogs,
@@ -1086,12 +1968,19 @@
       resultSignals,
       buttonSignals,
       accessibility,
+      consoleEvidence,
+      apiEvidence: [],
+      apiCapture: 'not captured in content script; DevTools panel links API events by action timestamp',
+      evidenceIds: [observationId, ...consoleEvidence.map((item) => item.id)],
       evidence
     };
   }
 
   function formatObservationMessage(observation) {
     const lines = [];
+    if (observation.diff && observation.diff.urlChanged) lines.push(`Route changed to ${observation.diff.toUrl || 'not captured'}`);
+    if (observation.diff && observation.diff.fieldChanges && observation.diff.fieldChanges.length) lines.push(...observation.diff.fieldChanges);
+    if (observation.diff && observation.diff.messageChanges && observation.diff.messageChanges.length) lines.push(...observation.diff.messageChanges.map((item) => `Message changed: ${item}`));
     if (observation.fieldValidation && observation.fieldValidation.length) lines.push(...observation.fieldValidation);
     if (observation.visibleAlerts && observation.visibleAlerts.length) lines.push(...observation.visibleAlerts.map((item) => `Visible message: ${item}`));
     if (observation.visibleDialogs && observation.visibleDialogs.length) lines.push(...observation.visibleDialogs.map((item) => `Dialog visible: ${item}`));
@@ -1101,6 +1990,100 @@
     if (observation.accessibility && observation.accessibility.length) lines.push(...observation.accessibility);
     if (!lines.length) lines.push(`No visible validation, dialog, toast, list, or table change detected on ${location.href}.`);
     return lines.slice(0, 8).join(' ');
+  }
+
+  function captureAgentActionSnapshot(context = {}) {
+    const fields = {};
+    for (const elementInfo of (context.elements || []).slice(0, 80)) {
+      if (!['input', 'textarea', 'select', 'checkbox', 'radio'].includes(elementInfo.role)) continue;
+      const element = getElementBySelector(elementInfo.selectorHint);
+      if (!element) continue;
+      fields[elementInfo.evidenceId || `DOM-${elementInfo.index}`] = {
+        label: sanitizePageText(elementInfo.label || elementInfo.placeholder || elementInfo.text || elementInfo.role, 100),
+        role: elementInfo.role,
+        valuePreview: maskAgentTypedValue(element.value || '', elementInfo),
+        checked: typeof element.checked === 'boolean' ? element.checked : null,
+        selectedIndex: typeof element.selectedIndex === 'number' ? element.selectedIndex : null,
+        disabled: Boolean(element.disabled || element.getAttribute?.('aria-disabled') === 'true')
+      };
+    }
+    return {
+      url: location.href,
+      title: document.title || '',
+      visibleAlerts: getVisibleAlertTexts(),
+      fieldValidation: getFieldValidationEvidence(),
+      visibleDialogs: Array.from(document.querySelectorAll('[role="dialog"], dialog, [aria-modal="true"]'))
+        .filter((element) => isVisibleElement(element, true))
+        .map((element) => sanitizePageText(getShortText(element), 120))
+        .filter(Boolean)
+        .slice(0, 5),
+      tableSignals: Array.from(document.querySelectorAll('table, [role="table"], ul, ol, [role="list"]'))
+        .filter((element) => isVisibleElement(element, true))
+        .map((element) => `${element.tagName.toLowerCase()}:${element.querySelectorAll ? element.querySelectorAll('tr, [role="row"], li, [role="listitem"]').length : 0}`)
+        .slice(0, 8),
+      fields
+    };
+  }
+
+  function diffAgentActionSnapshots(before, after) {
+    if (!after) {
+      return {
+        urlChanged: false,
+        fromUrl: before?.url || '',
+        toUrl: '',
+        fieldChanges: [],
+        messageChanges: [],
+        dialogChanges: [],
+        tableChanges: []
+      };
+    }
+    const previous = before || {};
+    const fieldChanges = [];
+    const beforeFields = previous.fields || {};
+    const afterFields = after.fields || {};
+    for (const [evidenceId, next] of Object.entries(afterFields)) {
+      const prior = beforeFields[evidenceId];
+      if (!prior) continue;
+      if (prior.valuePreview !== next.valuePreview) {
+        fieldChanges.push(`[${evidenceId}] ${next.label || 'field'} value changed from "${prior.valuePreview || ''}" to "${next.valuePreview || ''}"`);
+      } else if (prior.checked !== next.checked) {
+        fieldChanges.push(`[${evidenceId}] ${next.label || 'field'} checked changed from ${prior.checked} to ${next.checked}`);
+      } else if (prior.selectedIndex !== next.selectedIndex) {
+        fieldChanges.push(`[${evidenceId}] ${next.label || 'field'} selected option changed`);
+      }
+    }
+    return {
+      urlChanged: Boolean(previous.url && after.url && previous.url !== after.url),
+      fromUrl: previous.url || '',
+      toUrl: after.url || '',
+      fieldChanges: fieldChanges.slice(0, 8),
+      messageChanges: diffStringLists(previous.visibleAlerts || [], after.visibleAlerts || []).slice(0, 8),
+      dialogChanges: diffStringLists(previous.visibleDialogs || [], after.visibleDialogs || []).slice(0, 5),
+      tableChanges: diffStringLists(previous.tableSignals || [], after.tableSignals || []).slice(0, 5)
+    };
+  }
+
+  function diffStringLists(before = [], after = []) {
+    const previous = new Set((before || []).map((item) => String(item)));
+    return (after || [])
+      .map((item) => String(item))
+      .filter((item) => item && !previous.has(item));
+  }
+
+  function getAgentConsoleEventsInWindow(startedAt, endedAt) {
+    const start = Number(startedAt || 0);
+    const end = Number(endedAt || Date.now());
+    if (!start) return [];
+    return (agentRuntime.memory.console || [])
+      .filter((item) => Number(item.timestamp || 0) >= start - 250 && Number(item.timestamp || 0) <= end + 750)
+      .slice(-6)
+      .map((item) => ({
+        id: item.id,
+        level: sanitizePageText(item.level || 'log', 20),
+        message: sanitizePageText(item.message || '', 180),
+        timestamp: item.timestamp || 0,
+        url: item.url || ''
+      }));
   }
 
   function getFieldValidationEvidence() {
@@ -1185,7 +2168,7 @@
     }
     const failures = actionResults.filter((item) => !item.success);
     const successCount = actionResults.filter((item) => item.success).length;
-    const evidence = [...(observation?.evidence || []), ...actionResults.map((item) => `${item.action}: ${item.message}`)].slice(0, 12);
+    const evidence = [...(observation?.evidence || []), ...actionResults.map((item) => `[${item.actionId || 'ACT'}] ${item.action}: ${item.message}`)].slice(0, 12);
     const hasVisibleValidation = Boolean(
       (observation.fieldValidation && observation.fieldValidation.length)
       || (observation.visibleAlerts && observation.visibleAlerts.length)
@@ -1201,7 +2184,28 @@
     let summary = failures.length
       ? `${failures.length} agent step${failures.length === 1 ? '' : 's'} failed and needs review.`
       : `Agent completed ${successCount} step${successCount === 1 ? '' : 's'}; review the observations before filing.`;
-    if (plan.taskType === 'highlight_interactions' && !failures.length) {
+    if (plan.taskType === 'targeted_click' && !failures.length) {
+      const clicked = actionResults.find((item) => item.action === 'click' && item.success);
+      const changed = Boolean(observation?.diff?.urlChanged
+        || observation?.visibleDialogs?.length
+        || observation?.visibleAlerts?.length
+        || observation?.resultSignals?.length
+        || observation?.diff?.messageChanges?.length
+        || observation?.diff?.dialogChanges?.length);
+      status = clicked && changed ? 'passed' : 'needs_review';
+      summary = clicked && changed
+        ? 'Targeted click produced observable page evidence.'
+        : 'Targeted click ran, but TestPilot did not capture a clear page result.';
+    } else if (plan.taskType === 'targeted_fill' && !failures.length) {
+      const changedFields = observation?.diff?.fieldChanges || [];
+      const typeTargets = new Set(actionResults.filter((item) => item.action === 'type').map((item) => item.targetEvidenceId).filter(Boolean));
+      const changedTargetCount = changedFields.filter((item) => Array.from(typeTargets).some((id) => item.includes(`[${id}]`))).length;
+      const unrelatedChanges = changedFields.filter((item) => !Array.from(typeTargets).some((id) => item.includes(`[${id}]`)));
+      status = changedTargetCount && !unrelatedChanges.length ? 'passed' : (unrelatedChanges.length ? 'failed' : 'needs_review');
+      summary = status === 'passed'
+        ? 'Only the requested captured field changed.'
+        : (status === 'failed' ? 'More fields changed than the user requested.' : 'Typing ran, but field-change evidence was not captured.');
+    } else if (plan.taskType === 'highlight_interactions' && !failures.length) {
       const highlighted = actionResults.filter((item) => item.action === 'highlight' && item.success).length;
       status = highlighted ? 'passed' : 'needs_review';
       summary = highlighted
@@ -1244,11 +2248,79 @@
     return {
       status,
       summary,
-      passedChecks: actionResults.filter((item) => item.success).map((item) => `${item.action}: ${item.message}`),
-      failedChecks: failures.map((item) => `${item.action}: ${item.message}`),
+      passedChecks: actionResults.filter((item) => item.success).map((item) => `[${item.actionId || 'ACT'}] ${item.action}: ${item.message}`),
+      failedChecks: failures.map((item) => `[${item.actionId || 'ACT'}] ${item.action}: ${item.message}`),
       evidence,
       recommendedNextSteps: recommendedNextStepsForAgent(plan.taskType, status)
     };
+  }
+
+  function validateAgentClaims(result, plan, actionResults, observation, evidenceCards = []) {
+    const supportedIds = new Set([
+      ...(plan.evidenceIds || []),
+      ...(evidenceCards || []).map((card) => card.id),
+      ...(actionResults || []).map((item) => item.actionId).filter(Boolean),
+      ...(actionResults || []).map((item) => item.targetEvidenceId).filter(Boolean),
+      ...(actionResults || []).flatMap((item) => item.observedEvidenceIds || []),
+      ...(observation?.evidenceIds || [])
+    ]);
+    const cite = (text, fallbackId = '') => {
+      const clean = sanitizePageText(text || 'not captured', 500);
+      const hasCitation = /\[[A-Z]+-\d{3}\]/.test(clean);
+      if (hasCitation || clean === 'not captured') return clean;
+      if (fallbackId && supportedIds.has(fallbackId)) return `[${fallbackId}] ${clean}`;
+      return `${clean} (not captured)`;
+    };
+    const status = ['passed', 'failed', 'needs_review', 'blocked'].includes(result.status) ? result.status : 'needs_review';
+    const evidenceLines = [
+      ...(evidenceCards || []).slice(0, 8).map((card) => card.text),
+      ...(result.evidence || []).slice(0, 8).map((item) => cite(item, observation?.id || ''))
+    ].filter(Boolean);
+    const didLines = (actionResults || []).slice(0, 12).map((item) => (
+      `[${item.actionId || 'ACT'}] ${capitalizeAgentText(item.action || 'action')}${item.targetEvidenceId ? ` target [${item.targetEvidenceId}]` : ''}: ${sanitizePageText(item.message || 'not captured', 220)}`
+    ));
+    const needsReview = [];
+    if (status === 'needs_review') needsReview.push('Evidence is incomplete or ambiguous; tester confirmation is required.');
+    if (observation?.apiCapture) needsReview.push(`API correlation: ${observation.apiCapture}.`);
+    if (!evidenceLines.length) evidenceLines.push('not captured');
+    const finalSections = {
+      status,
+      task: String(plan.taskType || 'agent_task').replace(/_/g, ' '),
+      userRequirement: sanitizePageText(plan.userRequirement || 'not captured', 500),
+      whatIDid: didLines.length ? didLines : ['not captured'],
+      evidence: evidenceLines,
+      result: cite(result.summary || 'not captured', observation?.id || ''),
+      needsReview: needsReview.length ? needsReview : ['No unsupported claims were kept.'],
+      nextStep: (result.recommendedNextSteps || ['Repeat the flow if the result is important before filing.']).slice(0, 3)
+    };
+    return {
+      ...result,
+      status,
+      evidence: evidenceLines,
+      claimValidation: {
+        supportedEvidenceIds: Array.from(supportedIds).slice(0, 30),
+        unsupportedClaimsRemoved: true,
+        finalSections
+      },
+      finalOutput: formatValidatedAgentOutput(finalSections)
+    };
+  }
+
+  function formatValidatedAgentOutput(sections) {
+    return [
+      `Status: ${sections.status}`,
+      `Task: ${sections.task}`,
+      `User Requirement: ${sections.userRequirement}`,
+      'What I Did:',
+      ...sections.whatIDid.map((item) => `- ${item}`),
+      'Evidence:',
+      ...sections.evidence.map((item) => `- ${item}`),
+      `Result: ${sections.result}`,
+      'Needs Review:',
+      ...sections.needsReview.map((item) => `- ${item}`),
+      'Next Step:',
+      ...sections.nextStep.map((item) => `- ${item}`)
+    ].join('\n');
   }
 
   function getAccessibilityObservations() {
@@ -1296,10 +2368,19 @@
     if (/email/.test(hint)) return SAFE_DUMMY_VALUES.email;
     if (/password/.test(hint)) return SAFE_DUMMY_VALUES.invalidPassword;
     if (/phone|tel|mobile/.test(hint)) return SAFE_DUMMY_VALUES.invalidPhone;
+    if (/username|user name|login|account id|user id/.test(hint)) return SAFE_DUMMY_VALUES.email;
     if (/name|first|last|user/.test(hint)) return SAFE_DUMMY_VALUES.name;
     if (/message|comment|description|textarea/.test(hint) || field.role === 'textarea') return SAFE_DUMMY_VALUES.message;
     if (/search|query|keyword/.test(hint)) return SAFE_DUMMY_VALUES.search;
     return SAFE_DUMMY_VALUES.generic;
+  }
+
+  function valueForDataStrategy(dataStrategy, field) {
+    if (dataStrategy === 'symbols') return SAFE_DUMMY_VALUES.symbols;
+    if (dataStrategy === 'empty') return '';
+    if (dataStrategy === 'valid_dummy' || dataStrategy === 'user_provided' || dataStrategy === 'real_user_provided') return validDummyValueForField(field);
+    if (dataStrategy === 'invalid' || dataStrategy === 'fake_invalid') return dummyValueForField(field);
+    return dummyValueForField(field);
   }
 
   function validDummyValueForField(field) {
@@ -1307,6 +2388,7 @@
     if (/email/.test(hint)) return makeUniqueQaEmail();
     if (/password/.test(hint)) return SAFE_DUMMY_VALUES.password;
     if (/phone|tel|mobile/.test(hint)) return SAFE_DUMMY_VALUES.phone;
+    if (/username|user name|login|account id|user id/.test(hint)) return makeUniqueQaEmail();
     if (/name|first|last|user/.test(hint)) return SAFE_DUMMY_VALUES.name;
     if (/message|comment|description|textarea/.test(hint) || field.role === 'textarea') return SAFE_DUMMY_VALUES.message;
     if (/search|query|keyword/.test(hint)) return SAFE_DUMMY_VALUES.search;
@@ -1318,7 +2400,7 @@
   }
 
   function realDataDisclaimer(dataStrategy) {
-    return dataStrategy === 'real_user_provided'
+    return dataStrategy === 'real_user_provided' || dataStrategy === 'user_provided'
       ? 'Use safe realistic dummy QA data instead of private real user credentials.'
       : 'Enter valid-looking dummy QA data requested by the prompt.';
   }
@@ -1462,7 +2544,9 @@
       setElementValue(element, current);
       emitAgentEvent('field-updated', {
         requestKey: meta.requestKey || '',
+        actionId: meta.actionId || '',
         stepIndex: meta.stepIndex,
+        targetEvidenceId: meta.targetEvidenceId || '',
         targetIndex: meta.targetIndex || null,
         targetLabel: meta.targetLabel || '',
         action: 'type',

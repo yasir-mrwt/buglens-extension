@@ -28,8 +28,52 @@ assert(/getAgentStepApprovalFingerprint/.test(content), 'Agent step approval fin
 assert(/resumeFromStepIndex/.test(content), 'Agent approval does not resume from the pending step.');
 assert(/sanitizePreviousAgentActionResults/.test(content), 'Agent approved resume does not preserve previous safe actions.');
 assert(/pagePath:\s*safePagePath/.test(content), 'Agent session approval scope does not include page path.');
+for (const moduleName of [
+  'SessionManager',
+  'PageSnapshotService',
+  'EvidenceStore',
+  'IntentClassifier',
+  'TargetResolver',
+  'DataStrategyResolver',
+  'SafetyValidator',
+  'PlanHashService',
+  'AgentStateMachine',
+  'DebugTraceService',
+  'SessionRagRetriever',
+  'GroundedPlanner',
+  'AgentToolRegistry'
+]) {
+  assert(new RegExp(`const ${moduleName}`).test(content), `${moduleName} module is missing.`);
+}
+assert(/evidenceCards/.test(content), 'Agent does not carry retrieved evidence cards.');
+assert(/evidence-retrieved/.test(content), 'Agent does not emit evidence retrieval events.');
+assert(/targetEvidenceId/.test(content), 'Agent steps are not tied to target evidence IDs.');
+assert(/validateAgentToolStep/.test(content), 'Agent executor does not validate controlled tool actions.');
+assert(/captureAgentActionSnapshot/.test(content), 'Agent observation engine does not capture before/after snapshots.');
+assert(/diffAgentActionSnapshots/.test(content), 'Agent observation engine does not diff action snapshots.');
+assert(/getAgentConsoleEventsInWindow/.test(content), 'Agent does not correlate console events near action windows.');
+assert(/validateAgentClaims/.test(content), 'Agent claim validator is missing.');
+assert(/formatValidatedAgentOutput/.test(content), 'Agent final validated output formatter is missing.');
+assert(/Status:[\s\S]*User Requirement:[\s\S]*What I Did:[\s\S]*Evidence:[\s\S]*Needs Review:/m.test(content), 'Agent final output does not use the Phase 2 report sections.');
+assert(/planHash/.test(content), 'Agent planHash is missing.');
+assert(/promptId/.test(content), 'Agent promptId is missing.');
+assert(/taskId/.test(content), 'Agent taskId is missing.');
+assert(/target === 'first input'/.test(content), 'Target resolver does not handle first input.');
+assert(/target === 'signup link'/.test(content), 'Target resolver does not handle signup link.');
+assert(/target === 'google button'/.test(content), 'Target resolver does not handle Google/OAuth button.');
+assert(/dataStrategy === 'symbols'/.test(content), 'Data strategy does not handle symbols.');
+assert(/full login\|complete login\|try \.\*login\|login with\|clio login/.test(content), 'Agent does not route full login prompts to valid dummy login flow.');
+assert(/maybeAddLoginContinuationSteps/.test(content), 'Agent does not continue two-step login flows after password appears.');
+assert(/SAFE_DUMMY_VALUES\.password/.test(content), 'Agent does not type safe password values for login flows.');
+assert(/completedSafety/.test(content), 'Agent completion does not clear resolved confirmation state.');
+assert(/TESTPILOT_CANCEL_AGENT/.test(content), 'Agent cancel message is missing.');
 
 assert(/handleAgentEvent/.test(panel), 'Panel does not consume Agent events.');
+assert(/buildSessionEvidenceCards/.test(panel), 'Panel AI context does not retrieve compact evidence cards.');
+assert(/evidenceCards/.test(panel), 'Panel AI context does not expose evidence cards to model tasks.');
+assert(/result\.finalOutput/.test(panel), 'Panel does not render claim-validated Agent output first.');
+assert(/State:/.test(panel), 'Panel does not render Agent state changes.');
+assert(/Retrieved grounded evidence before planning/.test(panel), 'Panel does not render Agent evidence retrieval progress.');
 assert(/renderAgentLiveMessage/.test(panel), 'Panel does not render live Agent progress.');
 assert(/renderAgentPermissionMessage/.test(panel), 'Panel does not render Agent permission prompts.');
 assert(/approveAgentPermission/.test(panel), 'Panel does not wire Agent approval.');
@@ -38,6 +82,8 @@ assert(/Continue Once/.test(panel), 'Agent one-time approval button copy is miss
 assert(/Allow Similar This Session/.test(panel), 'Agent session preference approval button copy is missing.');
 assert(/agentApprovalPreferences/.test(panel), 'Agent session approval preference store is missing.');
 assert(/buildAgentApprovalPreferenceKey/.test(panel), 'Agent approval preference scoping is missing.');
+assert(/cancelPendingAgentApprovalsForNewPrompt/.test(panel), 'Panel does not cancel stale approvals when a new prompt is sent.');
+assert(/TESTPILOT_CANCEL_AGENT/.test(panel), 'Panel does not send Agent cancel messages.');
 assert(/stepFingerprint: approval\.stepFingerprint/.test(panel), 'Panel does not return the approved step fingerprint.');
 assert(/previousActionResults/.test(panel), 'Panel does not return previous action evidence on approval.');
 assert(/continue automatically from here after approval/.test(panel), 'Permission card does not explain automatic continuation.');
@@ -52,6 +98,7 @@ assert(/setStoredSessionSnapshot/.test(panel), 'Session persistence fallback hel
 assert(!/actual\.innerHTML/.test(panel), 'Bug draft actual-result rendering still uses innerHTML.');
 
 assert(/\.ai-chat-message\.agent-live/.test(css), 'Agent live message styling is missing.');
+assert(/\.topbar-status-strip\s*\{[\s\S]*display:\s*none\s*!important/.test(css), 'Noisy topbar AI/Agent/Mode chips are still visible.');
 assert(/\.ai-chat-message\.agent-permission/.test(css), 'Agent permission styling is missing.');
 assert(/\.agent-permission-actions/.test(css), 'Agent permission action styling is missing.');
 assert(/\.agent-permission-inputs/.test(css), 'Agent prepared input styling is missing.');

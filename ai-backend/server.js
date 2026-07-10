@@ -1,153 +1,151 @@
+/**
+ * TestPilot AI Backend
+ * Node.js 18+ required
+ *
+ * Current provider: Ollama (local) only.
+ * OpenAI cloud provider is stubbed — wire it up when the API key is purchased.
+ * Search for "TODO: OpenAI" to find the exact spots to uncomment.
+ *
+ * What changed from v1:
+ *  - Removed classifyChatScope()       → AI decides relevance via system prompt
+ *  - Removed isChatAnswerAligned()     → stopped throwing away valid AI answers
+ *  - Removed buildFallbackChatAnswer() → replaced with a single honest error message
+ *  - Removed all if(lower.includes()) prompt routing → system prompt handles everything
+ *  - Unified Ollama endpoint → both chat and stream use /api/chat
+ *  - Fallback only fires on actual provider failure, not regex mismatch
+ *  - Chat history is wired into the system prompt properly
+ *  - Context is injected once, cleanly, into every request
+ */
+
 import http from 'node:http';
-import fs from 'node:fs';
+import fs   from 'node:fs';
 
 loadEnvFile();
 assertRuntime();
 
+// ── Config ────────────────────────────────────────────────────────────────────
 const CONFIG = {
-  provider: 'ollama',
-  requestedProvider: (process.env.AI_PROVIDER || 'ollama').toLowerCase(),
-  ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
-  ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2:3b',
-  modelTimeoutMs: Number(process.env.AI_MODEL_TIMEOUT_MS || 240000),
-  chatTimeoutMs: Number(process.env.AI_CHAT_TIMEOUT_MS || process.env.AI_MODEL_TIMEOUT_MS || 180000),
-  port: Number(process.env.PORT || 8787)
+  ollamaBaseUrl:  process.env.OLLAMA_BASE_URL   || 'http://localhost:11434',
+  ollamaModel:    process.env.OLLAMA_MODEL       || 'llama3.2:3b',
+  modelTimeoutMs: Number(process.env.AI_MODEL_TIMEOUT_MS || 240_000),
+  chatTimeoutMs:  Number(process.env.AI_CHAT_TIMEOUT_MS  || 180_000),
+  port:           Number(process.env.PORT        || 8787),
+  // TODO: OpenAI — add these back when the API key is purchased:
+  // openAiApiKey: process.env.OPENAI_API_KEY || '',
+  // openAiModel:  process.env.OPENAI_MODEL   || 'gpt-4o-mini',
 };
 
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
 function loadEnvFile() {
   try {
     const text = fs.readFileSync(new URL('.env', import.meta.url), 'utf8');
     for (const line of text.split(/\r?\n/)) {
-      const trimmed = line.trim();
-      if (!trimmed || trimmed.startsWith('#') || !trimmed.includes('=')) continue;
-      const index = trimmed.indexOf('=');
-      const key = trimmed.slice(0, index).trim();
-      const value = trimmed.slice(index + 1).trim();
-      if (key && process.env[key] === undefined) process.env[key] = value;
+      const t = line.trim();
+      if (!t || t.startsWith('#') || !t.includes('=')) continue;
+      const i = t.indexOf('=');
+      const k = t.slice(0, i).trim();
+      const v = t.slice(i + 1).trim();
+      if (k && process.env[k] === undefined) process.env[k] = v;
     }
-  } catch {
-    // .env is optional; defaults are development friendly.
+  } catch { /* .env is optional */ }
+}
+
+function assertRuntime() {
+  const major = Number(String(process.versions.node || '0').split('.')[0]);
+  if (!Number.isFinite(major) || major < 18) {
+    console.error(`TestPilot requires Node.js 18+. Current: ${process.version}`);
+    process.exit(1);
   }
 }
 
-class AIProvider {
-  async health() {
-    throw new Error('AIProvider.health is not implemented.');
-  }
+// ── AI Providers ──────────────────────────────────────────────────────────────
 
-  async completeJson() {
-    throw new Error('AIProvider.completeJson is not implemented.');
-  }
-
-  async completeChat() {
-    throw new Error('AIProvider.completeChat is not implemented.');
-  }
-
-  async streamChat() {
-    throw new Error('AIProvider.streamChat is not implemented.');
-  }
-}
-
-class OllamaProvider extends AIProvider {
+/**
+ * OllamaProvider
+ * Uses /api/chat for BOTH streaming and non-streaming to keep request shapes
+ * consistent. stream:false for regular calls, stream:true for SSE.
+ */
+class OllamaProvider {
   constructor({ baseUrl, model }) {
-    super();
     this.baseUrl = String(baseUrl || '').replace(/\/+$/, '');
-    this.model = model;
+    this.model   = model;
+    this.name    = 'ollama';
   }
 
   async health() {
-    const response = await fetch(`${this.baseUrl}/api/tags`, { method: 'GET' });
-    if (!response.ok) throw new Error(`Ollama health returned ${response.status}`);
-    return { ok: true, provider: 'ollama', model: this.model };
+    const res = await fetch(`${this.baseUrl}/api/tags`);
+    if (!res.ok) throw new Error(`Ollama /api/tags returned ${res.status}`);
+    const data = await res.json();
+    const models = (data.models || []).map(m => m.name);
+    const modelAvailable = models.some(m => m.startsWith(this.model.split(':')[0]));
+    return {
+      ok: true,
+      provider: 'ollama',
+      model: this.model,
+      modelAvailable,
+      availableModels: models.slice(0, 20),
+    };
   }
 
-  async completeJson({ system, user }) {
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
+  // Non-streaming: returns the full text response
+  async chat({ system, messages }) {
+    const res = await fetch(`${this.baseUrl}/api/chat`, {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
-        model: this.model,
-        temperature: 0.2,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user }
-        ]
-      })
+        model:    this.model,
+        stream:   false,
+        options:  { temperature: 0.3 },
+        messages: buildOllamaMessages(system, messages),
+      }),
     });
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Ollama completion returned ${response.status}: ${body.slice(0, 240)}`);
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Ollama returned ${res.status}: ${body.slice(0, 300)}`);
     }
-    const payload = await response.json();
-    const content = payload?.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Ollama returned an empty completion.');
-    return parseJsonFromModel(content);
+    const payload = await res.json();
+    const content = payload?.message?.content;
+    if (!content) throw new Error('Ollama returned an empty response.');
+    return content.trim();
   }
 
-  async completeChat({ system, user }) {
-    const response = await fetch(`${this.baseUrl}/v1/chat/completions`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: this.model,
-        temperature: 0.3,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user }
-        ]
-      })
-    });
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Ollama chat returned ${response.status}: ${body.slice(0, 240)}`);
-    }
-    const payload = await response.json();
-    const content = payload?.choices?.[0]?.message?.content;
-    if (!content) throw new Error('Ollama returned an empty chat response.');
-    return parseOptionalJsonFromModel(content);
-  }
-
-  async streamChat({ system, user, onToken, signal }) {
-    const response = await fetch(`${this.baseUrl}/api/chat`, {
-      method: 'POST',
+  // Streaming: calls onToken(token) for each chunk, returns full text
+  async stream({ system, messages, onToken, signal }) {
+    const res = await fetch(`${this.baseUrl}/api/chat`, {
+      method:  'POST',
       headers: { 'Content-Type': 'application/json' },
       signal,
       body: JSON.stringify({
-        model: this.model,
-        stream: true,
-        options: { temperature: 0.3 },
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user }
-        ]
-      })
+        model:    this.model,
+        stream:   true,
+        options:  { temperature: 0.3 },
+        messages: buildOllamaMessages(system, messages),
+      }),
     });
-    if (!response.ok) {
-      const body = await response.text().catch(() => '');
-      throw new Error(`Ollama stream returned ${response.status}: ${body.slice(0, 240)}`);
-    }
-    if (!response.body || typeof response.body.getReader !== 'function') {
-      const result = await this.completeChat({ system, user });
-      const answer = typeof result === 'string' ? result : (result.answer || result.message || '');
-      if (answer) onToken(answer);
-      return answer;
+    if (!res.ok) {
+      const body = await res.text().catch(() => '');
+      throw new Error(`Ollama stream returned ${res.status}: ${body.slice(0, 300)}`);
     }
 
-    const reader = response.body.getReader();
+    // Fall back to non-streaming if the response body isn't a readable stream
+    if (!res.body?.getReader) {
+      const text = await this.chat({ system, messages });
+      onToken(text);
+      return text;
+    }
+
+    const reader  = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = '';
-    let answer = '';
+    let full   = '';
+
     const consumeLine = (line) => {
       const trimmed = line.trim();
       if (!trimmed) return;
       const payload = JSON.parse(trimmed);
-      const token = payload?.message?.content || payload?.response || '';
-      if (token) {
-        answer += token;
-        onToken(token);
-      }
-      if (payload.done && payload.error) throw new Error(payload.error);
+      const token = payload?.message?.content || '';
+      if (token) { full += token; onToken(token); }
+      if (payload.done && payload.error) throw new Error(String(payload.error));
     };
 
     while (true) {
@@ -159,974 +157,592 @@ class OllamaProvider extends AIProvider {
       if (done) break;
     }
     if (buffer.trim()) consumeLine(buffer);
-    return answer;
+    return full;
+  }
+
+  // JSON-only completion for structured analysis tasks
+  async completeJson({ system, messages }) {
+    // Append a reminder to return JSON only — Ollama doesn't have response_format natively
+    const jsonSystem = system + '\n\nIMPORTANT: Return valid JSON only. No markdown fences, no extra text.';
+    const text = await this.chat({ system: jsonSystem, messages });
+    return parseJsonSafely(text);
   }
 }
 
-class OpenAIProvider extends AIProvider {
-  async health() {
-    return { ok: false, provider: 'openai', configured: false, note: 'OpenAI provider placeholder only. No API keys are used by TestPilot.' };
-  }
+// TODO: OpenAI — uncomment this entire class when the API key is purchased.
+// The provider interface is identical to OllamaProvider (health/chat/stream/completeJson)
+// so swapping in will require no changes to the route handlers above.
+//
+// class OpenAIProvider {
+//   constructor({ apiKey, model }) {
+//     this.apiKey = apiKey;
+//     this.model  = model;
+//     this.name   = 'openai';
+//   }
+//   async health() { ... }
+//   async chat({ system, messages }) { ... }
+//   async stream({ system, messages, onToken, signal }) { ... }
+//   async completeJson({ system, messages }) { ... }
+// }
 
-  async completeJson() {
-    throw new Error('OpenAI provider is a future placeholder and is not configured.');
-  }
-
-  async completeChat() {
-    throw new Error('OpenAI provider is a future placeholder and is not configured.');
-  }
+// ── Provider factory ──────────────────────────────────────────────────────────
+// TODO: OpenAI — when the API key is ready, restore the OpenAIProvider class above
+// and add a branch here:
+//   if (process.env.OPENAI_API_KEY) {
+//     return new OpenAIProvider({ apiKey: process.env.OPENAI_API_KEY, model: process.env.OPENAI_MODEL || 'gpt-4o-mini' });
+//   }
+function createProvider() {
+  console.log(`[TestPilot] Using Ollama provider (${CONFIG.ollamaModel})`);
+  return new OllamaProvider({ baseUrl: CONFIG.ollamaBaseUrl, model: CONFIG.ollamaModel });
 }
 
 const provider = createProvider();
 
-function createProvider() {
-  return new OllamaProvider({ baseUrl: CONFIG.ollamaBaseUrl, model: CONFIG.ollamaModel });
+// ── Message builder ───────────────────────────────────────────────────────────
+function buildOllamaMessages(system, messages) {
+  return [
+    { role: 'system', content: system },
+    ...messages.map(m => ({ role: m.role, content: m.content })),
+  ];
+  // TODO: OpenAI uses the same shape — this function works for both providers as-is.
 }
 
-function getConfiguredModelName() {
-  return CONFIG.ollamaModel;
+// ── System prompts ────────────────────────────────────────────────────────────
+// One prompt per task. No branching inside prompts. No if(lower.includes()).
+// The AI is trusted to interpret the user's question directly.
+
+function buildChatSystemPrompt(context) {
+  const { pageUrl, health, counts, actionableFindings, needsReviewFindings,
+          networkSummary, consoleSummary, uiScanSummary } = context;
+
+const topFindings = (actionableFindings || []).slice(0, 5)
+    .map((f, i) => `  ${i + 1}. [${f.severity || 'medium'}] ${f.title}${f.userImpact ? ` — ${f.userImpact}` : ''}`)
+    .join('\n');
+
+  const needsReviewList = (needsReviewFindings || []).slice(0, 3)
+    .map((f, i) => `  ${i + 1}. ${f.title}`)
+    .join('\n');
+  const evidenceCards = Array.isArray(context.evidenceCards)
+    ? context.evidenceCards.slice(0, 12).map((card) => `  ${card.text || `[${card.id}] ${card.type || 'evidence'}`}`).join('\n')
+    : '';
+
+  return `You are TestPilot AI, a QA assistant embedded in a Chrome extension.
+A software tester is actively testing a webpage and talking to you in real time.
+
+Answer WHATEVER the tester asks — test strategy, bug analysis, Jira tickets,
+console errors, API failures, accessibility, repro steps, "is this a bug?",
+"what should I test next?", code explanations — everything is in scope if it
+relates to software quality or the current session.
+
+The ONLY thing you should decline is questions with zero connection to software,
+testing, or this session (e.g. "write me a poem", "what's the weather").
+For those, say exactly: "I'm focused on QA for this session — ask me about what you're testing."
+Do NOT decline anything else. Real QA questions come in many forms.
+
+When asked to generate a bug report: write a full report immediately.
+When asked for a Jira ticket: use this exact format:
+  Title / Severity / Priority / Environment / Affected URL /
+  Steps to Reproduce / Expected Result / Actual Result / Evidence /
+  User Impact / Developer Notes / QA Notes
+When asked what to test next: give specific, actionable suggestions based on the findings.
+When context is missing: tell the tester exactly which TestPilot action to run.
+Use retrieved evidence cards first. Cite evidence IDs like [API-001], [CON-001],
+[DOM-004], [ACT-012], [OBS-003], or say "not captured" for concrete claims
+that are not supported by the provided evidence.
+
+Tone: QA lead talking to a peer. Concise, practical, direct. Use plain text.
+If you return JSON, return exactly one object {"answer": "..."}.
+
+── CURRENT SESSION CONTEXT ──────────────────────────────────────────
+Page: ${pageUrl || 'not captured'}
+Health: ${health?.label || 'unknown'} (score: ${health?.score ?? '?'}/100)
+Actionable findings: ${counts?.actionable ?? 0}
+Needs review:        ${counts?.needsReview ?? 0}
+API calls captured:  ${networkSummary?.businessApis ?? 0}
+Console errors:      ${consoleSummary?.errors ?? 0}
+UI scans run:        ${uiScanSummary?.scans ?? 0}
+${topFindings   ? `\nTop actionable issues:\n${topFindings}`    : ''}
+${needsReviewList ? `\nNeeds review:\n${needsReviewList}`       : ''}
+${evidenceCards ? `\nRetrieved evidence cards:\n${evidenceCards}` : ''}
+─────────────────────────────────────────────────────────────────────`;
 }
 
+function buildAnalysisSystemPrompt(task) {
+  const taskFocus = {
+    'analyze-session': `
+Analyze the entire QA session. Separate real bugs from noise.
+Identify the most user-impacting issues. Do not invent issues not supported by evidence.
+Rate overall health as: excellent | good | needs_review | risky | broken`,
+
+    'generate-test-cases': `
+Generate specific, executable test cases based only on the evidence in this session.
+Each test case must have: title, objective, priority (P0–P3), type
+(functional|regression|accessibility|visual|performance|negative),
+sourceFinding, dataNeeded, steps (numbered list), expectedResult.
+Write steps a human tester can follow without ambiguity.
+Do not write strategy paragraphs — write tester actions.`,
+
+    'generate-bug-report': `
+Generate bug report drafts only for confirmed or high-confidence issues.
+For each bug include: title, severity, stepsToReproduce (numbered),
+expectedResult, actualResult, evidenceSummary.
+If evidence is weak or uncertain, put it in needsReview instead.
+Do not invent reproduction steps — base them on captured evidence.`,
+  }[task] || 'Analyze the TestPilot QA session.';
+
+  return `You are TestPilot AI, a careful QA analyst.
+${taskFocus}
+
+Rules:
+- Use ONLY the sanitized session data provided. Never invent issues.
+- Prefer session.evidenceCards and cite their IDs in concrete issue, test-case,
+  and bug-report claims.
+- Do not overstate severity. User impact drives priority.
+- Framework/internal traffic (Next.js prefetch, analytics, polling) is noise unless it causes user-visible failure.
+- If data is missing, say what the tester should do to capture it.
+
+Return strict JSON only matching this shape exactly:
+{
+  "qaHealth": "excellent|good|needs_review|risky|broken",
+  "executiveSummary": "",
+  "actionableIssues": [{"title":"","severity":"","reason":"","recommendation":""}],
+  "likelyFalsePositives": [{"title":"","reason":""}],
+  "needsReview": [{"title":"","whatToVerify":""}],
+  "recommendedNextTests": [""],
+  "testCases": [{
+    "title":"","objective":"","priority":"P0|P1|P2|P3",
+    "type":"functional|regression|accessibility|visual|performance|negative",
+    "sourceFinding":"","dataNeeded":"","steps":[""],"expectedResult":""
+  }],
+  "bugReportDrafts": [{
+    "title":"","severity":"","stepsToReproduce":[""],
+    "expectedResult":"","actualResult":"","evidenceSummary":""
+  }],
+  "managerSummary": "",
+  "developerSummary": ""
+}`;
+}
+
+// ── HTTP Server ───────────────────────────────────────────────────────────────
 const server = http.createServer(async (req, res) => {
   setCors(res);
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
-  }
+  if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
+  const url = pathname(req.url);
   try {
-    if (req.method === 'GET' && isRootRoute(req.url)) {
-      sendJson(res, 200, {
-        ok: true,
-        service: 'testpilot-ai-backend',
-        message: 'TestPilot AI backend is running.',
-        backendUrl: `http://localhost:${CONFIG.port}`,
-        healthCheck: `http://localhost:${CONFIG.port}/api/health`,
-        provider: CONFIG.provider,
-        model: getConfiguredModelName()
+    // Status
+    if (req.method === 'GET' && url === '/') {
+      return sendJson(res, 200, {
+        ok: true, service: 'testpilot-ai-backend',
+        provider: provider.name,
+        model: CONFIG.ollamaModel,
       });
-      return;
     }
 
-    if (req.method === 'GET' && req.url === '/api/health') {
-      const health = await getProviderHealth();
-      sendJson(res, 200, {
-        ok: true,
-        service: 'testpilot-ai-backend',
-        provider: CONFIG.provider,
-        model: getConfiguredModelName(),
-        ai: health
-      });
-      return;
+    if (req.method === 'GET' && url === '/api/health') {
+      const ai = await provider.health().catch(e => ({ ok: false, error: e.message }));
+      return sendJson(res, 200, { ok: true, service: 'testpilot-ai-backend', ai });
     }
 
-    if (req.method === 'POST' && req.url === '/api/ai/analyze-session') {
-      await handleAi(req, res, 'analyze-session');
-      return;
+    // Analysis tasks (non-streaming, return JSON)
+    if (req.method === 'POST' && [
+      '/api/ai/analyze-session',
+      '/api/ai/generate-test-cases',
+      '/api/ai/generate-bug-report',
+    ].includes(url)) {
+      return handleAnalysis(req, res, url.split('/').pop());
     }
 
-    if (req.method === 'POST' && req.url === '/api/ai/generate-bug-report') {
-      await handleAi(req, res, 'generate-bug-report');
-      return;
+    // Chat (non-streaming)
+    if (req.method === 'POST' && ['/api/ai/chat', '/api/chat'].includes(url)) {
+      return handleChat(req, res);
     }
 
-    if (req.method === 'POST' && req.url === '/api/ai/generate-test-cases') {
-      await handleAi(req, res, 'generate-test-cases');
-      return;
-    }
-
-    if (req.method === 'POST' && isChatRoute(req.url)) {
-      await handleChat(req, res);
-      return;
-    }
-
-    if (req.method === 'POST' && isChatStreamRoute(req.url)) {
-      await handleChatStream(req, res);
-      return;
+    // Chat (streaming SSE)
+    if (req.method === 'POST' && ['/api/ai/chat-stream', '/api/chat-stream'].includes(url)) {
+      return handleChatStream(req, res);
     }
 
     sendJson(res, 404, { ok: false, error: 'Not found' });
-  } catch (error) {
-    sendJson(res, 500, { ok: false, error: error.message || 'Internal server error' });
+  } catch (err) {
+    console.error(`[TestPilot] Unhandled error on ${url}:`, err.message);
+    sendJson(res, 500, { ok: false, error: err.message || 'Internal server error' });
   }
 });
 
-server.listen(CONFIG.port, () => {
-  console.log('TestPilot AI backend is running.');
-  console.log(`Backend URL: http://localhost:${CONFIG.port}`);
-  console.log(`Health check: http://localhost:${CONFIG.port}/api/health`);
-  console.log(`Provider: ${CONFIG.provider}; model: ${getConfiguredModelName()}`);
-  console.log('Tip: open the Health check URL above. The root URL now returns a backend status JSON.');
-  if (CONFIG.requestedProvider !== CONFIG.provider) {
-    console.log(`Remote provider "${CONFIG.requestedProvider}" is disabled; TestPilot is using local Ollama only.`);
-  }
-});
+// ── Route handlers ────────────────────────────────────────────────────────────
 
-server.on('error', (error) => {
-  if (error && error.code === 'EADDRINUSE') {
-    console.error(`TestPilot AI backend could not start because port ${CONFIG.port} is already in use.`);
-    console.error(`Stop the other process or start this backend with another port, for example: PORT=8788 npm start`);
-  } else {
-    console.error('TestPilot AI backend failed to start:', error && error.message ? error.message : error);
-  }
-  process.exit(1);
-});
+async function handleAnalysis(req, res, task) {
+  log(`${task} started`);
+  const body    = await readJson(req);
+  const session = sanitizeSession(body.session || body);
+  const system  = buildAnalysisSystemPrompt(task);
+  const messages = [{ role: 'user', content: JSON.stringify({ task, session }, null, 2) }];
 
-function assertRuntime() {
-  const major = Number(String(process.versions.node || '0').split('.')[0]);
-  if (!Number.isFinite(major) || major < 18) {
-    console.error(`TestPilot AI backend requires Node.js 18 or newer. Current Node.js: ${process.version}`);
-    console.error('Install a newer Node.js version, then run: cd ai-backend && npm start');
-    process.exit(1);
-  }
-}
-
-function isRootRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '') || '/';
-  return pathname === '/';
-}
-
-function isChatRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
-  return pathname === '/api/ai/chat' || pathname === '/api/chat';
-}
-
-function isChatStreamRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
-  return pathname === '/api/ai/chat-stream' || pathname === '/api/chat-stream';
-}
-
-async function handleAi(req, res, task) {
-  console.log(`[${new Date().toISOString()}] ${task} request received`);
-  const body = await readJson(req);
-  const session = sanitizeIncomingSession(body.session || body);
-  const fallback = buildFallbackAnalysis(session, task);
-  let usedFallback = false;
-  let fallbackReason = '';
-  let result = null;
-
+  let result, usedFallback = false, fallbackReason = '';
   try {
-    result = await withTimeout(provider.completeJson({
-      system: buildSystemPrompt(task),
-      user: JSON.stringify({ task, session }, null, 2)
-    }), CONFIG.modelTimeoutMs);
-  } catch (error) {
-    usedFallback = true;
-    fallbackReason = error.message || 'Model did not return a usable response.';
-    console.warn(`[${new Date().toISOString()}] ${task} using fallback: ${fallbackReason}`);
+    result = await withTimeout(
+      provider.completeJson({ system, messages }),
+      CONFIG.modelTimeoutMs
+    );
+  } catch (err) {
+    usedFallback   = true;
+    fallbackReason = err.message;
+    log(`${task} provider error — ${fallbackReason}`);
   }
 
-  const analysis = mergeAnalysisWithFallback(
-    result ? normalizeAiAnalysis(result) : fallback,
-    fallback,
-    { usedFallback, fallbackReason }
-  );
-  console.log(`[${new Date().toISOString()}] ${task} completed${usedFallback ? ' with fallback' : ''}`);
+  const analysis = result
+    ? normalizeAnalysis(result)
+    : buildMinimalFallback(session, task, fallbackReason);
+
+  log(`${task} done${usedFallback ? ' (fallback)' : ''}`);
   sendJson(res, 200, { ok: true, task, fallback: usedFallback, fallbackReason, analysis });
 }
 
 async function handleChat(req, res) {
-  console.log(`[${new Date().toISOString()}] chat request received`);
-  const body = await readJson(req);
-  const question = String(body.message || body.question || '').slice(0, 1000);
-  const context = sanitizeIncomingSession(body.context || {});
-  const history = sanitizeChatHistory(body.history || []);
-  const scope = classifyChatScope(question);
-  const usedContext = buildUsedContextList(context);
-  if (scope === 'irrelevant') {
-    sendJson(res, 200, {
-      ok: true,
-      fallback: false,
-      fallbackReason: '',
-      answer: 'I can only help with this TestPilot QA session, testing, debugging, reports, and software engineering topics. Ask me about the current findings, APIs, UI scan, console logs, or what to test next.',
-      scope,
-      usedContext,
-      suggestedActions: ['Ask about current findings', 'Review API failures', 'Explain health score']
-    });
-    return;
-  }
-  const fallbackAnswer = buildFallbackChatAnswer(question, context, '');
-  let answer = fallbackAnswer;
-  let usedFallback = false;
-  let fallbackReason = '';
+  log('chat started');
+  const body     = await readJson(req);
+  const question = String(body.message || body.question || '').slice(0, 2000);
+  const context  = sanitizeSession(body.context || {});
+  const history  = sanitizeHistory(body.history || []);
 
+  const system   = buildChatSystemPrompt(context);
+  // Include conversation history + new question as the messages array
+  const messages = [...history, { role: 'user', content: question }];
+
+  let answer = '', usedFallback = false, fallbackReason = '';
   try {
-    const result = await withTimeout(provider.completeChat({
-      system: buildChatSystemPrompt(),
-      user: JSON.stringify({ message: question, context, history }, null, 2)
-    }), CONFIG.chatTimeoutMs);
-    const normalized = normalizeChatAnswer(result, fallbackAnswer);
-    answer = normalized.answer;
-    if (normalized.usedFallback) {
-      usedFallback = true;
-      fallbackReason = 'AI returned no usable chat answer.';
-      answer = buildFallbackChatAnswer(question, context, fallbackReason);
-    } else if (!isChatAnswerAligned(question, answer)) {
-      usedFallback = true;
-      fallbackReason = 'AI answer did not match the requested task.';
-      answer = buildFallbackChatAnswer(question, context, '');
-    }
-  } catch (error) {
-    usedFallback = true;
-    fallbackReason = formatProviderError(error);
-    answer = isProviderCapacityError(fallbackReason)
-      ? buildProviderUnavailableChatAnswer(fallbackReason)
-      : buildFallbackChatAnswer(question, context, fallbackReason);
-    console.warn(`[${new Date().toISOString()}] chat using fallback: ${fallbackReason}`);
+    answer = await withTimeout(
+      provider.chat({ system, messages }),
+      CONFIG.chatTimeoutMs
+    );
+    // Clean up JSON-wrapped answers if the model returned {"answer":"..."}
+    answer = unwrapJsonAnswer(answer);
+  } catch (err) {
+    usedFallback   = true;
+    fallbackReason = err.message;
+    answer         = providerErrorMessage(err);
+    log(`chat provider error — ${fallbackReason}`);
   }
 
-  console.log(`[${new Date().toISOString()}] chat completed${usedFallback ? ' with fallback' : ''}`);
+  log(`chat done${usedFallback ? ' (fallback)' : ''}`);
   sendJson(res, 200, {
-    ok: true,
-    fallback: usedFallback,
-    fallbackReason,
-    answer,
-    scope,
-    usedContext,
-    suggestedActions: suggestChatActions(question, context)
+    ok: true, fallback: usedFallback, fallbackReason, answer,
+    usedContext: listUsedContext(context),
   });
 }
 
 async function handleChatStream(req, res) {
-  console.log(`[${new Date().toISOString()}] chat stream request received`);
-  const body = await readJson(req);
-  const question = String(body.message || body.question || '').slice(0, 1000);
-  const context = sanitizeIncomingSession(body.context || {});
-  const history = sanitizeChatHistory(body.history || []);
-  const scope = classifyChatScope(question);
-  const usedContext = buildUsedContextList(context);
-  const fallbackAnswer = scope === 'irrelevant'
-    ? 'I can only help with this TestPilot QA session, testing, debugging, reports, and software engineering topics. Ask me about the current findings, APIs, UI scan, console logs, or what to test next.'
-    : buildFallbackChatAnswer(question, context, '');
+  log('chat-stream started');
+  const body     = await readJson(req);
+  const question = String(body.message || body.question || '').slice(0, 2000);
+  const context  = sanitizeSession(body.context || {});
+  const history  = sanitizeHistory(body.history || []);
+
+  const system   = buildChatSystemPrompt(context);
+  const messages = [...history, { role: 'user', content: question }];
 
   sendSseHeaders(res);
-  if (scope === 'irrelevant') {
-    sendSse(res, 'token', { token: fallbackAnswer });
-    sendSse(res, 'done', {
-      ok: true,
-      fallback: false,
-      fallbackReason: '',
-      answer: fallbackAnswer,
-      scope,
-      usedContext,
-      suggestedActions: ['Ask about current findings', 'Review API failures', 'Explain health score']
-    });
-    res.end();
-    return;
-  }
 
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), CONFIG.chatTimeoutMs);
-  let rawAnswer = '';
-  let usedFallback = false;
-  let fallbackReason = '';
+  const timer = setTimeout(() => controller.abort(), CONFIG.chatTimeoutMs);
 
+  let rawAnswer = '', usedFallback = false, fallbackReason = '';
   try {
-    rawAnswer = await provider.streamChat({
-      system: buildChatSystemPrompt(),
-      user: JSON.stringify({ message: question, context, history }, null, 2),
+    rawAnswer = await provider.stream({
+      system, messages,
       signal: controller.signal,
-      onToken(token) {
-        sendSse(res, 'token', { token });
-      }
+      onToken(token) { sendSse(res, 'token', { token }); },
     });
-    const answer = cleanChatAnswerText(rawAnswer);
-    if (!answer || !isChatAnswerAligned(question, answer)) {
-      usedFallback = true;
-      fallbackReason = answer ? 'AI answer did not match the requested task.' : 'AI returned no usable chat answer.';
-      const replacement = buildFallbackChatAnswer(question, context, fallbackReason);
-      sendSse(res, 'replace', { answer: replacement });
-      rawAnswer = replacement;
-    } else {
-      rawAnswer = answer;
-    }
-  } catch (error) {
-    usedFallback = true;
-    fallbackReason = formatProviderError(error);
-    rawAnswer = isProviderCapacityError(fallbackReason)
-      ? buildProviderUnavailableChatAnswer(fallbackReason)
-      : buildFallbackChatAnswer(question, context, fallbackReason);
+    rawAnswer = unwrapJsonAnswer(rawAnswer);
+  } catch (err) {
+    usedFallback   = true;
+    fallbackReason = err.message;
+    rawAnswer      = providerErrorMessage(err);
+    // Replace whatever partial tokens were sent with the error message
     sendSse(res, 'replace', { answer: rawAnswer });
-    console.warn(`[${new Date().toISOString()}] chat stream using fallback: ${fallbackReason}`);
+    log(`chat-stream provider error — ${fallbackReason}`);
   } finally {
-    clearTimeout(timeout);
+    clearTimeout(timer);
   }
 
-  console.log(`[${new Date().toISOString()}] chat stream completed${usedFallback ? ' with fallback' : ''}`);
+  log(`chat-stream done${usedFallback ? ' (fallback)' : ''}`);
   sendSse(res, 'done', {
-    ok: true,
-    fallback: usedFallback,
-    fallbackReason,
-    answer: rawAnswer,
-    scope,
-    usedContext,
-    suggestedActions: suggestChatActions(question, context)
+    ok: true, fallback: usedFallback, fallbackReason, answer: rawAnswer,
+    usedContext: listUsedContext(context),
   });
   res.end();
 }
 
-function sendSseHeaders(res) {
-  res.writeHead(200, {
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Content-Type': 'text/event-stream; charset=utf-8',
-    'Cache-Control': 'no-cache, no-transform',
-    Connection: 'keep-alive'
-  });
+// ── Normalisation helpers ─────────────────────────────────────────────────────
+// Shape-check and clamp AI output so callers always get a predictable object.
+
+function normalizeAnalysis(raw) {
+  const src = (raw && typeof raw === 'object') ? raw : {};
+  const str  = (v, fb = '') => String(v ?? fb).trim().slice(0, 2000);
+  const arr  = (v)           => Array.isArray(v) ? v.slice(0, 20) : [];
+
+  const validHealth = ['excellent', 'good', 'needs_review', 'risky', 'broken'];
+  const qaHealth    = validHealth.includes(src.qaHealth) ? src.qaHealth : 'needs_review';
+
+  return {
+    qaHealth,
+    executiveSummary:     str(src.executiveSummary, 'No summary provided.'),
+    actionableIssues:     arr(src.actionableIssues).map(i => ({
+      title:          str(i?.title,          'Untitled issue'),
+      severity:       str(i?.severity,       'medium'),
+      reason:         str(i?.reason,         ''),
+      recommendation: str(i?.recommendation, ''),
+    })),
+    likelyFalsePositives: arr(src.likelyFalsePositives).map(i => ({
+      title:  str(i?.title,  ''),
+      reason: str(i?.reason, ''),
+    })),
+    needsReview:          arr(src.needsReview).map(i => ({
+      title:         str(i?.title,         ''),
+      whatToVerify:  str(i?.whatToVerify,  ''),
+    })),
+    recommendedNextTests: arr(src.recommendedNextTests).map(i => str(i)).filter(Boolean),
+    testCases:            arr(src.testCases).map(i => ({
+      title:          str(i?.title,          'Untitled test case'),
+      objective:      str(i?.objective,      ''),
+      priority:       str(i?.priority,       'P2'),
+      type:           str(i?.type,           'functional'),
+      sourceFinding:  str(i?.sourceFinding,  ''),
+      dataNeeded:     str(i?.dataNeeded,     ''),
+      steps:          arr(i?.steps).map(s => str(s)).filter(Boolean),
+      expectedResult: str(i?.expectedResult, ''),
+    })),
+    bugReportDrafts:      arr(src.bugReportDrafts).map(i => ({
+      title:              str(i?.title,           ''),
+      severity:           str(i?.severity,        'medium'),
+      stepsToReproduce:   arr(i?.stepsToReproduce).map(s => str(s)).filter(Boolean),
+      expectedResult:     str(i?.expectedResult,  ''),
+      actualResult:       str(i?.actualResult,    ''),
+      evidenceSummary:    str(i?.evidenceSummary, ''),
+    })).filter(i => i.title || i.evidenceSummary),
+    managerSummary:   str(src.managerSummary,   ''),
+    developerSummary: str(src.developerSummary, ''),
+  };
 }
 
-function sendSse(res, event, data) {
-  res.write(`event: ${event}\n`);
-  res.write(`data: ${JSON.stringify(data)}\n\n`);
+/**
+ * Minimal fallback when the provider itself fails (network down, model missing, timeout).
+ * Does NOT try to fake AI analysis — tells the user what happened and what to do.
+ */
+function buildMinimalFallback(session, task, reason) {
+  const pageUrl     = session.pageUrl || 'the tested page';
+  const actionable  = (session.actionableFindings  || []).slice(0, 8);
+  const needsReview = (session.needsReviewFindings || []).slice(0, 5);
+  const counts      = session.counts || {};
+  const hasAction   = actionable.length > 0 || Number(counts.actionable || 0) > 0;
+
+  return {
+    qaHealth:         hasAction ? 'risky' : 'needs_review',
+    executiveSummary: `AI provider unavailable (${reason}). Showing raw session data for ${pageUrl}. ${hasAction ? `${actionable.length} actionable finding(s) require review.` : 'No confirmed actionable findings.'} Fix the provider connection to get AI analysis.`,
+    actionableIssues: actionable.map(i => ({
+      title:          i.title          || 'Finding',
+      severity:       i.severity       || 'medium',
+      reason:         i.evidenceSummary || i.description || '',
+      recommendation: i.recommendation || 'Reproduce and confirm manually.',
+    })),
+    likelyFalsePositives: [],
+    needsReview:          needsReview.map(i => ({
+      title:        i.title        || 'Observation',
+      whatToVerify: i.recommendation || 'Confirm manually.',
+    })),
+    recommendedNextTests: [
+      `Check that Ollama is reachable: curl ${CONFIG.ollamaBaseUrl}/api/tags`,
+      `Reload the page and repeat the user flow to capture fresh evidence.`,
+    ],
+    testCases:       [],
+    bugReportDrafts: [],
+    managerSummary:  `AI analysis unavailable. ${actionable.length} raw actionable finding(s) listed. Restore the provider connection for full analysis.`,
+    developerSummary: `Provider error during ${task}: ${reason}`,
+  };
 }
 
-function buildChatSystemPrompt() {
-  return [
-    'You are TestPilot AI Chat, an evidence-aware QA assistant inside a Chrome DevTools extension.',
-    'Answer using only the provided sanitized TestPilot context.',
-    'Answer the tester question directly first, then add evidence details.',
-    'Use a friendly QA lead tone. Be concise, practical, and specific.',
-    'When the tester asks how to improve score/health, explain the top fixes that would raise the score.',
-    'When the tester asks to generate bug reports, draft bug reports for actionable findings. Include title, severity, impact, steps to reproduce, expected result, actual result, and evidence. Do not answer with score-improvement advice.',
-    'When the tester asks for a Jira ticket, use this exact plain-text format: Title, Severity, Priority, Environment, Affected URL, Steps to Reproduce, Expected Result, Actual Result, Evidence, User Impact, Developer Notes, QA Notes.',
-    'Use attached pageContext.selectedText, pageContext.attachments, and relatedFindings when present. Clearly label missing evidence instead of inventing it.',
-    'When evidence is missing, say exactly which TestPilot action to run next, such as Start Session, reload, or Scan UI.',
-    'Separate actionable bugs, needs-review observations, background activity, framework/internal noise, ignored findings, and passed checks.',
-    'Do not invent issues. If evidence is missing, say what the tester should do next.',
-    'Do not overstate severity. Prioritize user impact and linked user actions.',
-    'Prefer plain text for chat. If you return JSON, return exactly one object shaped like {"answer":""}. Never return multiple JSON objects.'
-  ].join('\n');
-}
+// ── Utility helpers ───────────────────────────────────────────────────────────
 
-function classifyChatScope(question) {
-  const value = String(question || '').toLowerCase();
-  if (!value.trim()) return 'qa';
-  if (/(qa|test|testing|bug|issue|api|console|ui|ux|error|exception|debug|frontend|backend|report|regression|health|score|finding|request|response|network|chrome|extension|javascript|typescript|react|next|vue|angular|css|html|performance|security|accessibility|jira|ticket|reproduce|expected|actual)/i.test(value)) {
-    return 'software_testing';
-  }
-  return 'irrelevant';
-}
-
-function sanitizeChatHistory(history) {
-  if (!Array.isArray(history)) return [];
-  return history.slice(-8).map((item) => ({
-    role: item && item.role === 'assistant' ? 'assistant' : 'user',
-    content: redactText(String(item && (item.content || item.text) || ''), 1600)
-  })).filter((item) => item.content);
-}
-
-function buildUsedContextList(context) {
-  const used = [];
-  if (context.pageUrl) used.push('page');
-  if (context.health) used.push('health');
-  if (context.counts) used.push('finding counts');
-  if (context.actionableFindings && context.actionableFindings.length) used.push('actionable findings');
-  if (context.needsReviewFindings && context.needsReviewFindings.length) used.push('needs-review findings');
-  if (context.networkSummary) used.push('network summary');
-  if (context.consoleSummary) used.push('console summary');
-  if (context.uiScanSummary) used.push('UI scan summary');
-  if (context.apiClassificationSummary) used.push('API classifications');
-  if (context.pageContext && context.pageContext.attachments && context.pageContext.attachments.length) used.push('attached page context');
-  return used;
-}
-
-function suggestChatActions(question, context) {
-  const value = String(question || '').toLowerCase();
-  if (value.includes('jira') || value.includes('ticket')) return ['Copy Jira ticket', 'Add response to report', 'Regenerate with more technical detail'];
-  if (value.includes('bug report')) return ['Add useful draft to report', 'Download bug report JSON'];
-  if (value.includes('ui')) return ['Run UI Scan', 'Review UI Bugs tab'];
-  if (value.includes('api')) return ['Open Findings', 'Filter API issues'];
-  if (!context || !context.uiScanSummary || !context.uiScanSummary.scans) return ['Run UI Scan', 'Ask what to test next'];
-  return ['Copy response', 'Add response to report'];
-}
-
-function normalizeChatAnswer(value, fallback) {
-  if (typeof value === 'string') {
-    const text = cleanChatAnswerText(value);
-    return { answer: (text || fallback).slice(0, 5000), usedFallback: !text };
-  }
-  if (value && typeof value === 'object') {
-    const text = cleanChatAnswerText(value.answer || value.message || value.response || value.summary || '');
-    return { answer: (text || fallback).slice(0, 5000), usedFallback: !text };
-  }
-  return { answer: fallback, usedFallback: true };
-}
-
-function cleanChatAnswerText(value) {
-  const raw = String(value || '').trim();
-  if (!raw) return '';
-  const withoutFence = raw
-    .replace(/^```(?:json|text)?\s*/i, '')
-    .replace(/```$/i, '')
+/**
+ * Cleans up answers where the model wrapped its response in {"answer":"..."}
+ * even though we asked for plain text in chat mode.
+ */
+function unwrapJsonAnswer(text) {
+  const t = String(text || '').trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/i, '')
     .trim();
-
-  const whole = parseAnswerObject(withoutFence);
-  if (whole) return whole;
-
-  const fragments = extractAnswerObjectFragments(withoutFence);
-  if (fragments.length) return fragments.join('\n\n');
-
-  return withoutFence
-    .replace(/^\{\s*"answer"\s*:\s*"/, '')
-    .replace(/"\s*\}\s*$/, '')
-    .trim();
-}
-
-function parseAnswerObject(value) {
   try {
-    const parsed = JSON.parse(value);
+    const parsed = JSON.parse(t);
     if (parsed && typeof parsed === 'object') {
-      const answer = parsed.answer || parsed.message || parsed.response || parsed.summary;
-      if (answer) return String(answer).trim();
+      const inner = parsed.answer || parsed.message || parsed.response || parsed.content;
+      if (inner && typeof inner === 'string') return inner.trim();
     }
-  } catch {
-    // Not a single JSON answer object.
-  }
-  return '';
+  } catch { /* not JSON, return as-is */ }
+  return t;
 }
 
-function extractAnswerObjectFragments(value) {
-  const answers = [];
-  const matches = String(value || '').match(/\{[\s\S]*?\}/g) || [];
-  for (const match of matches) {
-    const answer = parseAnswerObject(match);
-    if (answer) answers.push(answer);
-  }
-  return answers;
-}
-
-function isChatAnswerAligned(question, answer) {
-  const lowerQuestion = String(question || '').toLowerCase();
-  const lowerAnswer = String(answer || '').toLowerCase();
-  if (lowerQuestion.includes('bug report') || lowerQuestion.includes('jira') || lowerQuestion.includes('ticket')) {
-    const looksLikeBugReport = /(title|severity|steps|expected|actual|evidence|impact)/i.test(answer);
-    const looksLikeWrongScoreAdvice = /improve (the )?(score|qa score)|focus on fixing/i.test(lowerAnswer);
-    return looksLikeBugReport && !looksLikeWrongScoreAdvice;
-  }
-  return true;
-}
-
-function buildFallbackChatAnswer(question, context, reason) {
-  const counts = context.counts || {};
-  const health = context.health || {};
-  const lower = String(question || '').toLowerCase();
-  const basedOn = context.contextUsed || `Based on: ${(context.userActions || []).length} user actions, ${context.networkSummary?.businessApis || 0} API calls, ${context.uiScanSummary?.scans || 0} UI scans, ${context.consoleSummary?.errors || 0} console errors.`;
-  const actionable = context.actionableFindings || [];
-  const review = context.needsReviewFindings || [];
-  const background = context.backgroundAndIgnoredSummary || {};
-  const noiseCount = Number(counts.frameworkNoise || 0) + Number(counts.backgroundActivity || 0) + Number(counts.likelyFalsePositive || 0) + Number(counts.ignored || 0);
-  const fallbackNote = reason ? `\n\nLocal fallback note: ${reason}` : '';
-  const asksScore = lower.includes('score') || lower.includes('scrore') || lower.includes('health') || lower.includes('rating');
-  const asksImprove = lower.includes('improve') || lower.includes('increase') || lower.includes('better') || lower.includes('fix');
-
-  if (lower.includes('jira') || lower.includes('ticket')) {
-    return `${basedOn}\n\n${buildFallbackJiraTicket(context)}${fallbackNote}`;
-  }
-  if (lower.includes('bug report')) {
-    return `${basedOn}\n\n${actionable.length ? actionable.slice(0, 5).map((item, index) => `Bug Report ${index + 1}: ${item.title}\nSeverity: ${item.severity || 'needs review'}\nImpact: ${item.userImpact || 'A tested user flow may be affected.'}\nSteps to reproduce:\n1. Open the page captured in this TestPilot session.\n2. Start TestPilot, reload the page, and repeat the tested user flow.\n3. Observe the finding evidence for this issue.\nExpected result: The flow completes without this defect.\nActual result: ${item.userImpact || item.title}\nEvidence: ${item.evidenceSummary || item.recommendation || item.title}`).join('\n\n') : 'No confirmed actionable bugs are available for bug report drafts yet.'}${fallbackNote}`;
-  }
-  if (lower.includes('test') || lower.includes('checklist')) {
-    return `${basedOn}\n\nSuggested next tests:\n- Repeat the user flow after starting TestPilot and reloading the page.\n- Verify actionable findings first.\n- Validate needs-review UI and console findings manually.\n- Re-run UI scan after fixes.\n${fallbackNote}`;
-  }
-  if (lower.includes('ignore') || lower.includes('noise')) {
-    return `${basedOn}\n\nIgnored/noise summary: ${noiseCount} item(s). Framework/internal, background, likely false positive, analytics, and polling requests are not treated as real bugs unless user impact is confirmed.${fallbackNote}`;
-  }
-  if (asksScore) {
-    const topActionable = actionable.slice(0, 3).map((item, index) => `${index + 1}. Fix ${item.title}: ${item.userImpact || item.recommendation || 'This is counted as user-impacting evidence.'}`).join('\n');
-    const topReview = review.slice(0, 2).map((item, index) => `- Confirm or dismiss needs-review: ${item.title}`).join('\n');
-    if (asksImprove) {
-      return `${basedOn}\n\nTo improve the QA score, reduce the user-impacting findings first.\n\nCurrent health: ${health.label || 'Unknown'} (${health.score ?? 'N/A'}/100)\nActionable: ${counts.actionable || 0}\nNeeds review: ${counts.needsReview || 0}\n\nPriority fixes:\n${topActionable || '1. No actionable bug details are available yet. Review Findings and run the tested user flow again.'}\n${topReview ? `\nReview cleanup:\n${topReview}` : ''}\n\nAfter fixes, reload the page, repeat the same flow, run UI Scan if needed, then check whether actionable and needs-review counts drop.${fallbackNote}`;
-    }
-    return `${basedOn}\n\nHealth is ${health.label || 'Unknown'} (${health.score ?? 'N/A'}/100). It is reduced mainly by ${counts.actionable || 0} actionable finding(s) and ${counts.needsReview || 0} needs-review finding(s). Background/noise is tracked separately and does not meaningfully reduce the score.${fallbackNote}`;
-  }
-  if (lower.includes('ui') || lower.includes('visual')) {
-    return `${basedOn}\n\n${context.uiScanSummary?.scans ? 'Review UI findings in the UI Bugs tab, then confirm visible layout, clickable target, image, and link issues manually.' : 'No UI scan evidence is captured yet. Open the page state you want to check, go to UI Bugs, and run Scan UI.'}${fallbackNote}`;
-  }
-  if (lower.includes('real bug') || lower.includes('actionable')) {
-    return `${basedOn}\n\n${actionable.length ? actionable.map((item, index) => `${index + 1}. ${item.title} - ${item.userImpact}`).join('\n') : 'No confirmed actionable bugs are captured. Review manual observations before filing.'}${fallbackNote}`;
-  }
-  return `${basedOn}\n\nSession summary: ${counts.actionable || 0} actionable, ${counts.needsReview || 0} needs review, ${noiseCount} background/noise. ${review.length ? 'Manual-review findings need tester confirmation before filing.' : 'No manual-review finding is currently highlighted.'}${fallbackNote}`;
-}
-
-function buildFallbackJiraTicket(context) {
-  const pageContext = context.pageContext || {};
-  const attachments = Array.isArray(pageContext.attachments) ? pageContext.attachments : [];
-  const selectedText = pageContext.selectedText || (attachments.find((item) => item.type === 'selected-text') || {}).text || '';
-  const findings = Array.isArray(context.relatedFindings) && context.relatedFindings.length
-    ? context.relatedFindings
-    : [...(context.actionableFindings || []), ...(context.needsReviewFindings || [])];
-  const primary = findings[0] || {};
-  const environment = [
-    context.frameworkGuess && context.frameworkGuess !== 'Unknown' ? context.frameworkGuess : '',
-    context.environment?.viewport ? `Viewport ${context.environment.viewport.width || 0}x${context.environment.viewport.height || 0}` : '',
-    context.environment?.userAgentSummary || ''
-  ].filter(Boolean).join(' | ') || 'Captured TestPilot environment';
-  const title = primary.title || (selectedText ? `Page message conflicts with captured QA evidence` : 'TestPilot QA issue requires review');
-  const evidence = [
-    selectedText ? `Selected page text: "${selectedText.slice(0, 500)}"` : '',
-    primary.evidenceSummary ? `Finding evidence: ${primary.evidenceSummary}` : '',
-    primary.title ? `Primary finding: ${primary.title}` : '',
-    attachments.filter((item) => item.type !== 'selected-text').slice(0, 3).map((item) => `${item.label || item.type}: ${(item.text || item.title || '').slice(0, 300)}`).join('\n')
-  ].filter(Boolean).join('\n');
-
-  return [
-    `Title: ${title}`,
-    `Severity: ${primary.severity || 'Needs review'}`,
-    `Priority: ${primary.severity === 'critical' || primary.severity === 'high' ? 'P1' : 'P2'}`,
-    `Environment: ${environment}`,
-    `Affected URL: ${pageContext.page?.url || context.pageUrl || 'Not captured'}`,
-    'Steps to Reproduce:',
-    '1. Open the affected URL.',
-    '2. Start TestPilot, reload the page, and repeat the tested user flow.',
-    selectedText ? '3. Observe the selected page text or UI message attached to this ticket.' : '3. Observe the TestPilot finding evidence.',
-    'Expected Result:',
-    selectedText ? 'The page copy and backend/console behavior should describe the same successful or failed state.' : 'The tested flow completes without the captured TestPilot issue.',
-    'Actual Result:',
-    primary.userImpact || primary.description || selectedText || 'TestPilot captured evidence that needs QA review.',
-    'Evidence:',
-    evidence || 'No detailed evidence was captured yet. Attach selected page text or run the user flow again.',
-    'User Impact:',
-    primary.userImpact || 'Potential user impact requires confirmation by the tester.',
-    'Developer Notes:',
-    primary.recommendation || 'Review the linked API, console, and UI evidence before changing behavior.',
-    'QA Notes:',
-    'Confirm reproducibility, attach screenshots manually if needed, and re-run TestPilot after the fix.'
-  ].join('\n');
-}
-
-function buildProviderUnavailableChatAnswer(reason) {
-  return [
-    'AI provider error',
-    '',
-    reason,
-    '',
-    'TestPilot can still capture findings and export reports. For local testing, keep `AI_PROVIDER=ollama` and make sure Ollama is running with the selected model.'
-  ].join('\n');
-}
-
-function formatProviderError(error) {
-  const message = String(error && error.message ? error.message : error || 'Local Ollama request failed.');
-  if (/429|quota|rate limit|exceeded/i.test(message)) {
-    return 'Local Ollama reported a capacity or rate-limit error.';
-  }
-  if (/401|403|api key|permission|unauthorized|forbidden/i.test(message)) {
-    return 'Local Ollama rejected the request permissions.';
-  }
-  if (/404|not found|not supported/i.test(message)) {
-    return 'The configured Ollama model is unavailable. Pull the model or change OLLAMA_MODEL.';
-  }
-  return message.slice(0, 500);
-}
-
-function isProviderCapacityError(message) {
-  return /rate limited|quota|out of quota/i.test(String(message || ''));
-}
-
-function withTimeout(promise, timeoutMs) {
-  return Promise.race([
-    promise,
-    new Promise((_, reject) => {
-      setTimeout(() => reject(new Error(`Model timed out after ${timeoutMs}ms`)), timeoutMs);
-    })
-  ]);
-}
-
-function mergeAnalysisWithFallback(analysis, fallback, meta = {}) {
-  const merged = normalizeAiAnalysis({
-    ...fallback,
-    ...analysis,
-    actionableIssues: analysis.actionableIssues && analysis.actionableIssues.length ? analysis.actionableIssues : fallback.actionableIssues,
-    likelyFalsePositives: analysis.likelyFalsePositives && analysis.likelyFalsePositives.length ? analysis.likelyFalsePositives : fallback.likelyFalsePositives,
-    needsReview: analysis.needsReview && analysis.needsReview.length ? analysis.needsReview : fallback.needsReview,
-    recommendedNextTests: analysis.recommendedNextTests && analysis.recommendedNextTests.length ? analysis.recommendedNextTests : fallback.recommendedNextTests,
-    testCases: analysis.testCases && analysis.testCases.length ? analysis.testCases : fallback.testCases,
-    bugReportDrafts: analysis.bugReportDrafts && analysis.bugReportDrafts.length ? analysis.bugReportDrafts : fallback.bugReportDrafts
-  });
-  if (meta.usedFallback) {
-    merged.developerSummary = `${merged.developerSummary} Fallback note: ${meta.fallbackReason}`.slice(0, 1600);
-  }
-  return merged;
-}
-
-async function getProviderHealth() {
+function parseJsonSafely(text) {
+  const t = String(text || '').trim()
+    .replace(/^```(?:json)?\s*/i, '')
+    .replace(/```\s*$/i, '')
+    .trim();
   try {
-    return await provider.health();
-  } catch (error) {
-    return {
-      ok: false,
-      provider: CONFIG.provider,
-      model: CONFIG.ollamaModel,
-      error: error.message || 'AI provider is not reachable.'
-    };
+    return JSON.parse(t);
+  } catch {
+    // Try extracting the first {...} block
+    const match = t.match(/\{[\s\S]*\}/);
+    if (match) {
+      try { return JSON.parse(match[0]); } catch { /* fall through */ }
+    }
+    throw new Error(`Model returned non-JSON: ${t.slice(0, 200)}`);
   }
 }
 
-function buildSystemPrompt(task) {
-  const focus = {
-    'analyze-session': 'Analyze the TestPilot QA session, separate real issues from likely false positives, and recommend practical next tests.',
-    'generate-test-cases': 'Generate concrete QA test cases. Each test case must have a title, objective, priority, type, source finding, data needed, step-by-step actions, and one expected result. Prefer evidence-driven tests over generic advice.',
-    'generate-bug-report': 'Generate concise bug report drafts only for confirmed or high-confidence issues. If evidence is uncertain, put it in needsReview instead of inventing a bug.'
-  }[task] || 'Analyze the TestPilot QA session.';
-
-  return [
-    'You are TestPilot AI, a careful QA assistant embedded in a Chrome DevTools extension.',
-    focus,
-    'Use only the sanitized session summary. Do not invent issues.',
-    'Do not overstate severity. Prioritize confirmed user impact.',
-    'Clearly identify framework/internal noise and likely false positives.',
-    'Mark uncertain UI or console findings as manual review.',
-    'For test cases, write tester-executable steps, not strategy paragraphs.',
-    'For bug reports, include steps to reproduce, expected result, actual result, and evidence summary.',
-    'Keep output concise and useful for QA testers, frontend developers, and managers.',
-    'Return strict JSON only with this shape:',
-    '{"qaHealth":"excellent|good|needs_review|risky|broken","executiveSummary":"","actionableIssues":[{"title":"","severity":"","reason":"","recommendation":""}],"likelyFalsePositives":[{"title":"","reason":""}],"needsReview":[{"title":"","whatToVerify":""}],"recommendedNextTests":[""],"testCases":[{"title":"","objective":"","priority":"P0|P1|P2|P3","type":"functional|regression|accessibility|visual|performance|negative","sourceFinding":"","dataNeeded":"","steps":[""],"expectedResult":""}],"bugReportDrafts":[{"title":"","severity":"","stepsToReproduce":[""],"expectedResult":"","actualResult":"","evidenceSummary":""}],"managerSummary":"","developerSummary":""}'
-  ].join('\n');
+function providerErrorMessage(err) {
+  const msg = String(err?.message || err || 'Unknown error');
+  if (/ECONNREFUSED|ENOTFOUND|fetch failed/i.test(msg)) {
+    return `Ollama is not running. Start it with: ollama serve\nThen make sure the model is pulled: ollama pull ${CONFIG.ollamaModel}`;
+  }
+  if (/404|not found/i.test(msg)) {
+    return `Model "${CONFIG.ollamaModel}" is not installed. Run: ollama pull ${CONFIG.ollamaModel}`;
+  }
+  if (/timed out/i.test(msg)) {
+    return `Ollama timed out after ${CONFIG.chatTimeoutMs / 1000}s. Try a smaller model or increase AI_CHAT_TIMEOUT_MS.`;
+  }
+  // TODO: OpenAI — add error handling here when the provider is wired up:
+  // if (/401|Incorrect API key/i.test(msg)) return 'Invalid OpenAI API key.';
+  // if (/429|rate limit/i.test(msg))        return 'OpenAI rate limit hit.';
+  // if (/insufficient_quota/i.test(msg))    return 'OpenAI quota exhausted.';
+  return `AI provider error: ${msg.slice(0, 300)}`;
 }
 
-function sanitizeIncomingSession(session) {
-  const safe = redactSensitiveValue(JSON.parse(JSON.stringify(session || {})));
-  delete safe.rawHeaders;
-  delete safe.requestHeaders;
-  delete safe.responseHeaders;
-  delete safe.requestBody;
-  delete safe.responseBody;
-  delete safe.cookies;
-  delete safe.authorization;
+function sanitizeSession(session) {
+  const safe = deepRedact(JSON.parse(JSON.stringify(session || {})));
+  // Strip raw headers/bodies — too large and contain secrets
+  for (const key of ['rawHeaders','requestHeaders','responseHeaders','requestBody','responseBody','cookies']) {
+    delete safe[key];
+  }
   return safe;
 }
 
-function redactText(text, maxLength = 5000) {
-  return String(text || '')
-    .replace(/(authorization|cookie|token|password|secret|api[_-]?key|apikey|access[_-]?token|refresh[_-]?token)=([^&\s]+)/gi, '$1=[REDACTED]')
-    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/gi, 'Bearer [REDACTED]')
-    .slice(0, maxLength);
+function sanitizeHistory(history) {
+  if (!Array.isArray(history)) return [];
+  return history
+    .slice(-10) // keep last 10 turns max
+    .map(item => ({
+      role:    item?.role === 'assistant' ? 'assistant' : 'user',
+      content: String(item?.content || item?.text || '').slice(0, 2000),
+    }))
+    .filter(item => item.content);
 }
 
-function redactSensitiveValue(value, depth = 0) {
+function listUsedContext(context) {
+  const used = [];
+  if (context.pageUrl)                                      used.push('page URL');
+  if (context.health)                                       used.push('health score');
+  if (context.actionableFindings?.length)                   used.push('actionable findings');
+  if (context.needsReviewFindings?.length)                  used.push('needs-review findings');
+  if (context.networkSummary?.businessApis)                 used.push('network summary');
+  if (context.consoleSummary?.errors)                       used.push('console summary');
+  if (context.uiScanSummary?.scans)                         used.push('UI scan summary');
+  if (context.pageContext?.attachments?.length)             used.push('page attachments');
+  return used;
+}
+
+function deepRedact(value, depth = 0) {
   if (value === null || value === undefined) return value;
   if (typeof value === 'string') return redactText(value);
   if (typeof value === 'number' || typeof value === 'boolean') return value;
-  if (depth > 6) return '[Object]';
-  if (Array.isArray(value)) return value.slice(0, 80).map((item) => redactSensitiveValue(item, depth + 1));
+  if (depth > 6) return '[object]';
+  if (Array.isArray(value)) return value.slice(0, 80).map(v => deepRedact(v, depth + 1));
   if (typeof value === 'object') {
-    const output = {};
-    for (const [key, item] of Object.entries(value).slice(0, 80)) {
-      if (/authorization|cookie|token|password|secret|api[_-]?key|apikey/i.test(key)) {
-        output[key] = '[REDACTED]';
-      } else {
-        output[key] = redactSensitiveValue(item, depth + 1);
-      }
+    const out = {};
+    for (const [k, v] of Object.entries(value).slice(0, 80)) {
+      out[k] = /authorization|cookie|token|password|secret|api[_-]?key/i.test(k)
+        ? '[REDACTED]'
+        : deepRedact(v, depth + 1);
     }
-    return output;
+    return out;
   }
   return String(value);
 }
 
-function buildFallbackAnalysis(session, task) {
-  const actionable = Array.isArray(session.actionableFindings) ? session.actionableFindings : [];
-  const needsReview = Array.isArray(session.needsReviewFindings) ? session.needsReviewFindings : [];
-  const findings = [...actionable, ...needsReview].slice(0, 10);
-  const counts = session.counts || {};
-  const pageUrl = session.pageUrl || 'the tested page';
-  const hasActionable = actionable.length > 0 || Number(counts.actionable || 0) > 0;
-  const hasReview = needsReview.length > 0 || Number(counts.needsReview || 0) > 0;
-  const qaHealth = hasActionable ? 'risky' : (hasReview ? 'needs_review' : 'good');
-
-  const recommendedNextTests = buildRecommendedTests(session, findings);
-  const testCases = buildFallbackTestCases(session, findings, recommendedNextTests);
-  const bugReportDrafts = buildFallbackBugDrafts(session, actionable, needsReview);
-
-  return {
-    qaHealth,
-    executiveSummary: [
-      `TestPilot reviewed the sanitized session for ${pageUrl}.`,
-      hasActionable ? `${actionable.length} actionable finding(s) should be prioritized.` : 'No confirmed actionable defects were present in the sanitized summary.',
-      hasReview ? `${needsReview.length} observation(s) need manual confirmation.` : ''
-    ].filter(Boolean).join(' '),
-    actionableIssues: actionable.slice(0, 8).map((issue) => ({
-      title: issue.title || 'Actionable TestPilot finding',
-      severity: issue.severity || 'medium',
-      reason: issue.evidenceSummary || issue.description || 'TestPilot captured actionable evidence.',
-      recommendation: issue.recommendation || 'Reproduce the flow and fix the confirmed behavior.'
-    })),
-    likelyFalsePositives: buildLikelyFalsePositives(session),
-    needsReview: needsReview.slice(0, 8).map((issue) => ({
-      title: issue.title || 'TestPilot observation needs review',
-      whatToVerify: issue.recommendation || issue.evidenceSummary || 'Confirm whether this is visible and user-impacting before filing.'
-    })),
-    recommendedNextTests,
-    testCases,
-    bugReportDrafts,
-    managerSummary: hasActionable
-      ? 'TestPilot found evidence that should be reviewed before release. Prioritize confirmed actionable issues, then validate manual-review observations.'
-      : 'TestPilot did not find confirmed actionable defects in the sanitized session. Complete the generated follow-up tests for confidence.',
-    developerSummary: `Generated ${testCases.length} test case(s) and ${bugReportDrafts.length} bug draft(s) from sanitized local evidence${task ? ` for ${task}` : ''}.`
-  };
+function redactText(text) {
+  return String(text || '')
+    .replace(/(authorization|cookie|token|password|secret|api[_-]?key)=([^&\s"]+)/gi, '$1=[REDACTED]')
+    .replace(/Bearer\s+[A-Za-z0-9._~+/=-]{8,}/gi, 'Bearer [REDACTED]')
+    .slice(0, 8000);
 }
 
-function buildRecommendedTests(session, findings) {
-  const tests = [];
-  if (session.networkSummary && Number(session.networkSummary.businessApis || 0) > 0) {
-    tests.push('Repeat the main user flow and confirm all business API calls return expected 2xx/3xx responses without duplicate side effects.');
-  }
-  if (session.consoleSummary && (Number(session.consoleSummary.errors || 0) > 0 || Number(session.consoleSummary.warnings || 0) > 0)) {
-    tests.push('Repeat the flow with DevTools open and verify console errors or warnings do not appear during the user action.');
-  }
-  if (session.uiScanSummary && Number(session.uiScanSummary.scans || 0) > 0) {
-    tests.push('Re-run the visible viewport UI scan after fixing review items and confirm no layout, clipping, or target-size observations remain.');
-  } else {
-    tests.push('Run a visible viewport UI scan on the target screen after the page reaches the intended state.');
-  }
-  for (const finding of findings.slice(0, 4)) {
-    tests.push(`Verify "${finding.title || 'captured finding'}" manually and confirm whether the user-facing behavior is reproducible.`);
-  }
-  if (!tests.length) {
-    tests.push('Open the tested page, complete the core happy path, and confirm no API, console, or visible UI issues are captured.');
-  }
-  return Array.from(new Set(tests)).slice(0, 8);
-}
-
-function buildFallbackTestCases(session, findings, recommendedNextTests) {
-  const pageUrl = session.pageUrl || 'the tested page';
-  const sourceItems = findings.length ? findings : recommendedNextTests.map((item, index) => ({
-    title: `Follow-up QA check ${index + 1}`,
-    type: index === 0 ? 'api' : 'ui',
-    severity: 'medium',
-    category: 'needs-review',
-    evidenceSummary: item,
-    recommendation: item
-  }));
-
-  const cases = sourceItems.slice(0, 8).map((finding, index) => {
-    const type = normalizeTestType(finding.type, finding.title);
-    const priority = priorityFromSeverity(finding.severity, finding.category);
-    return {
-      title: `${priority} ${type} check: ${finding.title || `QA follow-up ${index + 1}`}`,
-      objective: finding.description || finding.evidenceSummary || finding.recommendation || 'Verify the captured TestPilot observation.',
-      priority,
-      type,
-      sourceFinding: finding.title || 'TestPilot session',
-      dataNeeded: 'Use a normal QA account and any existing test data required for this page.',
-      steps: [
-        `Open ${pageUrl}.`,
-        'Start TestPilot, reload the page, and perform the exact user flow under test.',
-        finding.recommendation || finding.evidenceSummary || 'Observe the behavior related to the captured finding.',
-        'Confirm whether network, console, and visible UI evidence matches the expected result.'
-      ],
-      expectedResult: expectedForFinding(finding)
-    };
-  });
-
-  return cases.length ? cases : [{
-    title: 'P2 smoke test: page loads cleanly',
-    objective: 'Confirm the captured page can complete the core user flow without new TestPilot findings.',
-    priority: 'P2',
-    type: 'regression',
-    sourceFinding: 'No specific finding',
-    dataNeeded: 'Standard QA test data.',
-    steps: [
-      `Open ${pageUrl}.`,
-      'Start TestPilot and reload the page.',
-      'Complete the primary user flow for this page.',
-      'Review TestPilot Findings, AI Analysis, and Reports.'
-    ],
-    expectedResult: 'No confirmed actionable API, console, or UI defects are captured.'
-  }];
-}
-
-function buildFallbackBugDrafts(session, actionable, needsReview) {
-  const pageUrl = session.pageUrl || 'the tested page';
-  const candidates = actionable.length ? actionable : needsReview.slice(0, 3);
-  return candidates.slice(0, 8).map((finding) => ({
-    title: finding.title || 'TestPilot captured issue',
-    severity: finding.severity || (finding.category === 'needs-review' ? 'needs review' : 'medium'),
-    stepsToReproduce: [
-      `Open ${pageUrl}.`,
-      'Start TestPilot and reload the page.',
-      'Repeat the tested user flow that produced this evidence.',
-      'Review the matching TestPilot finding and confirm the behavior.'
-    ],
-    expectedResult: expectedForFinding(finding),
-    actualResult: finding.description || finding.evidenceSummary || 'TestPilot captured evidence that differs from the expected behavior.',
-    evidenceSummary: finding.evidenceSummary || finding.recommendation || 'Sanitized TestPilot finding evidence.'
-  }));
-}
-
-function buildLikelyFalsePositives(session) {
-  const items = [];
-  const framework = session.frameworkNoiseSummary || {};
-  if (Number(framework.count || 0) > 0) {
-    items.push({
-      title: 'Framework/internal route prefetch traffic',
-      reason: 'Speculative framework requests were observed without confirmed user-facing failure.'
-    });
-  }
-  return items;
-}
-
-function normalizeTestType(type, title) {
-  const source = `${type || ''} ${title || ''}`.toLowerCase();
-  if (source.includes('ui') || source.includes('visual') || source.includes('layout')) return 'visual';
-  if (source.includes('console')) return 'regression';
-  if (source.includes('api') || source.includes('network')) return 'functional';
-  if (source.includes('slow') || source.includes('performance')) return 'performance';
-  return 'regression';
-}
-
-function priorityFromSeverity(severity, category) {
-  if (severity === 'critical') return 'P0';
-  if (severity === 'high') return 'P1';
-  if (severity === 'medium' || category === 'actionable') return 'P2';
-  return 'P3';
-}
-
-function expectedForFinding(finding) {
-  if (finding.type === 'api') return 'The relevant API calls complete with expected status, timing, and no duplicate side effects.';
-  if (finding.type === 'console') return 'The flow completes without meaningful console errors, runtime errors, or unhandled promise rejections.';
-  if (finding.type === 'ui') return 'The visible UI remains readable, aligned, accessible, and usable in the tested viewport.';
-  return finding.recommendation || 'The tested flow behaves correctly without confirmed user-facing defects.';
-}
-
-function normalizeAiAnalysis(value) {
-  const source = value && typeof value === 'object' ? value : {};
-  const text = (input, fallback = '') => {
-    const value = String(input ?? '').trim();
-    return (value || String(fallback || '')).slice(0, 1600);
-  };
-  const array = (items) => Array.isArray(items) ? items.slice(0, 12) : [];
-  const qaHealth = ['excellent', 'good', 'needs_review', 'risky', 'broken'].includes(source.qaHealth)
-    ? source.qaHealth
-    : 'needs_review';
-  const recommendedNextTests = array(source.recommendedNextTests).map((item) => text(item)).filter(Boolean);
-  const testCases = array(source.testCases).map((item) => ({
-    title: text(item?.title, 'Untitled test case'),
-    objective: text(item?.objective, 'Verify the behavior described by TestPilot evidence.'),
-    priority: text(item?.priority, 'P2'),
-    type: text(item?.type, 'functional'),
-    sourceFinding: text(item?.sourceFinding, 'TestPilot session'),
-    dataNeeded: text(item?.dataNeeded, 'Standard QA account or existing test data.'),
-    steps: array(item?.steps).map((step) => text(step)).filter(Boolean),
-    expectedResult: text(item?.expectedResult, 'The flow completes without confirmed API, console, or UI defects.')
-  }));
-  const actionableIssues = array(source.actionableIssues).map((item) => ({
-    title: text(item?.title),
-    severity: text(item?.severity),
-    reason: text(item?.reason),
-    recommendation: text(item?.recommendation)
-  }));
-  const bugReportDrafts = array(source.bugReportDrafts).map((item) => ({
-    title: text(item?.title),
-    severity: text(item?.severity),
-    stepsToReproduce: array(item?.stepsToReproduce).map((step) => text(step)).filter(Boolean),
-    expectedResult: text(item?.expectedResult),
-    actualResult: text(item?.actualResult),
-    evidenceSummary: text(item?.evidenceSummary)
-  })).filter((item) => item.title || item.evidenceSummary);
-  const fallbackBugDrafts = actionableIssues.map((item) => ({
-    title: item.title || 'TestPilot actionable issue',
-    severity: item.severity || 'needs review',
-    stepsToReproduce: [
-      'Open the page captured in the TestPilot session.',
-      'Start TestPilot, reload the page, and repeat the tested user flow.',
-      'Observe the evidence described in the TestPilot finding.'
-    ],
-    expectedResult: item.recommendation || 'The tested flow completes without user-facing defects.',
-    actualResult: item.reason || 'TestPilot captured evidence that requires developer review.',
-    evidenceSummary: item.reason || 'Actionable TestPilot finding.'
-  }));
-  const fallbackTestCases = recommendedNextTests.map((item, index) => ({
-    title: `Follow-up QA check ${index + 1}`,
-    objective: item,
-    priority: 'P2',
-    type: 'regression',
-    sourceFinding: 'AI recommended next test',
-    dataNeeded: 'Standard QA test data.',
-    steps: [
-      'Open the page or flow captured in the TestPilot session.',
-      item,
-      'Observe network, console, and visible UI behavior while completing the flow.'
-    ],
-    expectedResult: 'The flow completes without confirmed TestPilot defects or user-facing regressions.'
-  }));
-
-  return {
-    qaHealth,
-    executiveSummary: text(source.executiveSummary, 'AI reviewed the sanitized TestPilot session.'),
-    actionableIssues,
-    likelyFalsePositives: array(source.likelyFalsePositives).map((item) => ({
-      title: text(item?.title),
-      reason: text(item?.reason)
-    })),
-    needsReview: array(source.needsReview).map((item) => ({
-      title: text(item?.title),
-      whatToVerify: text(item?.whatToVerify)
-    })),
-    recommendedNextTests,
-    testCases: testCases.length ? testCases : fallbackTestCases,
-    bugReportDrafts: bugReportDrafts.length ? bugReportDrafts : fallbackBugDrafts,
-    managerSummary: text(source.managerSummary, 'No manager summary was provided by the model.'),
-    developerSummary: text(source.developerSummary, 'No developer summary was provided by the model.')
-  };
-}
-
-function parseJsonFromModel(content) {
-  try {
-    return JSON.parse(content);
-  } catch {
-    const match = String(content).match(/\{[\s\S]*\}/);
-    if (!match) throw new Error('Model did not return JSON.');
-    return JSON.parse(match[0]);
-  }
-}
-
-function parseOptionalJsonFromModel(content) {
-  const text = String(content || '').trim();
-  if (!text) return '';
-  try {
-    return JSON.parse(text);
-  } catch {
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) {
-      try {
-        return JSON.parse(match[0]);
-      } catch {
-        // Plain text chat answers are valid for this endpoint.
-      }
-    }
-    return text;
-  }
+function withTimeout(promise, ms) {
+  return Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error(`Request timed out after ${ms}ms`)), ms)
+    ),
+  ]);
 }
 
 function readJson(req) {
   return new Promise((resolve, reject) => {
     let data = '';
-    req.on('data', (chunk) => {
+    req.on('data', chunk => {
       data += chunk;
-      if (data.length > 1_000_000) {
-        req.destroy();
-        reject(new Error('Request body too large.'));
-      }
+      if (data.length > 1_000_000) { req.destroy(); reject(new Error('Request body too large.')); }
     });
-    req.on('end', () => {
-      try {
-        resolve(data ? JSON.parse(data) : {});
-      } catch {
-        reject(new Error('Invalid JSON body.'));
-      }
-    });
+    req.on('end',   () => { try { resolve(data ? JSON.parse(data) : {}); } catch { reject(new Error('Invalid JSON.')); } });
     req.on('error', reject);
   });
 }
 
 function setCors(res) {
-  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Origin',  '*');
   res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
 function sendJson(res, status, payload) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
 }
+
+function sendSseHeaders(res) {
+  res.writeHead(200, {
+    'Content-Type':                'text/event-stream; charset=utf-8',
+    'Cache-Control':               'no-cache, no-transform',
+    'Connection':                  'keep-alive',
+    'Access-Control-Allow-Origin': '*',
+    'Access-Control-Allow-Headers':'Content-Type, Authorization',
+  });
+}
+
+function sendSse(res, event, data) {
+  res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+}
+
+function pathname(url) {
+  return (String(url || '').split('?')[0].replace(/\/+$/, '') || '/');
+}
+
+function log(msg) {
+  console.log(`[${new Date().toISOString()}] ${msg}`);
+}
+
+// ── Start ─────────────────────────────────────────────────────────────────────
+server.listen(CONFIG.port, () => {
+  console.log(`\nTestPilot AI backend running on http://localhost:${CONFIG.port}`);
+  console.log(`Provider : ${provider.name}`);
+  console.log(`Model    : ${CONFIG.ollamaModel}`);
+  console.log(`Health   : http://localhost:${CONFIG.port}/api/health\n`);
+});
+
+server.on('error', err => {
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${CONFIG.port} is already in use. Try: PORT=8788 npm start`);
+  } else {
+    console.error('Server failed to start:', err.message);
+  }
+  process.exit(1);
+});

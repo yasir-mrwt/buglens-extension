@@ -110,14 +110,64 @@
               <button type="button" data-shortcut-tab="bug-reports">Bug Reports</button>
               <button type="button" data-shortcut-tab="reports">Reports</button>
             </nav>
+            <div class="topbar-status-strip" aria-live="polite">
+              <span class="topbar-status-chip">
+                <strong>AI</strong>
+                <span id="headerAiStatus">Checking</span>
+              </span>
+              <span class="topbar-status-chip">
+                <strong>Agent</strong>
+                <span id="headerAgentState">Idle</span>
+              </span>
+              <span class="topbar-status-chip">
+                <strong>Mode</strong>
+                <span id="headerContextMode">Fast</span>
+              </span>
+            </div>
           </div>
           <div class="actions" aria-label="Session actions">
             <button id="startBtn" class="primary">Start</button>
             <button id="stopBtn" disabled>Stop</button>
+            <button id="stopAgentBtn" type="button" disabled>Stop Agent</button>
+            <button id="debugDrawerBtn" type="button">Debug</button>
             <button id="clearBtn" class="danger-quiet">Clear</button>
             <button id="quickExportBtn">Export</button>
           </div>
         </header>
+
+        <aside id="debugDrawer" class="debug-drawer" aria-label="TestPilot debug drawer" aria-hidden="true">
+          <div class="debug-drawer-panel">
+            <header>
+              <div>
+                <span class="eyebrow">Runtime debug</span>
+                <h2>Agent trace</h2>
+              </div>
+              <button id="debugDrawerCloseBtn" type="button" aria-label="Close debug drawer">×</button>
+            </header>
+            <div class="debug-grid">
+              <article><span>sessionId</span><strong id="debugSessionId">not captured</strong></article>
+              <article><span>promptId</span><strong id="debugPromptId">not captured</strong></article>
+              <article><span>taskId</span><strong id="debugTaskId">not captured</strong></article>
+              <article><span>planHash</span><strong id="debugPlanHash">not captured</strong></article>
+              <article><span>state</span><strong id="debugAgentState">idle</strong></article>
+              <article><span>provider</span><strong id="debugProviderStatus">not checked</strong></article>
+              <article><span>context mode</span><strong id="debugContextMode">fast</strong></article>
+              <article><span>tokens</span><strong id="debugTokenUsage">not captured</strong></article>
+            </div>
+            <section>
+              <h3>Retrieved evidence IDs</h3>
+              <pre id="debugEvidenceIds">[]</pre>
+            </section>
+            <section>
+              <h3>Plan JSON preview</h3>
+              <pre id="debugPlanJson">{}</pre>
+            </section>
+            <section>
+              <h3>Action trace</h3>
+              <pre id="debugActionTrace">No agent actions yet.</pre>
+            </section>
+          </div>
+        </aside>
 
         <div id="toastRegion" class="toast-region" role="status" aria-live="polite" aria-atomic="true"></div>
 
@@ -345,7 +395,7 @@
                   <option>All Types</option>
                   <option>Functional</option>
                   <option>Negative</option>
-                  <option>Edge Cases</option>
+                  <option>Edge</option>
                   <option>Regression</option>
                   <option>Smoke</option>
                 </select>
@@ -362,6 +412,7 @@
                 <button id="generateTestCasesTabBtn" class="primary" type="button">Generate</button>
                 <button id="copyTestCasesBtn" type="button">Copy</button>
                 <button id="exportTestCasesMarkdownBtn" type="button">Export Markdown</button>
+                <button id="exportTestCasesJsonBtn" type="button">Export JSON</button>
                 <button id="clearTestCasesBtn" type="button">Clear</button>
               </div>
             </article>

@@ -354,6 +354,48 @@ Expected:
 - The menu scrolls inside itself if its own content is taller than the viewport.
 - The tab content behind the open menu does not scroll.
 
+## 9C. Agent Deterministic Foundation Examples
+
+Run each command on a staging page with matching controls.
+
+Commands and expected behavior:
+
+- `only change the first input`
+  Expected: Agent resolves target `first input`, changes exactly one visible input/textarea, does not submit.
+
+- `try signup`
+  Expected: Agent resolves target `signup link`, highlights/clicks the signup link or button if visible and same-site safe.
+
+- `try continuing with google`
+  Expected: Agent resolves target `google button` and asks confirmation because OAuth/social login is not auto-run.
+
+- `why is login button broken`
+  Expected: Agent uses answer/inspect mode, observes evidence, and does not click/type unless the tester asks for action.
+
+- `try with symbols in name`
+  Expected: Agent resolves a name/first text field when visible, types symbol data into that field, and does not use a generic stale form plan.
+
+Expected debug/evidence fields:
+
+- Agent live output includes state changes such as classifying, snapshotting, planning, executing, observing, evaluating, completed, blocked, or awaiting confirmation.
+- Final Agent result includes `promptId`, `taskId`, and `planHash`.
+- New prompt produces a new planHash.
+- Page change produces a new planHash.
+- New data strategy produces a new planHash.
+- Old pending approval is cancelled when a new Agent prompt is sent.
+
+Pass:
+
+- Prompt-specific commands do not reuse stale/default plans.
+- Missing target is reported as not captured/no action, not silently replaced by a generic form flow.
+
+Fail:
+
+- `only change the first input` modifies multiple fields.
+- `try signup` fills a form instead of targeting signup.
+- `try continuing with google` clicks OAuth without confirmation.
+- A one-time approval continues a previous prompt after a new prompt was sent.
+
 ## 10. Agent Mode: Search / Filter
 
 Test command:
@@ -605,6 +647,7 @@ node --check content/content-script.js
 node --check background/service-worker.js
 node --check ai-backend/server.js
 node tests/agent-live-workflow-smoke.js
+node tests/agent-production-hardening-smoke.js
 node tests/ai-provider-settings-smoke.js
 node tests/responsive-ui-smoke.js
 node tests/network-analyzer-smoke.js
@@ -655,3 +698,128 @@ Each Agent response should include:
 - `Recommended Next Steps`
 
 Reject the run if a prompt above falls back to the old generic form plan for an unrelated task.
+
+## 20. Phase 2 Agent RAG / Execution Validation
+
+Use a normal test page with at least one form, one link/button, and one visible validation message path.
+
+Setup:
+
+1. Start `ai-backend` only if you want chat/model responses; the Agent validation below is deterministic and should still run without cloud keys.
+2. Load the extension unpacked.
+3. Open the target page, open DevTools, open `TestPilot`.
+4. Start a session and reload the inspected page.
+5. Open `AI QA Agent`, switch to `Agent`.
+
+Run these prompts one at a time:
+
+| Prompt | Expected validation |
+| --- | --- |
+| `only change the first input` | Plan cites retrieved `DOM-*` evidence, changes only the first input, and final output says `passed` only if the field diff proves only that target changed. |
+| `try signup` | Plan targets a captured signup `DOM-*` link/button. If route/modal/message changes are captured, result can pass; otherwise it must be `needs_review`, not generic success. |
+| `try continuing with google` | Agent pauses for permission before OAuth/social login and resumes only the same `planHash` / step fingerprint after approval. |
+| `why is login button broken` | Agent stays in answer/observe mode and does not click or type. Unsupported claims must say `not captured`. |
+| `try with symbols in name` | Agent uses symbol test data only on the resolved field and records the input in the final result. |
+
+Every Agent final answer must include these labels:
+
+- `Status`
+- `Task`
+- `User Requirement`
+- `What I Did`
+- `Evidence`
+- `Result`
+- `Needs Review`
+- `Next Step`
+
+Pass:
+
+- `Agent is working` live messages show `Retrieved grounded evidence before planning`.
+- Safe plan rows include target `DOM-*` evidence IDs.
+- Final output cites `DOM-*`, `ACT-*`, `OBS-*`, `CON-*`, `API-*`, or says `not captured`.
+- A click is not marked passed just because the click handler ran; there must be route, modal, visible message, list/table, field, API, or console evidence.
+- Starting a new Agent prompt cancels stale pending approval.
+
+Fail:
+
+- Final answer gives broad health-score advice instead of evidence for the prompt.
+- Agent reuses an old generic form plan after a new prompt.
+- A serious submit/continue/OAuth action runs without approval.
+- Output claims an API failure, console error, or page state without an evidence ID or `not captured`.
+
+## 21. Phase 3 Production Hardening Validation
+
+Use the local harness when you need a repeatable MVP check:
+
+```text
+tests/fixtures/testpilot-harness.html
+```
+
+Open it directly in Chrome, then open DevTools > TestPilot.
+
+Required flow:
+
+1. Start a session.
+2. Reload the harness page.
+3. Confirm the top header shows compact `AI`, `Agent`, and `Mode` chips.
+4. Open `Debug`.
+5. Switch chat to `Agent`.
+6. Run `only change the first input`.
+7. Confirm the debug drawer shows:
+   - `sessionId`
+   - `promptId`
+   - `taskId`
+   - `planHash`
+   - current state
+   - retrieved evidence IDs
+   - plan JSON preview
+   - action trace
+   - provider status
+   - context mode
+8. Run `try continuing with google`.
+9. Confirm the Agent pauses for permission and `Stop Agent` cancels without stopping the session.
+10. Run `test login with fake data`.
+11. Confirm the final Agent output cites `DOM-*`, `ACT-*`, `OBS-*`, or says `not captured`.
+12. Trigger `API failure` and `Console error` buttons on the harness page.
+13. Open `Findings`, `Console`, and `Reports` to verify sanitized evidence.
+
+Test Cases tab:
+
+1. Open `Test Cases`.
+2. Select each filter: `All Types`, `Functional`, `Negative`, `Edge`, `Regression`, `Smoke`.
+3. Click `Generate`.
+4. Confirm loader appears while generating.
+5. Confirm generated cases reference session evidence or latest Agent result.
+6. Click `Copy`, `Export Markdown`, and `Export JSON`.
+
+Bug Reports tab:
+
+1. Open `Bug Reports`.
+2. Click `Generate`.
+3. Confirm each draft has title, severity, steps, expected, actual, evidence, and evidence IDs.
+4. If evidence IDs are missing, confirm the needs-review warning appears.
+5. Click `Copy`, `Export Markdown`, and `Export JSON`.
+
+Provider / privacy checks:
+
+1. Stop `ai-backend`.
+2. Send a normal Chat message.
+3. Expected: TestPilot shows a provider unavailable error, not a fake AI answer.
+4. Start `ai-backend` again.
+5. Click Check AI or wait for auto-check.
+6. Confirm API keys remain masked in Settings and exports do not contain cookies, auth headers, tokens, passwords, or raw secrets.
+
+Pass:
+
+- Main chat stays chat-only; generated test cases and bug reports appear only in their tabs.
+- Agent run state shows `idle`, `running`, `waiting`, `blocked`, or `failed`.
+- Debug drawer is useful without exposing secrets.
+- Stop Agent cancels the Agent run but keeps the QA session alive.
+- Exports are redacted and include the latest Agent result when present.
+
+Fail:
+
+- Test cases or bug reports are dumped into the main chat.
+- Debug drawer shows raw passwords, tokens, cookies, auth headers, or API keys.
+- Provider-offline chat invents a model answer.
+- Agent repeats a stale generic form plan for the regression prompts.
