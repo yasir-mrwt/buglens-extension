@@ -802,7 +802,7 @@ function PanelShell() {
               ] }),
               /* @__PURE__ */ jsxRuntimeExports.jsxs("label", { className: "wide-field", children: [
                 "Allowed color tokens",
-                /* @__PURE__ */ jsxRuntimeExports.jsx("textarea", { id: "allowedColors", placeholder: "#000000\n    #ffffff\n    #2563eb", defaultValue: "" }),
+                /* @__PURE__ */ jsxRuntimeExports.jsx("textarea", { id: "allowedColors", placeholder: "#000000\r\n    #ffffff\r\n    #2563eb", defaultValue: "" }),
                 /* @__PURE__ */ jsxRuntimeExports.jsx("small", { children: "Optional. Enter one CSS color per line." })
               ] })
             ] })

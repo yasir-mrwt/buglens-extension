@@ -3474,9 +3474,15 @@ function getSelectedTestCaseFormat() {
   return String(((_a = els.testCaseFormatSelect) == null ? void 0 : _a.value) || "Step-by-step").trim();
 }
 function filterTestCasesForSelectedType(testCases) {
-  const selected = getSelectedTestCaseType().toLowerCase();
-  if (!selected || selected === "all types") return testCases;
-  return testCases.filter((testCase) => String(testCase.type || "").toLowerCase().includes(selected.replace(/\s+/g, " ")));
+  const selected = String(getSelectedTestCaseType() || "All Types").trim().toLowerCase();
+  const items = Array.isArray(testCases) ? testCases : [];
+  if (!selected || selected === "all types") return items;
+  const normalized = selected.replace(/\s+/g, " ");
+  return items.filter((testCase) => {
+    const type = String((testCase == null ? void 0 : testCase.type) || "").trim().toLowerCase();
+    if (normalized === "edge") return type.includes("edge");
+    return type.includes(normalized);
+  });
 }
 function readTestCasePreferences() {
   return {

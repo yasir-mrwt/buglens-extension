@@ -1244,6 +1244,7 @@ async function startSession() {
   state.settings = readSettingsFromForm();
   await persistSettingsSnapshot();
   await setContentSession(state.sessionId);
+  await sendTabMessage({ type: 'TESTPILOT_START_OBSERVATION' });
   await persistSession();
   render();
   showToast('Session started. Reload the inspected page for complete capture.', 'success');
@@ -1255,6 +1256,7 @@ function stopSession() {
   state.endedAt = Date.now();
   state.lastUpdatedAt = state.endedAt;
   state.timeline.push({ type: 'session-stopped', timestamp: state.endedAt, pageUrl: state.pageUrl });
+  void sendTabMessage({ type: 'TESTPILOT_STOP_OBSERVATION' });
   void setContentSession(null);
   schedulePersist();
   render();
@@ -1310,6 +1312,7 @@ async function clearSession() {
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = new Map();
   recentEvidenceEvents = [];
+  await sendTabMessage({ type: 'TESTPILOT_STOP_OBSERVATION' });
   await setContentSession(null);
   await removeStoredSessionSnapshot();
   render();

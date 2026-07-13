@@ -1,4 +1,6 @@
 // @ts-nocheck
+import { buildXPathSelector, createInputBatcher } from '../shared/observation';
+
 (() => {
   const PAGE_CONSOLE_SOURCE = 'testpilot-page-console-listener';
   const MAX_ISSUES_PER_RULE_DEFAULT = 25;
@@ -22,6 +24,167 @@
     generic: 'test'
   };
   let activeSessionId = null;
+  let observationEnabled = false;
+  let observationLayer = null;
+
+  function applyObservationState() {
+    if (!observationLayer) return;
+    const shouldObserve = observationEnabled && Boolean(activeSessionId);
+    if (shouldObserve) {
+      observationLayer.start();
+    } else {
+      observationLayer.stop();
+    }
+  }
+
+  const inputBatcher = createInputBatcher(300, (target) => {
+    if (!target) return;
+    const element = target;
+    emitObservation('user-action', {
+      type: 'input',
+      label: getShortText(element) || getElementLabel(element),
+      selector: buildXPathSelector(element) || getSelector(element),
+      url: location.href,
+      timestamp: Date.now(),
+      inputType: element.type || element.tagName.toLowerCase(),
+      name: element.name || null,
+      valueLength: element.value !== undefined && element.value !== null ? String(element.value).length : 0
+    });
+  });
+
+  class ObservationLayer {
+    constructor(onObservation) {
+      this.onObservation = typeof onObservation === 'function' ? onObservation : () => {};
+      this.observer = null;
+      this.started = false;
+      this.boundHandlers = null;
+    }
+
+    start() {
+      if (this.started || !document || !window) return;
+      this.started = true;
+      this.boundHandlers = {
+        click: (event) => this.handleClick(event),
+        submit: (event) => this.handleSubmit(event),
+        input: (event) => this.handleInput(event),
+        change: (event) => this.handleChange(event)
+      };
+
+      document.addEventListener('click', this.boundHandlers.click, true);
+      document.addEventListener('submit', this.boundHandlers.submit, true);
+      document.addEventListener('input', this.boundHandlers.input, true);
+      document.addEventListener('change', this.boundHandlers.change, true);
+
+      const observerTarget = document.documentElement || document.body || document;
+      if (observerTarget) {
+        this.observer = new MutationObserver((records) => this.handleMutations(records));
+        this.observer.observe(observerTarget, {
+          subtree: true,
+          childList: true,
+          attributes: true
+        });
+      }
+    }
+
+    stop() {
+      if (!this.started) return;
+      this.started = false;
+
+      if (this.boundHandlers) {
+        document.removeEventListener('click', this.boundHandlers.click, true);
+        document.removeEventListener('submit', this.boundHandlers.submit, true);
+        document.removeEventListener('input', this.boundHandlers.input, true);
+        document.removeEventListener('change', this.boundHandlers.change, true);
+      }
+
+      if (this.observer) {
+        this.observer.disconnect();
+        this.observer = null;
+      }
+    }
+
+    handleClick(event) {
+      const target = event.target && event.target.closest
+        ? event.target.closest('button, a, input, select, textarea, [role="button"], [onclick]')
+        : event.target;
+      if (!target) return;
+      const actionType = target.tagName && target.tagName.toLowerCase() === 'a' ? 'click-link' : 'click';
+      this.emitUserAction(actionType, target, {
+        href: target.getAttribute ? target.getAttribute('href') : null,
+        download: target.hasAttribute && target.hasAttribute('download')
+      });
+    }
+
+    handleSubmit(event) {
+      this.emitUserAction('submit', event.target, {
+        method: event.target && event.target.method,
+        action: event.target && event.target.action
+      });
+    }
+
+    handleInput(event) {
+      const target = event.target;
+      if (!target || !target.matches || !target.matches('input, textarea, [contenteditable="true"]')) return;
+      inputBatcher.schedule(target);
+    }
+
+    handleChange(event) {
+      const target = event.target;
+      if (!target || !target.matches || !target.matches('input, select, textarea')) return;
+      this.emitUserAction(target.type === 'file' ? 'file-upload' : 'input-change', target, {
+        inputType: target.type || target.tagName.toLowerCase(),
+        name: target.name || null
+      });
+    }
+
+    handleMutations(records) {
+      if (!records || !records.length) return;
+      const mutationSummary = records.slice(0, 10).map((record) => this.describeMutation(record));
+      this.emitObservation('dom-mutation', {
+        timestamp: Date.now(),
+        url: location.href,
+        recordCount: records.length,
+        mutations: mutationSummary
+      });
+    }
+
+    describeMutation(record) {
+      const target = record.target;
+      const descriptor = {
+        type: record.type,
+        tagName: target && target.tagName ? target.tagName.toLowerCase() : null,
+        attributeName: record.attributeName || null,
+        addedCount: record.addedNodes ? record.addedNodes.length : 0,
+        removedCount: record.removedNodes ? record.removedNodes.length : 0,
+        textLength: record.type === 'characterData' && record.target && record.target.textContent !== undefined
+          ? String(record.target.textContent).length
+          : 0
+      };
+      return descriptor;
+    }
+
+    emitUserAction(type, element, extra = {}) {
+      if (!element) return;
+      this.emitObservation('user-action', {
+        type,
+        label: getShortText(element) || getElementLabel(element),
+        selector: buildXPathSelector(element) || getSelector(element),
+        url: location.href,
+        timestamp: Date.now(),
+        ...sanitizeActionExtra(extra)
+      });
+    }
+
+    emitObservation(kind, payload) {
+      this.onObservation({ kind, payload });
+    }
+  }
+
+  observationLayer = new ObservationLayer((entry) => {
+    if (!activeSessionId || !observationEnabled) return;
+    sendToExtension(entry.kind === 'dom-mutation' ? 'dom-mutation' : 'user-action', entry.payload);
+  });
+  applyObservationState();
 
   function sendToExtension(kind, payload) {
     try {
@@ -45,34 +208,6 @@
     sendToExtension('console', event.data.payload);
   }, false);
 
-  document.addEventListener('click', (event) => {
-    const target = event.target && event.target.closest
-      ? event.target.closest('button, a, input, select, textarea, [role="button"], [onclick]')
-      : event.target;
-    if (!target) return;
-    const actionType = target.tagName && target.tagName.toLowerCase() === 'a' ? 'click-link' : 'click';
-    sendUserAction(actionType, target, {
-      href: target.getAttribute ? target.getAttribute('href') : null,
-      download: target.hasAttribute && target.hasAttribute('download')
-    });
-  }, true);
-
-  document.addEventListener('submit', (event) => {
-    sendUserAction('submit', event.target, {
-      method: event.target && event.target.method,
-      action: event.target && event.target.action
-    });
-  }, true);
-
-  document.addEventListener('change', (event) => {
-    const target = event.target;
-    if (!target || !target.matches || !target.matches('input, select, textarea')) return;
-    sendUserAction(target.type === 'file' ? 'file-upload' : 'input-change', target, {
-      inputType: target.type || target.tagName.toLowerCase(),
-      name: target.name || null
-    });
-  }, true);
-
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     if (!message || typeof message !== 'object') return false;
 
@@ -94,7 +229,22 @@
 
     if (message.type === 'TESTPILOT_SET_SESSION') {
       activeSessionId = typeof message.sessionId === 'string' ? message.sessionId : null;
+      applyObservationState();
       sendResponse({ ok: true, sessionId: activeSessionId });
+      return true;
+    }
+
+    if (message.type === 'TESTPILOT_START_OBSERVATION') {
+      observationEnabled = true;
+      applyObservationState();
+      sendResponse({ ok: true, enabled: observationEnabled, sessionId: activeSessionId });
+      return true;
+    }
+
+    if (message.type === 'TESTPILOT_STOP_OBSERVATION') {
+      observationEnabled = false;
+      applyObservationState();
+      sendResponse({ ok: true, enabled: observationEnabled, sessionId: activeSessionId });
       return true;
     }
 
@@ -1992,18 +2142,6 @@
       durationMs: Math.round(performance.now() - startedAt),
       issues
     };
-  }
-
-  function sendUserAction(type, element, extra = {}) {
-    if (!activeSessionId || !element) return;
-    sendToExtension('user-action', {
-      type,
-      label: getShortText(element) || getElementLabel(element),
-      selector: getSelector(element),
-      url: location.href,
-      timestamp: Date.now(),
-      ...sanitizeActionExtra(extra)
-    });
   }
 
   function sanitizeActionExtra(extra) {

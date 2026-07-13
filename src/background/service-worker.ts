@@ -128,15 +128,30 @@ chrome.runtime.onMessage.addListener((message: RuntimeMessage, sender, sendRespo
       chrome.storage.session.get(storageKey, (stored) => {
         const session = stored[storageKey] as StoredSessionSnapshot | undefined;
         const sessionId = session && session.active ? session.sessionId : contentMessage.sessionId;
-        relayToPanels(tabId, {
-          type: TESTPILOT_CONTENT_EVENT,
-          tabId,
-          payload: {
-            ...contentMessage,
-            sessionId
-          }
+        const enrichedMessage = {
+          ...contentMessage,
+          sessionId
+        };
+
+        const nextSessionSnapshot = {
+          ...(session || {}),
+          active: Boolean(session?.active || sessionId),
+          sessionId,
+          lastObservedAt: Date.now(),
+          lastEventKind: contentMessage.kind || 'unknown',
+          lastEventPayload: contentMessage.payload || null
+        } as StoredSessionSnapshot;
+
+        chrome.storage.session.set({
+          [storageKey]: nextSessionSnapshot
+        }, () => {
+          relayToPanels(tabId, {
+            type: TESTPILOT_CONTENT_EVENT,
+            tabId,
+            payload: enrichedMessage
+          });
+          sendResponse({ ok: true });
         });
-        sendResponse({ ok: true });
       });
       return true;
     }
