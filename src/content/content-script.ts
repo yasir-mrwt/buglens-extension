@@ -1,5 +1,6 @@
 // @ts-nocheck
 import { buildXPathSelector, createInputBatcher } from '../shared/observation';
+import { classifyNetworkUrl } from '../shared/networkClassifier';
 
 (() => {
   const PAGE_CONSOLE_SOURCE = 'testpilot-page-console-listener';
@@ -204,8 +205,21 @@ import { buildXPathSelector, createInputBatcher } from '../shared/observation';
 
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
-    if (!event.data || event.data.source !== PAGE_CONSOLE_SOURCE) return;
-    sendToExtension('console', event.data.payload);
+    const data = event.data;
+    if (!data || typeof data !== 'object') return;
+
+    if (data.source === PAGE_CONSOLE_SOURCE) {
+      sendToExtension('console', data.payload);
+      return;
+    }
+
+    if (data.source === 'testpilot-page-network-listener' && data.payload) {
+      const payload = {
+        ...data.payload,
+        category: classifyNetworkUrl(data.payload.input || data.payload.url, location.origin)
+      };
+      sendToExtension('network', payload);
+    }
   }, false);
 
   chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {

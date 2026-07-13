@@ -6,9 +6,10 @@ export function buildXPathSelector(element: Element | null | undefined) {
 
   while (current && current.nodeType === Node.ELEMENT_NODE) {
     let part = current.nodeName.toLowerCase();
-    const parent = current.parentElement;
-    if (parent) {
-      const siblings = Array.from(parent.children).filter((child) => child.nodeName === current.nodeName);
+    const parentElement: Element | null = current.parentElement;
+    if (parentElement) {
+      const currentNodeName = current.nodeName;
+      const siblings = Array.from(parentElement.children).filter((child: Element) => child.nodeName === currentNodeName);
       if (siblings.length > 1) {
         part += `[${siblings.indexOf(current) + 1}]`;
       }
@@ -21,7 +22,7 @@ export function buildXPathSelector(element: Element | null | undefined) {
     }
 
     parts.unshift(part);
-    current = parent;
+    current = parentElement;
   }
 
   return parts.length ? `//${parts.join('/')}` : '';
