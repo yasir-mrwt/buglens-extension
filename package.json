@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "dexie": "^3.2.4",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
@@ -21,6 +22,8 @@
     "@types/react": "^19.0.2",
     "@types/react-dom": "^19.0.2",
     "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.2.5",
+    "ts-node": "^10.9.2",
     "typescript": "^5.7.2",
     "vite": "^6.0.5"
   }
