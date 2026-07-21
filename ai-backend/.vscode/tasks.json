@@ -1,0 +1,15 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "ai-backend-test-integration",
+			"type": "shell",
+			"command": "npm.cmd",
+			"args": [
+				"run",
+				"test:integration"
+			],
+			"isBackground": false
+		}
+	]
+}

@@ -1,6 +1,9 @@
 // @ts-nocheck
-import { buildContextBuilderMessage, createContextBuilderMessageBus } from '../../shared/contextBuilder';
+import { ContextBuilder, buildContextBuilderMessage, createContextBuilderMessageBus } from '../../shared/contextBuilder';
+import { createDefaultRuleEngine } from '../../shared/ruleEngine';
 import { sanitizeCapturedMetadata } from '../../shared/redaction';
+import { classifyNetworkUrl } from '../../shared/networkClassifier';
+import { saveFinding } from '../../shared/db';
 
 const inspectedTabId = chrome.devtools.inspectedWindow.tabId;
 const port = chrome.runtime.connect({ name: 'testpilot-devtools' });
@@ -253,6 +256,11 @@ let forceNextAiChatScroll = false;
 const pendingAgentApprovals = new Map();
 const agentApprovalPreferences = new Map();
 const contextBuilderBus = createContextBuilderMessageBus();
+const ruleEngine = createDefaultRuleEngine({
+  pageUrl: state.pageUrl,
+  classifyNetworkUrl: (url, pageOrigin) => classifyNetworkUrl(url, pageOrigin),
+  document: typeof document !== 'undefined' ? document : null
+});
 
 const els = {
   startBtn: document.getElementById('startBtn'),
@@ -1653,6 +1661,16 @@ function processPageContextNetworkEvent(payload) {
     requestSource: 'page-context'
   };
 
+  emitRuleEngineFindings({
+    kind: 'network',
+    payload: {
+      method,
+      url,
+      status,
+      durationMs
+    }
+  });
+
   if (payload.kind === 'error' || status === 0) {
     state.networkStats.failed += 1;
     addIssue({
@@ -1838,6 +1856,16 @@ function processNetworkEntry(entry) {
     bodyStatus,
     requestBody: redactText(request.postData && request.postData.text ? request.postData.text : '')
   };
+
+  emitRuleEngineFindings({
+    kind: 'network',
+    payload: {
+      method,
+      url,
+      status,
+      durationMs
+    }
+  });
 
   recordRecentEvidenceEvent({
     type: 'api',
@@ -2147,6 +2175,22 @@ function handleContentEvent(message) {
   if (!state.active) return;
   if (!state.sessionId || message.sessionId !== state.sessionId) return;
 
+  if (message.kind === 'rule-finding') {
+    const finding = message.payload || {};
+    addIssue(mapRuleFindingToIssue(finding));
+    recordRecentEvidenceEvent({
+      type: finding.type || 'ui',
+      timestamp: finding.timestamp || Date.now(),
+      title: finding.title || 'Rule finding',
+      summary: finding.description || finding.title || 'Rule finding detected',
+      severity: finding.severity || 'medium',
+      url: finding.url || state.pageUrl,
+      evidence: finding.evidence || {}
+    });
+    render();
+    return;
+  }
+
   if (message.kind === 'network') {
     processPageContextNetworkEvent(message.payload);
     return;
@@ -2158,6 +2202,7 @@ function handleContentEvent(message) {
   state.lastUpdatedAt = Date.now();
   const issue = analyzeConsolePayload(payload);
   addIssue(issue);
+  emitRuleEngineFindings({ kind: 'console', payload });
   recordRecentEvidenceEvent({
     type: 'console',
     timestamp: payload.timestamp || Date.now(),
@@ -2168,6 +2213,31 @@ function handleContentEvent(message) {
     evidence: issue.evidence
   });
   render();
+}
+
+function emitRuleEngineFindings(observation) {
+  ruleEngine.context.pageUrl = state.pageUrl;
+  ruleEngine.context.document = typeof document !== 'undefined' ? document : null;
+  const findings = ruleEngine.evaluate(observation || {});
+  for (const finding of findings) {
+    addIssue(mapRuleFindingToIssue(finding));
+  }
+}
+
+function mapRuleFindingToIssue(finding) {
+  const type = finding.type || (finding.rule === 'console-errors' ? 'console' : 'ui');
+  const category = finding.category || (finding.severity === 'low' ? 'needs-review' : 'actionable');
+  return {
+    type,
+    category,
+    severity: finding.severity,
+    confidence: 'high',
+    title: finding.title,
+    description: finding.description || finding.title,
+    evidence: sanitizeCapturedMetadata(finding.evidence || {}),
+    url: finding.url || state.pageUrl,
+    timestamp: finding.timestamp
+  };
 }
 
 function analyzeConsolePayload(payload) {
@@ -2413,6 +2483,20 @@ function setScanButtonState(scanning) {
 }
 
 function publishFindingsToContextBuilder() {
+  const structuredEvidence = new ContextBuilder({
+    event: 'findings-updated',
+    sessionId: state.sessionId,
+    pageUrl: state.pageUrl,
+    domObservations: () => recentEvidenceEvents.filter((event) => ['dom-mutation', 'user-action'].includes(event.type)),
+    networkFindings: () => state.issues.filter((issue) => issue.type === 'api'),
+    consoleLogs: () => state.issues.filter((issue) => issue.type === 'console'),
+    ruleResults: () => state.issues.filter((issue) => issue.type === 'ui' || issue.category === 'framework-noise'),
+    metadata: {
+      networkStats: state.networkStats,
+      uiStats: state.uiStats,
+      lastUpdatedAt: state.lastUpdatedAt
+    }
+  }).build();
   const message = buildContextBuilderMessage({
     event: 'findings-updated',
     findings: state.issues.slice(-200),
@@ -2421,7 +2505,8 @@ function publishFindingsToContextBuilder() {
     extra: {
       networkStats: state.networkStats,
       uiStats: state.uiStats,
-      lastUpdatedAt: state.lastUpdatedAt
+      lastUpdatedAt: state.lastUpdatedAt,
+      structuredEvidence
     }
   });
   contextBuilderBus.publish(message);
@@ -2451,6 +2536,7 @@ function addIssue(issue) {
     state.lastUpdatedAt = Date.now();
     schedulePersist();
     publishFindingsToContextBuilder();
+    persistFindingToDexie(existing, { duplicateHit: true });
     return existing;
   }
 
@@ -2477,7 +2563,33 @@ function addIssue(issue) {
   state.lastUpdatedAt = Date.now();
   schedulePersist();
   publishFindingsToContextBuilder();
+  persistFindingToDexie(storedIssue);
   return storedIssue;
+}
+
+function persistFindingToDexie(issue, options = {}) {
+  if (!issue || !state.sessionId) return;
+  const title = String(issue.title || '').slice(0, 500);
+  const summary = String(issue.description || issue.title || '').slice(0, 1000);
+  const payload = sanitizeCapturedMetadata({
+    ...issue,
+    duplicateHit: Boolean(options.duplicateHit),
+    persistedAt: Date.now()
+  });
+  void saveFinding({
+    sessionId: state.sessionId,
+    kind: 'finding',
+    category: issue.category,
+    title,
+    summary,
+    url: issue.url || state.pageUrl || '',
+    timestamp: issue.timestamp || Date.now(),
+    payload,
+    createdAt: Date.now(),
+    updatedAt: Date.now()
+  }).catch((error) => {
+    console.warn('[TestPilot] Failed to persist finding in Dexie', error);
+  });
 }
 
 function normalizeIssue(issue) {
@@ -3185,7 +3297,9 @@ async function submitAiChat(value) {
       return;
     }
     const streamingMessage = createStreamingAssistantMessage();
+    const context = buildFreshChatContext();
     const providerResponse = await completeChatWithSelectedProvider(question, {
+      context,
       onToken(token) {
         streamingMessage.text += token;
         forceNextAiChatScroll = false;
@@ -3230,11 +3344,11 @@ function createStreamingAssistantMessage() {
 
 async function completeChatWithSelectedProvider(question, options = {}) {
   const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
+  const context = options.context || buildFreshChatContext();
   if (providerSettings.provider === 'local-backend') {
     if (typeof options.onToken === 'function' || typeof options.onReplace === 'function') {
-      return streamLocalBackendChat(question, options);
+      return streamLocalBackendChat(question, { ...options, context });
     }
-    const context = buildCompactAiSessionSummary('chat');
     const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/ai/chat`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -3281,7 +3395,7 @@ async function completeChatWithSelectedProvider(question, options = {}) {
 
 async function streamLocalBackendChat(question, options = {}) {
   const providerSettings = normalizeAiProviderSettings(state.settings.aiProvider);
-  const context = buildCompactAiSessionSummary('chat');
+  const context = options.context || buildFreshChatContext();
   const response = await fetchWithTimeout(`${getAiProviderBaseUrl(providerSettings)}/api/ai/chat-stream`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Accept: 'text/event-stream' },
@@ -4336,7 +4450,7 @@ function validateAiProviderSettings(settings) {
 }
 
 function buildProviderChatMessages(question) {
-  const context = buildCompactAiSessionSummary('chat');
+  const context = buildFreshChatContext();
   const history = (state.ai.chatMessages || [])
     .filter((message) => ['user', 'assistant'].includes(message.role) && message.text)
     .slice(-6)
@@ -4364,6 +4478,26 @@ function buildProviderChatMessages(question) {
       })
     }
   ];
+}
+
+function buildFreshChatContext() {
+  return {
+    ...buildCompactAiSessionSummary('chat'),
+    structuredEvidence: new ContextBuilder({
+      event: 'chat-context',
+      sessionId: state.sessionId,
+      pageUrl: state.pageUrl,
+      domObservations: () => recentEvidenceEvents.filter((event) => ['dom-mutation', 'user-action'].includes(event.type)),
+      networkFindings: () => state.issues.filter((issue) => issue.type === 'api'),
+      consoleLogs: () => state.issues.filter((issue) => issue.type === 'console'),
+      ruleResults: () => state.issues.filter((issue) => issue.type === 'ui' || issue.category === 'framework-noise'),
+      metadata: {
+        networkStats: state.networkStats,
+        uiStats: state.uiStats,
+        lastUpdatedAt: state.lastUpdatedAt
+      }
+    }).build()
+  };
 }
 
 function buildProviderTaskMessages(task) {

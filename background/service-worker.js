@@ -130,15 +130,28 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       chrome.storage.session.get(storageKey, (stored) => {
         const session = stored[storageKey];
         const sessionId = session && session.active ? session.sessionId : contentMessage.sessionId;
-        relayToPanels(tabId, {
-          type: TESTPILOT_CONTENT_EVENT,
-          tabId,
-          payload: {
-            ...contentMessage,
-            sessionId
-          }
+        const enrichedMessage = {
+          ...contentMessage,
+          sessionId
+        };
+        const nextSessionSnapshot = {
+          ...session || {},
+          active: Boolean((session == null ? void 0 : session.active) || sessionId),
+          sessionId,
+          lastObservedAt: Date.now(),
+          lastEventKind: contentMessage.kind || "unknown",
+          lastEventPayload: contentMessage.payload || null
+        };
+        chrome.storage.session.set({
+          [storageKey]: nextSessionSnapshot
+        }, () => {
+          relayToPanels(tabId, {
+            type: TESTPILOT_CONTENT_EVENT,
+            tabId,
+            payload: enrichedMessage
+          });
+          sendResponse({ ok: true });
         });
-        sendResponse({ ok: true });
       });
       return true;
     }

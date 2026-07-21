@@ -1,3 +1,6 @@
+import { SidebarToggle } from './SidebarToggle';
+import { PageContextBar } from './PageContextBar';
+
 export function PanelShell() {
   return (
     <div className="app-layout">
@@ -46,25 +49,10 @@ export function PanelShell() {
                 <span className="separator" aria-hidden="true" />
                 <span id="sessionDuration">00:00</span>
               </div>
-              <div className="current-url">
-                <span>Current page</span>
-                <strong id="currentUrl">Checking...</strong>
-              </div>
+              <PageContextBar />
               <p id="sessionHint">Start a session, then reload the page for complete network coverage.</p>
             </div>
-            <div className="qa-menu-bar">
-              <button id="menuToggleBtn" className="menu-toggle" aria-expanded="false" aria-controls="workspaceNav" type="button">
-                <svg className="menu-toggle-icon" viewBox="0 0 24 24" aria-hidden="true"><path d="M5 6h14M5 12h14M5 18h14" /></svg>
-                <span className="menu-toggle-label">Menu</span>
-              </button>
-              <nav id="workspaceNav" className="qa-menu" role="menu" aria-label="QA tool sections">
-                <div className="qa-menu-head">
-                  <div>
-                    <strong>TestPilot Menu</strong>
-                    <small>Open manual QA panels or run focused tools.</small>
-                  </div>
-                  <button id="menuCloseBtn" className="qa-menu-close" type="button" aria-label="Close menu">×</button>
-                </div>
+            <SidebarToggle>
                 <button role="menuitem" data-tab="ai">Main Chat</button>
                 <details className="qa-menu-group">
                   <summary>QA Tools</summary>
@@ -89,8 +77,7 @@ export function PanelShell() {
                 <button role="menuitem" data-tab="bug-reports">Bug Reports</button>
                 <button role="menuitem" data-tab="reports">Reports</button>
                 <button role="menuitem" data-tab="settings">Settings</button>
-              </nav>
-            </div>
+            </SidebarToggle>
             <nav className="top-workflow-tabs" aria-label="Quick sections">
               <button type="button" data-shortcut-tab="dashboard">Dashboard</button>
               <button type="button" data-shortcut-tab="findings">Findings</button>

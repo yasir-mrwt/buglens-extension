@@ -1,4 +1,4 @@
-exports.buildXPathSelector = function buildXPathSelector(element) {
+export function buildXPathSelector(element) {
   if (!element || element.nodeType !== 1) return '';
 
   const parts = [];
@@ -25,9 +25,9 @@ exports.buildXPathSelector = function buildXPathSelector(element) {
   }
 
   return parts.length ? `//${parts.join('/')}` : '';
-};
+}
 
-exports.createInputBatcher = function createInputBatcher(delayMs, emit) {
+export function createInputBatcher(delayMs, emit) {
   let timer = null;
   let latestTarget = null;
 
@@ -44,4 +44,4 @@ exports.createInputBatcher = function createInputBatcher(delayMs, emit) {
       }, delayMs);
     }
   };
-};
+}

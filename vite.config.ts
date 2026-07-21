@@ -1,4 +1,4 @@
-import { cp, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { cp, mkdir, readFile, readdir, writeFile } from 'node:fs/promises';
 import { dirname, resolve } from 'node:path';
 import react from '@vitejs/plugin-react';
 import { defineConfig, type Plugin } from 'vite';
@@ -43,27 +43,24 @@ function copyStaticExtensionFiles(): Plugin {
       );
       await writeFile(panelHtmlPath, updatedPanelHtml);
 
-      const generatedEntries = [
-        'background/service-worker.js',
-        'content/content-script.js',
-        'content/injected-console-listener.js',
-        'content/injected-network-listener.js',
-        'devtools/devtools.js',
-        'devtools/panel.js',
-        'popup/popup.js',
-        'assets/client.js',
-        'assets/devtools-panel.js',
-        'assets/messages.js'
-      ];
-
-      await Promise.all(generatedEntries.map(async (entry) => {
-        const source = resolve(outDir, entry);
-        const destination = resolve(__dirname, entry);
-        await mkdir(dirname(destination), { recursive: true });
-        await cp(source, destination, { force: true });
-      }));
+      await copyGeneratedJavaScriptFiles(outDir, __dirname);
     }
   };
+}
+
+async function copyGeneratedJavaScriptFiles(sourceDir: string, destinationDir: string): Promise<void> {
+  const entries = await readdir(sourceDir, { withFileTypes: true });
+  await Promise.all(entries.map(async (entry) => {
+    const source = resolve(sourceDir, entry.name);
+    const destination = resolve(destinationDir, entry.name);
+    if (entry.isDirectory()) {
+      await copyGeneratedJavaScriptFiles(source, destination);
+      return;
+    }
+    if (!entry.isFile() || !entry.name.endsWith('.js')) return;
+    await mkdir(dirname(destination), { recursive: true });
+    await cp(source, destination, { force: true });
+  }));
 }
 
 export default defineConfig({

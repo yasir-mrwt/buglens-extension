@@ -1,6 +1,10 @@
 // @ts-nocheck
-import http from 'node:http';
 import fs from 'node:fs';
+import express from 'express';
+import cors from 'cors';
+import pinoHttp from 'pino-http';
+import { pathToFileURL } from 'node:url';
+import { z } from 'zod';
 
 loadEnvFile();
 assertRuntime();
@@ -10,10 +14,13 @@ const CONFIG = {
   requestedProvider: (process.env.AI_PROVIDER || 'ollama').toLowerCase(),
   ollamaBaseUrl: process.env.OLLAMA_BASE_URL || 'http://localhost:11434',
   ollamaModel: process.env.OLLAMA_MODEL || 'llama3.2:3b',
+  corsOriginAllowlist: process.env.CORS_ORIGIN_ALLOWLIST || 'chrome-extension://*,http://localhost:3000,http://localhost:4173,http://localhost:5173',
   modelTimeoutMs: Number(process.env.AI_MODEL_TIMEOUT_MS || 240000),
   chatTimeoutMs: Number(process.env.AI_CHAT_TIMEOUT_MS || process.env.AI_MODEL_TIMEOUT_MS || 180000),
   port: Number(process.env.PORT || 8787)
 };
+
+const CORS_ALLOWLIST = parseOriginAllowlist(CONFIG.corsOriginAllowlist);
 
 function loadEnvFile() {
   try {
@@ -29,6 +36,33 @@ function loadEnvFile() {
   } catch {
     // .env is optional; defaults are development friendly.
   }
+}
+
+function parseOriginAllowlist(value) {
+  return String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isOriginAllowed(origin, allowlist) {
+  if (!origin) return true;
+  if (!allowlist.length) return false;
+  const normalizedOrigin = normalizeOrigin(origin);
+  return allowlist.some((entry) => {
+    if (entry === '*') return true;
+    const normalizedEntry = normalizeOrigin(entry);
+    if (!normalizedEntry) return false;
+    if (normalizedEntry.endsWith('*')) {
+      const prefix = normalizedEntry.slice(0, -1);
+      return normalizedOrigin.startsWith(prefix);
+    }
+    return normalizedOrigin === normalizedEntry;
+  });
+}
+
+function normalizeOrigin(value) {
+  return String(value || '').trim().replace(/\/+$/, '').toLowerCase();
 }
 
 class AIProvider {
@@ -179,6 +213,43 @@ class OpenAIProvider extends AIProvider {
 }
 
 const provider = createProvider();
+let server = null;
+let shutdownHooksRegistered = false;
+let isShuttingDown = false;
+
+const analyzeSessionBodySchema = z.object({
+  session: z.unknown().optional()
+}).passthrough();
+
+const generateBugReportBodySchema = z.object({
+  session: z.unknown().optional()
+}).passthrough();
+
+const generateTestCasesBodySchema = z.object({
+  session: z.unknown().optional()
+}).passthrough();
+
+const chatHistoryItemSchema = z.object({
+  role: z.enum(['user', 'assistant', 'system']).optional(),
+  content: z.string().max(4000).optional(),
+  text: z.string().max(4000).optional()
+}).passthrough();
+
+const chatBodySchema = z.object({
+  message: z.string().max(1000).optional(),
+  question: z.string().max(1000).optional(),
+  mode: z.enum(['chat', 'agent']).optional(),
+  context: z.record(z.unknown()).optional(),
+  history: z.array(chatHistoryItemSchema).max(20).optional()
+}).passthrough();
+
+const chatStreamBodySchema = z.object({
+  message: z.string().max(1000).optional(),
+  question: z.string().max(1000).optional(),
+  mode: z.enum(['chat', 'agent']).optional(),
+  context: z.record(z.unknown()).optional(),
+  history: z.array(chatHistoryItemSchema).max(20).optional()
+}).passthrough();
 
 function createProvider() {
   return new OllamaProvider({ baseUrl: CONFIG.ollamaBaseUrl, model: CONFIG.ollamaModel });
@@ -188,91 +259,179 @@ function getConfiguredModelName() {
   return CONFIG.ollamaModel;
 }
 
-const server = http.createServer(async (req, res) => {
-  setCors(res);
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204);
-    res.end();
-    return;
+export const app = express();
+
+function asyncRoute(handler) {
+  return (req, res, next) => {
+    Promise.resolve(handler(req, res, next)).catch(next);
+  };
+}
+
+app.use(pinoHttp({
+  autoLogging: {
+    ignore(req) {
+      return req.url === '/api/health';
+    }
+  },
+  customLogLevel(req, res, error) {
+    if (error || res.statusCode >= 500) return 'error';
+    if (res.statusCode >= 400) return 'warn';
+    return 'info';
+  },
+  customSuccessMessage(req, res) {
+    return `${req.method} ${req.url} -> ${res.statusCode}`;
+  },
+  customErrorMessage(req, res, error) {
+    return `${req.method} ${req.url} -> ${res.statusCode} (${error?.message || 'request error'})`;
   }
+}));
 
-  try {
-    if (req.method === 'GET' && isRootRoute(req.url)) {
-      sendJson(res, 200, {
-        ok: true,
-        service: 'testpilot-ai-backend',
-        message: 'TestPilot AI backend is running.',
-        backendUrl: `http://localhost:${CONFIG.port}`,
-        healthCheck: `http://localhost:${CONFIG.port}/api/health`,
-        provider: CONFIG.provider,
-        model: getConfiguredModelName()
-      });
+app.use(cors({
+  origin(origin, callback) {
+    if (isOriginAllowed(origin, CORS_ALLOWLIST)) {
+      callback(null, true);
       return;
     }
+    callback(new Error(`Origin not allowed by CORS policy: ${String(origin || '(none)')}`));
+  },
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
 
-    if (req.method === 'GET' && req.url === '/api/health') {
-      const health = await getProviderHealth();
-      sendJson(res, 200, {
-        ok: true,
-        service: 'testpilot-ai-backend',
-        provider: CONFIG.provider,
-        model: getConfiguredModelName(),
-        ai: health
-      });
-      return;
-    }
+app.use(express.json({ limit: '1mb' }));
 
-    if (req.method === 'POST' && req.url === '/api/ai/analyze-session') {
-      await handleAi(req, res, 'analyze-session');
-      return;
-    }
+app.get('/', asyncRoute(async (_req, res) => {
+  sendJson(res, 200, {
+    ok: true,
+    service: 'testpilot-ai-backend',
+    message: 'TestPilot AI backend is running.',
+    backendUrl: `http://localhost:${CONFIG.port}`,
+    healthCheck: `http://localhost:${CONFIG.port}/api/health`,
+    provider: CONFIG.provider,
+    model: getConfiguredModelName()
+  });
+}));
 
-    if (req.method === 'POST' && req.url === '/api/ai/generate-bug-report') {
-      await handleAi(req, res, 'generate-bug-report');
-      return;
-    }
+app.get('/api/health', asyncRoute(async (_req, res) => {
+  const health = await getProviderHealth();
+  sendJson(res, 200, {
+    ok: true,
+    service: 'testpilot-ai-backend',
+    provider: CONFIG.provider,
+    model: getConfiguredModelName(),
+    ai: health
+  });
+}));
 
-    if (req.method === 'POST' && req.url === '/api/ai/generate-test-cases') {
-      await handleAi(req, res, 'generate-test-cases');
-      return;
-    }
+app.post('/api/ai/analyze-session', validateBody(analyzeSessionBodySchema), asyncRoute(async (req, res) => {
+  await handleAi(req, res, 'analyze-session');
+}));
 
-    if (req.method === 'POST' && isChatRoute(req.url)) {
-      await handleChat(req, res);
-      return;
-    }
+app.post('/api/ai/generate-bug-report', validateBody(generateBugReportBodySchema), asyncRoute(async (req, res) => {
+  await handleAi(req, res, 'generate-bug-report');
+}));
 
-    if (req.method === 'POST' && isChatStreamRoute(req.url)) {
-      await handleChatStream(req, res);
-      return;
-    }
+app.post('/api/ai/generate-test-cases', validateBody(generateTestCasesBodySchema), asyncRoute(async (req, res) => {
+  await handleAi(req, res, 'generate-test-cases');
+}));
 
-    sendJson(res, 404, { ok: false, error: 'Not found' });
-  } catch (error) {
-    sendJson(res, 500, { ok: false, error: error.message || 'Internal server error' });
-  }
+app.post(['/api/ai/chat', '/api/chat'], validateBody(chatBodySchema), asyncRoute(async (req, res) => {
+  await handleChat(req, res);
+}));
+
+app.post(['/api/ai/chat-stream', '/api/chat-stream'], validateBody(chatStreamBodySchema), asyncRoute(async (req, res) => {
+  await handleChatStream(req, res);
+}));
+
+app.use((req, res) => {
+  sendJson(res, 404, { ok: false, error: `Not found: ${req.method} ${req.path}` });
 });
 
-server.listen(CONFIG.port, () => {
-  console.log('TestPilot AI backend is running.');
-  console.log(`Backend URL: http://localhost:${CONFIG.port}`);
-  console.log(`Health check: http://localhost:${CONFIG.port}/api/health`);
-  console.log(`Provider: ${CONFIG.provider}; model: ${getConfiguredModelName()}`);
-  console.log('Tip: open the Health check URL above. The root URL now returns a backend status JSON.');
-  if (CONFIG.requestedProvider !== CONFIG.provider) {
-    console.log(`Remote provider "${CONFIG.requestedProvider}" is disabled; TestPilot is using local Ollama only.`);
-  }
+app.use((error, req, res, _next) => {
+  if (res.headersSent) return;
+
+  const isCorsError = typeof error?.message === 'string' && error.message.includes('Origin not allowed by CORS policy');
+  const status = Number(error?.status || error?.statusCode) ||
+    (isCorsError ? 403 : 0) ||
+    (error?.type === 'entity.parse.failed' ? 400 : 500);
+  const message = error?.message || (status === 400 ? 'Invalid request body.' : 'Internal server error');
+
+  req.log?.error?.({ err: error, status }, 'request failed');
+  sendJson(res, status, {
+    ok: false,
+    error: message
+  });
 });
 
-server.on('error', (error) => {
-  if (error && error.code === 'EADDRINUSE') {
-    console.error(`TestPilot AI backend could not start because port ${CONFIG.port} is already in use.`);
-    console.error(`Stop the other process or start this backend with another port, for example: PORT=8788 npm start`);
-  } else {
-    console.error('TestPilot AI backend failed to start:', error && error.message ? error.message : error);
-  }
-  process.exit(1);
-});
+export function startServer() {
+  if (server) return server;
+
+  registerShutdownHandlers();
+  server = app.listen(CONFIG.port, () => {
+    console.log('TestPilot AI backend is running.');
+    console.log(`Backend URL: http://localhost:${CONFIG.port}`);
+    console.log(`Health check: http://localhost:${CONFIG.port}/api/health`);
+    console.log(`Provider: ${CONFIG.provider}; model: ${getConfiguredModelName()}`);
+    console.log('Tip: open the Health check URL above. The root URL now returns a backend status JSON.');
+    if (CONFIG.requestedProvider !== CONFIG.provider) {
+      console.log(`Remote provider "${CONFIG.requestedProvider}" is disabled; TestPilot is using local Ollama only.`);
+    }
+  });
+
+  server.on('error', (error) => {
+    if (error && error.code === 'EADDRINUSE') {
+      console.error(`TestPilot AI backend could not start because port ${CONFIG.port} is already in use.`);
+      console.error(`Stop the other process or start this backend with another port, for example: PORT=8788 npm start`);
+    } else {
+      console.error('TestPilot AI backend failed to start:', error && error.message ? error.message : error);
+    }
+    process.exit(1);
+  });
+
+  return server;
+}
+
+function registerShutdownHandlers() {
+  if (shutdownHooksRegistered) return;
+  shutdownHooksRegistered = true;
+  process.once('SIGINT', () => {
+    void shutdownServer('SIGINT')
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  });
+  process.once('SIGTERM', () => {
+    void shutdownServer('SIGTERM')
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  });
+}
+
+export async function shutdownServer(signal = 'SIGTERM') {
+  if (!server || isShuttingDown) return;
+  isShuttingDown = true;
+
+  console.log(`Received ${signal}. Starting graceful shutdown...`);
+  const activeServer = server;
+
+  await new Promise((resolve) => {
+    activeServer.close(() => {
+      console.log('HTTP server closed cleanly.');
+      resolve();
+    });
+    setTimeout(() => {
+      console.warn('Forcing shutdown after timeout.');
+      resolve();
+    }, 8000).unref();
+  });
+
+  server = null;
+  isShuttingDown = false;
+}
+
+const isMainModule = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+if (isMainModule) {
+  startServer();
+}
 
 function assertRuntime() {
   const major = Number(String(process.versions.node || '0').split('.')[0]);
@@ -283,19 +442,24 @@ function assertRuntime() {
   }
 }
 
-function isRootRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '') || '/';
-  return pathname === '/';
-}
-
-function isChatRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
-  return pathname === '/api/ai/chat' || pathname === '/api/chat';
-}
-
-function isChatStreamRoute(url) {
-  const pathname = String(url || '').split('?')[0].replace(/\/+$/, '');
-  return pathname === '/api/ai/chat-stream' || pathname === '/api/chat-stream';
+function validateBody(schema) {
+  return (req, res, next) => {
+    const parsed = schema.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendJson(res, 400, {
+        ok: false,
+        error: 'Invalid request body.',
+        details: parsed.error.issues.map((issue) => ({
+          path: issue.path.join('.') || '(root)',
+          message: issue.message,
+          code: issue.code
+        }))
+      });
+      return;
+    }
+    req.body = parsed.data;
+    next();
+  };
 }
 
 async function handleAi(req, res, task) {
@@ -1101,6 +1265,9 @@ function parseOptionalJsonFromModel(content) {
 }
 
 function readJson(req) {
+  if (req && typeof req === 'object' && req.body && typeof req.body === 'object') {
+    return Promise.resolve(req.body);
+  }
   return new Promise((resolve, reject) => {
     let data = '';
     req.on('data', (chunk) => {
@@ -1128,6 +1295,10 @@ function setCors(res) {
 }
 
 function sendJson(res, status, payload) {
+  if (typeof res.status === 'function' && typeof res.json === 'function') {
+    res.status(status).json(payload);
+    return;
+  }
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8' });
   res.end(JSON.stringify(payload));
 }

@@ -1,6 +1,7 @@
 // @ts-nocheck
 import { buildXPathSelector, createInputBatcher } from '../shared/observation';
 import { classifyNetworkUrl } from '../shared/networkClassifier';
+import { createDefaultRuleEngine } from '../shared/ruleEngine';
 
 (() => {
   const PAGE_CONSOLE_SOURCE = 'testpilot-page-console-listener';
@@ -27,6 +28,11 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
   let activeSessionId = null;
   let observationEnabled = false;
   let observationLayer = null;
+  const ruleEngine = createDefaultRuleEngine({
+    pageUrl: location.href,
+    classifyNetworkUrl: (url, pageOrigin) => classifyNetworkUrl(url, pageOrigin),
+    document
+  });
 
   function applyObservationState() {
     if (!observationLayer) return;
@@ -184,6 +190,9 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
   observationLayer = new ObservationLayer((entry) => {
     if (!activeSessionId || !observationEnabled) return;
     sendToExtension(entry.kind === 'dom-mutation' ? 'dom-mutation' : 'user-action', entry.payload);
+    if (entry.kind === 'dom-mutation') {
+      emitRuleEngineFindings('dom-mutation', entry.payload);
+    }
   });
   applyObservationState();
 
@@ -203,6 +212,17 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
     }
   }
 
+  function emitRuleEngineFindings(kind, payload) {
+    const findings = ruleEngine.evaluate({ kind, payload, sessionId: activeSessionId, pageUrl: location.href });
+    for (const finding of findings) {
+      sendToExtension('rule-finding', {
+        ...finding,
+        pageUrl: location.href,
+        sessionId: activeSessionId
+      });
+    }
+  }
+
   window.addEventListener('message', (event) => {
     if (event.source !== window) return;
     const data = event.data;
@@ -210,6 +230,7 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
 
     if (data.source === PAGE_CONSOLE_SOURCE) {
       sendToExtension('console', data.payload);
+      emitRuleEngineFindings('console', data.payload);
       return;
     }
 
@@ -219,6 +240,7 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
         category: classifyNetworkUrl(data.payload.input || data.payload.url, location.origin)
       };
       sendToExtension('network', payload);
+      emitRuleEngineFindings('network', payload);
     }
   }, false);
 
@@ -251,6 +273,7 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
     if (message.type === 'TESTPILOT_START_OBSERVATION') {
       observationEnabled = true;
       applyObservationState();
+      emitRuleEngineFindings('session-start', { document });
       sendResponse({ ok: true, enabled: observationEnabled, sessionId: activeSessionId });
       return true;
     }
@@ -1808,6 +1831,8 @@ import { classifyNetworkUrl } from '../shared/networkClassifier';
         timestamp: Date.now()
       });
     }
+
+    emitRuleEngineFindings('ui-scan', { document, settings, maxUiNodes, visibleViewportOnly });
 
     const docEl = document.documentElement;
     if (docEl && docEl.scrollWidth > window.innerWidth + 8) {

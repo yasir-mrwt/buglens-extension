@@ -1,3 +1,80 @@
+function buildContextBuilderMessage({
+  event,
+  findings = [],
+  sessionId = null,
+  pageUrl = "",
+  extra = {}
+}) {
+  const counts = {
+    total: findings.length,
+    actionable: findings.filter((item) => item.category === "actionable").length,
+    needsReview: findings.filter((item) => item.category === "needs-review").length,
+    frameworkNoise: findings.filter((item) => item.category === "framework-noise").length
+  };
+  return {
+    event,
+    sessionId,
+    pageUrl,
+    payload: {
+      findings,
+      counts,
+      ...extra
+    }
+  };
+}
+function createContextBuilderMessageBus() {
+  const subscribers = /* @__PURE__ */ new Set();
+  return {
+    subscribe(listener) {
+      subscribers.add(listener);
+      return () => subscribers.delete(listener);
+    },
+    publish(message) {
+      for (const listener of subscribers) {
+        listener(message);
+      }
+    }
+  };
+}
+const REDACTION_KEYS = ["authorization", "cookie", "set-cookie", "x-api-key", "api_key", "token", "access_token", "refresh_token", "id_token", "password", "secret"];
+function isSensitiveKey$1(key) {
+  const normalized = String(key || "").toLowerCase();
+  return REDACTION_KEYS.some((candidate) => normalized.includes(candidate));
+}
+function redactValue(value) {
+  if (typeof value === "string") {
+    return value;
+  }
+  if (Array.isArray(value)) {
+    return value.map((item) => redactValue(item));
+  }
+  if (value && typeof value === "object") {
+    const output = {};
+    for (const [k, v] of Object.entries(value)) {
+      if (isSensitiveKey$1(k)) {
+        output[k] = "[REDACTED]";
+      } else {
+        output[k] = redactValue(v);
+      }
+    }
+    return output;
+  }
+  return value;
+}
+function sanitizeCapturedMetadata(metadata) {
+  if (!metadata || typeof metadata !== "object") return metadata;
+  const output = {};
+  for (const [key, value] of Object.entries(metadata)) {
+    if (isSensitiveKey$1(key)) {
+      output[key] = "[REDACTED]";
+    } else if (value && typeof value === "object" && !Array.isArray(value)) {
+      output[key] = redactValue(value);
+    } else {
+      output[key] = redactValue(value);
+    }
+  }
+  return output;
+}
 const inspectedTabId = chrome.devtools.inspectedWindow.tabId;
 const port = chrome.runtime.connect({ name: "testpilot-devtools" });
 const VERSION = "0.4.1";
@@ -239,6 +316,7 @@ let reportBuilderDirty = false;
 let forceNextAiChatScroll = false;
 const pendingAgentApprovals = /* @__PURE__ */ new Map();
 const agentApprovalPreferences = /* @__PURE__ */ new Map();
+const contextBuilderBus = createContextBuilderMessageBus();
 const els = {
   startBtn: document.getElementById("startBtn"),
   stopBtn: document.getElementById("stopBtn"),
@@ -1148,6 +1226,7 @@ async function startSession() {
   state.settings = readSettingsFromForm();
   await persistSettingsSnapshot();
   await setContentSession(state.sessionId);
+  await sendTabMessage({ type: "TESTPILOT_START_OBSERVATION" });
   await persistSession();
   render();
   showToast("Session started. Reload the inspected page for complete capture.", "success");
@@ -1158,6 +1237,7 @@ function stopSession() {
   state.endedAt = Date.now();
   state.lastUpdatedAt = state.endedAt;
   state.timeline.push({ type: "session-stopped", timestamp: state.endedAt, pageUrl: state.pageUrl });
+  void sendTabMessage({ type: "TESTPILOT_STOP_OBSERVATION" });
   void setContentSession(null);
   schedulePersist();
   render();
@@ -1209,6 +1289,7 @@ async function clearSession() {
   state.networkStats = createEmptyNetworkStats();
   state.duplicateCache = /* @__PURE__ */ new Map();
   recentEvidenceEvents = [];
+  await sendTabMessage({ type: "TESTPILOT_STOP_OBSERVATION" });
   await setContentSession(null);
   await removeStoredSessionSnapshot();
   render();
@@ -1468,6 +1549,120 @@ function recordRecentEvidenceEvent(event) {
   };
   recentEvidenceEvents.push(normalized);
   recentEvidenceEvents = recentEvidenceEvents.filter((item) => item.timestamp >= Date.now() - 10 * 60 * 1e3).slice(-120);
+}
+function normalizeHeaderList(headers) {
+  if (Array.isArray(headers)) return headers.map((header) => {
+    if (!header || typeof header !== "object") return { name: String(header || ""), value: "" };
+    return { name: String(header.name || ""), value: String(header.value || "") };
+  });
+  if (!headers || typeof headers !== "object") return [];
+  return Object.entries(headers).map(([name, value]) => ({ name, value: String(value || "") }));
+}
+function processPageContextNetworkEvent(payload) {
+  if (!payload || typeof payload !== "object") return;
+  if (payload.kind !== "response" && payload.kind !== "error") return;
+  state.networkStats.total += 1;
+  state.lastUpdatedAt = Date.now();
+  const method = String(payload.method || "GET").toUpperCase();
+  const url = String(payload.input || payload.url || "");
+  const status = Number(payload.status || 0);
+  const durationMs = Math.round(Number(payload.durationMs || 0));
+  const requestClass = classifyNetworkRequest({
+    url,
+    method,
+    mimeType: "",
+    resourceType: payload.type || "",
+    request: { headers: normalizeHeaderList(payload.headers || []) },
+    response: { headers: normalizeHeaderList(payload.headers || []) },
+    frameworkPrefetch: null
+  });
+  if (requestClass === "framework") {
+    state.networkStats.framework += 1;
+  } else if (requestClass !== "api") {
+    state.networkStats[requestClass] += 1;
+  } else {
+    state.networkStats.api += 1;
+  }
+  const baseEvidence = {
+    method,
+    url: redactUrl(url),
+    pageUrl: state.pageUrl,
+    payloadKind: payload.kind,
+    status,
+    durationMs,
+    resourceType: payload.type || "",
+    category: payload.category || "",
+    requestId: payload.requestId || "",
+    requestBody: payload.body ? redactText(String(payload.body), 2e3) : "",
+    headers: redactHeaders(normalizeHeaderList(payload.headers || [])),
+    requestSource: "page-context"
+  };
+  if (payload.kind === "error" || status === 0) {
+    state.networkStats.failed += 1;
+    addIssue({
+      type: "api",
+      category: "actionable",
+      severity: "high",
+      title: `${method} ${shortUrlPath(url)} failed to complete`,
+      description: "A page-context network request failed before a successful response was returned.",
+      userImpact: "The tested flow may be missing required data or fail to complete.",
+      recommendation: "Check connectivity, CORS, endpoint availability, and the browser console for the failing request.",
+      evidence: {
+        ...baseEvidence,
+        error: payload.errorMessage || "The request failed before a response was received."
+      }
+    });
+  } else if (status >= 500) {
+    state.networkStats.failed += 1;
+    addIssue({
+      type: "api",
+      category: "actionable",
+      severity: "critical",
+      title: `${method} ${shortUrlPath(url)} returned ${status}`,
+      description: "A page-context request returned a server error response.",
+      userImpact: "A required business operation or data request may fail for the tester.",
+      recommendation: "Investigate the server-side error and verify the endpoint contract.",
+      evidence: baseEvidence
+    });
+  } else if (status >= 400) {
+    state.networkStats.failed += 1;
+    addIssue({
+      type: "api",
+      category: "actionable",
+      severity: "high",
+      title: `${method} ${shortUrlPath(url)} returned ${status}`,
+      description: "A page-context request returned a client or authentication error.",
+      userImpact: "The requested business operation or required data may be unavailable.",
+      recommendation: "Confirm whether the request should succeed and inspect the server or client response.",
+      evidence: baseEvidence
+    });
+  } else {
+    state.networkStats.passed += 1;
+  }
+  if (durationMs > 2e3) {
+    state.networkStats.slow += 1;
+    addIssue({
+      type: "api",
+      category: "needs-review",
+      severity: "medium",
+      title: `Slow page-context response: ${method} ${shortUrlPath(url)}`,
+      description: `The request took ${durationMs}ms, which exceeds the 2000ms threshold.`,
+      userImpact: "The tested interaction may feel delayed or time out on slower connections.",
+      recommendation: "Profile the endpoint latency and confirm whether the delay affects the workflow.",
+      evidence: { ...baseEvidence, thresholdMs: 2e3 }
+    });
+  }
+  recordRecentEvidenceEvent({
+    type: "api",
+    timestamp: Date.now(),
+    title: `${method} ${shortUrlPath(url)} ${status || "no status"}`,
+    summary: `${method} ${shortUrlPath(url)} returned ${status || "no HTTP status"} in ${durationMs}ms`,
+    severity: status >= 500 ? "critical" : status >= 400 || status === 0 ? "high" : durationMs > 2e3 ? "medium" : "info",
+    url,
+    evidence: baseEvidence
+  });
+  schedulePersist();
+  render();
 }
 function processNetworkEntry(entry) {
   var _a;
@@ -1849,8 +2044,12 @@ function handleContentEvent(message) {
     return;
   }
   if (!state.active) return;
-  if (message.kind !== "console") return;
   if (!state.sessionId || message.sessionId !== state.sessionId) return;
+  if (message.kind === "network") {
+    processPageContextNetworkEvent(message.payload);
+    return;
+  }
+  if (message.kind !== "console") return;
   const payload = message.payload || {};
   if (payload.timestamp && state.startedAt && payload.timestamp < state.startedAt) return;
   state.lastUpdatedAt = Date.now();
@@ -2083,6 +2282,20 @@ function setScanButtonState(scanning) {
   els.uiScanBtn.disabled = scanning;
   els.uiScanBtn.textContent = scanning ? "Scanning..." : "Run UI Scan";
 }
+function publishFindingsToContextBuilder() {
+  const message = buildContextBuilderMessage({
+    event: "findings-updated",
+    findings: state.issues.slice(-200),
+    sessionId: state.sessionId,
+    pageUrl: state.pageUrl,
+    extra: {
+      networkStats: state.networkStats,
+      uiStats: state.uiStats,
+      lastUpdatedAt: state.lastUpdatedAt
+    }
+  });
+  contextBuilderBus.publish(message);
+}
 function addIssue(issue) {
   const normalized = normalizeIssue(issue);
   const duplicateKey = getIssueDuplicateKey(normalized);
@@ -2105,6 +2318,7 @@ function addIssue(issue) {
     }
     state.lastUpdatedAt = Date.now();
     schedulePersist();
+    publishFindingsToContextBuilder();
     return existing;
   }
   const typeLimit = {
@@ -2128,6 +2342,7 @@ function addIssue(issue) {
   state.issues.push(storedIssue);
   state.lastUpdatedAt = Date.now();
   schedulePersist();
+  publishFindingsToContextBuilder();
   return storedIssue;
 }
 function normalizeIssue(issue) {
@@ -2140,7 +2355,7 @@ function normalizeIssue(issue) {
   const url = redactUrl(rawUrl);
   let title = redactText(String(issue.title || "TestPilot issue"), 180);
   let description = redactText(String(issue.description || ""), 1e3);
-  const evidence = redactObject(issue.evidence || {});
+  const evidence = sanitizeCapturedMetadata(redactObject(issue.evidence || {}));
   if (category === "framework-noise") {
     const route = inferNextRouteFromEvidence(evidence);
     evidence.category = "framework-prefetch";
@@ -5057,7 +5272,7 @@ function classifyNetworkRequest({ url, method, mimeType, resourceType, request, 
   const lowerUrl = String(url).toLowerCase();
   const lowerMime = String(mimeType || "").toLowerCase();
   const lowerResource = String(resourceType || "").toLowerCase();
-  const upperMethod = String(method).toUpperCase();
+  const upperMethod = String(method || "GET").toUpperCase();
   const accept = getHeaderValue(request.headers || [], "accept");
   const contentType = getHeaderValue(response.headers || [], "content-type");
   const jsonLike = lowerMime.includes("json") || String(accept).toLowerCase().includes("json") || String(contentType).toLowerCase().includes("json");
